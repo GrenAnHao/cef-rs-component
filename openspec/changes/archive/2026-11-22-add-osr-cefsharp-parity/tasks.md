@@ -1,0 +1,37 @@
+# Tasks
+
+## 1. `rust-cef-core` Pure-`std` Contracts & State Machines
+
+- [x] 1.1 Implement outbound drag contracts in `crates/rust-cef-core/src/outbound_drag.rs` (`OutboundDragPolicy` defaulting to deny, `DragOperationMask`, bounded `DraggedPayload` with 64 KiB text / 256 KiB HTML / 8 KiB URL / 32 file-path limits and redacted `Debug`, `DragSessionId`, `BrowserCommand::FinishOutboundDrag`, and single in-flight session transitions), wire into `contracts.rs`/`ports.rs`/`session.rs`, and verify via `cargo test -p rust-cef-core outbound_drag`.
+- [x] 1.2 Implement bounded AXTree model and applier in `crates/rust-cef-core/src/accessibility.rs` (`AxRole`, `AxBounds`, `AxNode`, `AxTreeSnapshot`, `AxUpdateApplier` enforcing `MAX_AX_NODES = 2048`, `MAX_AX_TEXT_BYTES = 1024`, `MAX_AX_CHILDREN = 256`, `node_id_to_clear`, location updates, redacted `Debug`, and `BrowserCommand::SetAccessibilityState`), and verify via `cargo test -p rust-cef-core accessibility`.
+- [x] 1.3 Implement Profile/Frame `CefURLRequest` contracts in `crates/rust-cef-core/src/url_request.rs` (`UrlRequestTarget`, `UrlRequestSpec` method allowlist & size/header/timeout bounds, `UrlRequestOutcome`, `UrlRequestHandle`, `UrlRequestLedger` concurrency cap `<= 32`, and sensitive header/body `Debug` redaction), expose through `ports.rs`/`runtime.rs`, and verify via `cargo test -p rust-cef-core url_request`.
+- [x] 1.4 Extend `crates/rust-cef-core/src/input.rs`, `ports.rs`, and `session.rs` with `BrowserTouchEvent`, `TouchEventType`, `TouchPointerType`, `BrowserCommand::TouchEvent`, finite coordinate validation, `[0.0, 1.0]` pressure clamping, and active touch-id tracking, and verify via `cargo test -p rust-cef-core` (all pure-`std` tests pass with zero GPUI/Win32/CEF dependencies).
+
+## 2. `rust-cef-runtime` Native CEF Adapters & Shutdown Barrier
+
+- [x] 2.1 Implement `crates/rust-cef-runtime/src/outbound_drag.rs` and update `client.rs::start_dragging`, `update_drag_cursor`, `registry.rs`, and `runtime.rs` so default-deny keeps returning `0` while opt-in copies bounded `DraggedPayload`, returns `1` immediately, forwards `DragSourceEndedAt` / `DragSourceSystemDragEnded` on `FinishOutboundDrag`, rejects concurrent/stale `drag_id`, and drains cleanly on close; verify via `cargo test -p rust-cef-runtime outbound_drag`.
+- [x] 2.2 Implement `crates/rust-cef-runtime/src/accessibility.rs` using `cef::wrap_accessibility_handler!`, attach via `Client::accessibility_handler` when opted in, parse CEF `Value` strictly inside callback scope, publish latest coalesced `AxTreeSnapshot`, implement `BrowserCommand::SetAccessibilityState`, clear on disable/close, and verify via `cargo test -p rust-cef-runtime accessibility`.
+- [x] 2.3 Implement `crates/rust-cef-runtime/src/url_request.rs` using `cef::wrap_urlrequest_client!`, `cef::urlrequest_create`, and `Frame::create_urlrequest` with `TrustedContentPolicy` checks (initial + redirect URLs), Profile cookie/proxy/TLS reuse, non-blocking opt-in `GetAuthCredentials` (default deny, redacted `Debug`), idempotent `cancel()`, and Runtime shutdown-barrier drain before `cef_shutdown`; verify via `cargo test -p rust-cef-runtime url_request`.
+- [x] 2.4 Wire `BrowserCommand::TouchEvent` -> `host.send_touch_event` and synthetic `Cancelled` events for open `touch_id` entries on `ResetInput` / focus loss / close in `crates/rust-cef-runtime/src/input.rs` and `registry.rs`, and verify via `cargo test -p rust-cef-runtime --lib` and `cargo tree -p rust-cef-runtime | Select-String gpui` (0 hits).
+
+## 3. `rust-cef-ui` & `rust-cef-gpui` Thin UI Adapters (Zero New Crates)
+
+- [x] 3.1 Implement zero-new-dep Win32 COM `IDataObject` / `IDropSource` / `IEnumFORMATETC` and async UI/STA `DoDragDrop` runner in `crates/rust-cef-gpui/src/ole_drag.rs` (including the bounded non-reentrant `Integrated` mode `WM_TIMER` pump guard and close cleanup), wire `StartOutboundDrag` / `FinishOutboundDrag` through `crates/rust-cef-ui` & `crates/rust-cef-gpui/src/view.rs`, and verify via `cargo test -p rust-cef-ui` and `cargo test -p rust-cef-gpui ole_drag`.
+- [x] 3.2 Implement `crates/rust-cef-gpui/src/accessibility.rs` mapping `AxRole` -> `gpui::accesskit::Role` and projecting coalesced `AxTreeSnapshot` nodes via `a11y_synthetic_children(&mut A11ySubtreeBuilder)` inside `view.rs` with view-origin coordinate translation and disable/close cleanup; verify via `cargo test -p rust-cef-gpui accessibility`.
+- [x] 3.3 Wire GPUI `PinchEvent` DirectManipulation bounded zoom and touch forwarding in `crates/rust-cef-gpui/src/view.rs`, implement explicit host-owned `NativeTouchServices` (`WM_POINTER*` / `GetPointerInfo`) in `crates/rust-cef-gpui/src/native_touch.rs` following `NativeKeyboardServices` teardown hygiene, and verify via `cargo test -p rust-cef-gpui` and `cargo tree -p rust-cef-ui | Select-String gpui` (0 hits).
+
+## 4. `gpui-cef-component-demo` Opt-In Desktop Browser Shell
+
+- [x] 4.1 Add opt-in `--browser-shell true|false` (default `false`) in `src/component_demo/cli.rs` preserving 100% compatibility of all existing flags (`--smoke-ms`, `--observer-gate`, `--context-menu`, `--ux-controls`, `--host-capabilities`, `--page`, `--menu-*`), and verify CLI unit tests via `cargo test -p gpui-cef-poc --bin gpui-cef-component-demo`.
+- [x] 4.2 Implement the modular desktop browser shell mode (`src/component_demo/shell.rs` wired from `host.rs`) using public `rust-cef-gpui` / `rust-cef-core` APIs only: multi-tab bar (create/switch/close tabs, popup-to-tab handoff within trusted policy), address bar + loading bar, Back/Forward/Reload/Stop, Zoom/Mute, Find bar, Download confirmation & progress bar, `PrintToPdf` export, DevTools toggle, and orderly all-tab shutdown before `Runtime::shutdown`; verify unit tests + release compilation.
+
+## 5. Real-CEF Verification, Delivery Regression, Docs & Seal
+
+- [x] 5.1 Build and run real-CEF OSR parity probe coverage across all 4 matrix combinations (`Integrated`/`Threaded` × `SoftwareRequired`/`D3d11Required`) verifying: (a) outbound drag payload + async completion without pump deadlock, (b) `IAccessibilityHandler` AXTree capture + `accesskit` projection, (c) Profile-scoped & Frame-scoped `CefURLRequest` sharing cookies/auth, untrusted redirect denial, explicit cancel & shutdown drain, (d) `SendTouchEvent` dispatch & active-point cancellation on focus loss/close, and (e) zero orphan helper processes after `cef_shutdown`.
+- [x] 5.2 Package the Release bundle and run `gpui-cef-component-demo.exe` covering both the 5 existing regression scenarios (backward compatibility preserved) and `--browser-shell true` multi-tab / navigation / find / download / PDF / DevTools / clean shutdown verification.
+- [x] 5.3 Run `cargo fmt --check`, `scripts/check.ps1`, standalone `validation/component-host` and `validation/gpui-runtime-probe` checks, zero-`gpui` `cargo tree` audit for `rust-cef-{core,ui,helper,runtime}`, and SHA-256 verification showing all 4 `Cargo.lock` files match baseline hashes verbatim.
+- [x] 5.4 Update [README.md](../../../README.md), [docs/component-view.md](../../../docs/component-view.md), and [docs/validation.md](../../../docs/validation.md) documenting the OSR parity capabilities and exact verified evidence paths, then seal the immutable validation bundle under `E:\gpui-cef-component-validation-f66a95cc\`.
+
+## Workflow follow-up
+
+- Do NOT run `openspec archive` automatically; wait for explicit user review and confirmation after all 4-combo OSR parity evidence, workspace/standalone checks, and seal artifacts are presented.

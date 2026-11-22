@@ -1,0 +1,17 @@
+Report-fix RED/GREEN (task 5.4)
+Source files copied byte-for-byte (md5 verified at copy time):
+  0f33ac54a87baa818631e99ea99fbfde  evidence-report-red.txt          (10 tests: 5 passed / 5 failed)
+  fcde00099f5687edd65ca9b6322a85f8  evidence-report-green.txt        (10 passed / 0 failed)
+  b38997f3f49b81025c9d156f0727a0f9  evidence-report-red-build.txt
+  e515a60b4c688d297d72a8eaf6f2a6b1  evidence-report-green-build.txt
+Original location: <repo>/execution/task-5.4-report-{red,green}{,-build}.log
+Test binary: <repo>/target/debug/deps/gpui_runtime_probe-6fb7a512706a0334.exe
+  (D:/poc-cef-target was read-only in the child sandbox; build ran in the repo target)
+
+Component dispatcher RED (aebcc29569db3c064009261b96c6964f)
+  evidence-component-dispatcher-red-captured.txt is a VERBATIM transcription of the
+  console output produced by the original RED run:
+  `CARGO_TARGET_DIR=D:/poc-cef-target cargo test -p gpui-cef-component --lib --offline`
+  That run was not redirected to a file, so no byte-identical run log exists. Nothing
+  was summarized or edited; the text matches the failing assertions (burst 5 != 1,
+  dropped/closed receiver returned Ok instead of Closed).

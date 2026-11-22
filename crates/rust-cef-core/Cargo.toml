@@ -1,0 +1,7 @@
+[package]
+name = "rust-cef-core"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+description = "Platform-independent contracts and state machines for GPUI-CEF-COMPONENT"

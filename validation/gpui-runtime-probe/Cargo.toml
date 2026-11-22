@@ -1,0 +1,33 @@
+[package]
+name = "gpui-runtime-probe"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Minimal GPUI host for the public GPUI-CEF Runtime wiring (task 5.4)"
+
+# Standalone validation workspace; never a distributable app and deliberately
+# excluded from the root workspace.
+[workspace]
+
+[[bin]]
+name = "gpui-runtime-probe"
+path = "src/main.rs"
+
+[dependencies]
+rust-cef-gpui = { path = "../../crates/rust-cef-gpui" }
+rust-cef-core = { path = "../../crates/rust-cef-core" }
+# test-support supplies the shared ProbeOptions/ProbeReport wire format and the
+# observer-ready handshake; the GPUI host does not import native-probe types.
+rust-cef-runtime = { path = "../../crates/rust-cef-runtime", features = ["test-support"] }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.154"
+
+# Exactly the single GPUI identity used by the component crate.
+gpui = { version = "=0.3.12", package = "gpui-pre", default-features = false, features = ["windows-manifest"] }
+gpui_platform = { version = "=0.3.12", package = "gpui-pre-platform" }
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2

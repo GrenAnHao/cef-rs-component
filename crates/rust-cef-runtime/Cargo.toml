@@ -1,0 +1,66 @@
+[package]
+name = "rust-cef-runtime"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+description = "CEF process and browser adapters for GPUI-CEF-COMPONENT"
+
+[[bin]]
+name = "runtime-probe"
+path = "src/bin/runtime-probe.rs"
+required-features = ["test-support"]
+
+[[bin]]
+name = "profile-probe"
+path = "src/bin/profile-probe.rs"
+required-features = ["test-support"]
+
+[[bin]]
+name = "profile-restart-probe"
+path = "src/bin/profile-restart-probe.rs"
+required-features = ["test-support"]
+
+[[bin]]
+name = "navigation-probe"
+path = "src/bin/navigation-probe.rs"
+required-features = ["test-support"]
+
+[[bin]]
+name = "policy-probe"
+path = "src/bin/policy-probe.rs"
+required-features = ["test-support"]
+
+[[bin]]
+name = "renderer-probe"
+path = "src/bin/renderer-probe.rs"
+required-features = ["test-support"]
+
+[[bin]]
+name = "file-drop-probe"
+path = "src/bin/file-drop-probe.rs"
+required-features = ["test-support"]
+
+[features]
+test-support = []
+
+[dependencies]
+rust-cef-core.workspace = true
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.154"
+url = "=2.5.8"
+sha2 = "=0.10.9"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+cef.workspace = true
+windows = { version = "=0.61.3", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Security",
+] }
+
+[build-dependencies]
+sha2 = "=0.10.9"

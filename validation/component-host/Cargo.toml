@@ -1,0 +1,30 @@
+[package]
+name = "component-host"
+version = "0.1.0"
+edition = "2024"
+publish = false
+default-run = "component-host"
+
+[[bin]]
+name = "file-drag-events"
+path = "src/bin/file-drag-events.rs"
+required-features = ["file-drag-events"]
+
+[workspace]
+
+[features]
+# Opt-in validation build: forwards to the component's test-only probe surface.
+validation = ["rust-cef-gpui/validation"]
+# Explicit fixture only; ordinary validation/All does not build or run it.
+file-drag-events = ["validation"]
+
+[dependencies]
+rust-cef-gpui = { path = "../../crates/rust-cef-gpui" }
+gpui = { version = "=0.3.12", package = "gpui-pre", default-features = false, features = ["windows-manifest"] }
+gpui_platform = { version = "=0.3.12", package = "gpui-pre-platform" }
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2

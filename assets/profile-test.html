@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="referrer" content="no-referrer">
+<title>GPUI CEF profile probe</title>
+<style>
+html, body { margin: 0; padding: 0; width: 100%; height: 100%; }
+body { background: rgb(26, 76, 126); overflow: hidden; }
+#status-panel {
+  position: absolute; left: 8px; top: 0; width: 304px; max-height: 72px;
+  overflow: hidden; color: #ffffff; font: 12px/1.35 system-ui, sans-serif;
+}
+#status-panel p { margin: 4px 0; }
+#status-panel span { font-weight: 700; }
+</style>
+</head>
+<body style="margin:0;background:rgb(26,76,126)">
+<div id="status-panel">
+<p>token: <span id="token">pending</span></p>
+<p>op: <span id="operation">pending</span> | state: <span id="status">running</span></p>
+</div>
+<script>
+(function () {
+  "use strict";
+
+  var params = new URLSearchParams(window.location.search);
+  var token = params.get("token") || "";
+  var operation = params.get("op") || "";
+  var value = params.get("value") || "";
+  var cookieName = "gpui_cef_profile_test";
+  var storageKey = "gpui-cef-profile-test";
+
+  function setText(id, text) {
+    var element = document.getElementById(id);
+    if (element) {
+      element.textContent = text;
+    }
+  }
+
+  function readCookie() {
+    var prefix = cookieName + "=";
+    var parts = document.cookie ? document.cookie.split("; ") : [];
+    for (var index = 0; index < parts.length; index += 1) {
+      if (parts[index].indexOf(prefix) === 0) {
+        try {
+          return decodeURIComponent(parts[index].slice(prefix.length));
+        } catch (_) {
+          return parts[index].slice(prefix.length);
+        }
+      }
+    }
+    return null;
+  }
+
+  function postResult(payload) {
+    return fetch("/result", {
+      method: "POST",
+      cache: "no-store",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    });
+  }
+
+  function reportError(error) {
+    var message = error && error.message ? error.message : String(error);
+    setText("status", "error");
+    // The fixture rejects a second result for the same token; a failed report
+    // is intentionally swallowed here and observed by the host's errors().
+    postResult({ token: token, error: message }).catch(function () {});
+  }
+
+  async function run() {
+    setText("token", token ? token.slice(0, 48) : "(missing)");
+    setText("operation", operation || "(missing)");
+    if (!token) {
+      throw new Error("missing token");
+    }
+
+    if (operation === "write") {
+      // Persistent test cookie: Max-Age keeps it across a normal browser
+      // restart so the same value can be verified by later profile tasks.
+      document.cookie = cookieName + "=" + encodeURIComponent(value) +
+        "; Path=/; SameSite=Lax; Max-Age=31536000";
+      localStorage.setItem(storageKey, value);
+    } else if (operation !== "read") {
+      throw new Error("invalid operation");
+    }
+
+    var cookie = readCookie();
+    var local_storage = localStorage.getItem(storageKey);
+    var response = await postResult({
+      token: token,
+      cookie: cookie,
+      local_storage: local_storage
+    });
+    if (!response.ok) {
+      throw new Error("result POST failed with status " + response.status);
+    }
+    setText("status", operation === "write" ? "written" : "read");
+  }
+
+  run().catch(reportError);
+})();
+</script>
+</body>
+</html>

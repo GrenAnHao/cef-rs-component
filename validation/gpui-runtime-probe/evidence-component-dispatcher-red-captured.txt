@@ -1,0 +1,28 @@
+thread 'dispatcher::tests::closed_receiver_reports_closed_and_wakes_recv' (76004) panicked at crates\gpui-cef-component\src\dispatcher.rs:60:9:
+assertion `left == right` failed
+  left: Ok(())
+ right: Err(Closed)
+
+---- dispatcher::tests::capacity_one_coalesces_a_burst_into_one_signal stdout ----
+
+thread 'dispatcher::tests::capacity_one_coalesces_a_burst_into_one_signal' (67164) panicked at crates\gpui-cef-component\src\dispatcher.rs:43:9:
+assertion `left == right` failed: a burst must collapse to one wake-up
+  left: 5
+ right: 1
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- dispatcher::tests::dropped_receiver_reports_closed_not_success stdout ----
+
+thread 'dispatcher::tests::dropped_receiver_reports_closed_not_success' (32988) panicked at crates\gpui-cef-component\src\dispatcher.rs:53:9:
+assertion `left == right` failed
+  left: Ok(())
+ right: Err(Closed)
+
+failures:
+    dispatcher::tests::capacity_one_coalesces_a_burst_into_one_signal
+    dispatcher::tests::closed_receiver_reports_closed_and_wakes_recv
+    dispatcher::tests::dropped_receiver_reports_closed_not_success
+
+test result: FAILED. 1 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p gpui-cef-component --lib`

@@ -1,0 +1,18 @@
+[package]
+name = "rust-cef-ui"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+description = "UI-framework-agnostic browser surface, input, IME, drag, menu and wake pipeline for rust-cef"
+
+[features]
+# Test-only forwarding of runtime frame-probe controls.
+validation = ["rust-cef-runtime/test-support"]
+
+[dependencies]
+rust-cef-core.workspace = true
+rust-cef-runtime.workspace = true
+# UI wake-up channel: capacity 1 so an unbounded event/frame burst collapses
+# into a single pending signal instead of a GUI-side queue.
+async-channel = "=2.5.0"

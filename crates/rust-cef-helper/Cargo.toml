@@ -1,0 +1,15 @@
+[package]
+name = "rust-cef-helper"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+description = "Independent CEF subprocess entry for GPUI-CEF-COMPONENT"
+
+[dependencies]
+rust-cef-runtime.workspace = true
+
+[[test]]
+name = "deployment_distribution"
+path = "tests/deployment_distribution.rs"
+harness = false

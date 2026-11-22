@@ -1,0 +1,10 @@
+[env]
+# Reuse the script cache; cef-rs downloads a versioned child here if absent.
+CEF_PATH = { value = ".cef/156.0.31_windows_x86_64", relative = true }
+"CMAKE_TOOLCHAIN_FILE_x86_64-pc-windows-msvc" = { value = "scripts/windows-toolchain.cmake", relative = true }
+
+[target.x86_64-pc-windows-msvc]
+runner = ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "scripts/cargo-run.ps1"]
+
+# Use a short Cargo target path (via CARGO_TARGET_DIR or scripts -TargetDir) to
+# avoid Windows MAX_PATH failures under cef-dll-sys CMake builds.

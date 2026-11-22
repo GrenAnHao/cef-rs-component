@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><title>probe</title>
+<style>
+* { box-sizing: border-box }
+html, body { margin: 0; height: 100%; background: #f3f6fb; color: #172439; font: 18px system-ui }
+body { display: flex; flex-direction: column }
+nav { display: flex; gap: 4px; padding: 10px 16px; background: #fff; border-bottom: 2px solid #dde4ef; flex: none }
+nav button { font: 15px system-ui; padding: 7px 16px; border: 1px solid #c3cfdf; border-radius: 7px; background: #f7f9fc; color: #33445c; cursor: pointer }
+nav button[aria-selected="true"] { background: #315cf5; border-color: #315cf5; color: #fff; font-weight: 600 }
+main { position: relative; flex: 1; min-height: 0 }
+section { position: absolute; inset: 0; padding: 20px; display: none; overflow: auto }
+section[data-tab="typing"] { padding: 0 }
+section[data-active="true"] { display: block }
+h2 { margin: 0 0 6px; font-size: 17px; font-weight: 600; color: #4a5b74 }
+p.hint { margin: 0 0 16px; font-size: 14px; color: #6b7d96 }
+/* Same box as the original single-page probe: the scripted input test clicks
+   at view (120, 90), so the field must still cover that point. */
+#field { position: absolute; left: 20px; top: 20px; width: 620px; height: 220px; padding: 16px; font-size: 22px; border: 3px solid #315cf5; border-radius: 10px; background: #fff; display: block }
+/* Positions match the original single-page layout so the synthetic drag probe
+   (which drives CEF at fixed view coordinates) keeps working unchanged. */
+#dragme { position: absolute; left: 820px; top: 20px; width: 180px; height: 80px; background: #315cf5; color: #fff; border-radius: 8px; display: flex; align-items: center; justify-content: center; font-weight: 700 }
+#dropzone { position: absolute; left: 820px; top: 140px; width: 180px; height: 100px; border: 3px dashed #315cf5; border-radius: 8px; display: flex; align-items: center; justify-content: center }
+/* Keep repeated menu/input probes from pushing the test controls off-screen.
+   The title still contains every event; only the visible log is scrollable. */
+#log { font: 14px ui-monospace, monospace; white-space: pre-wrap; margin-top: 18px; color: #29394f; max-height: 180px; overflow: auto; flex-shrink: 0 }
+</style>
+
+<nav id="tabs">
+  <button data-tab="typing" aria-selected="true">输入法 / 键盘</button>
+  <button data-tab="mouse">鼠标 / 滚轮</button>
+  <button data-tab="drag">拖拽 / 右键菜单</button>
+</nav>
+
+<main>
+  <section data-tab="typing" data-active="true">
+    <input id="field" placeholder="click me, then type">
+    <h2 style="position:absolute;left:672px;top:24px">中文输入法与键盘</h2>
+    <p class="hint" style="position:absolute;left:672px;top:60px;width:300px">
+      点进文本框，切到中文输入法打字。<br>
+      观察候选窗位置、组合下划线、光标形状。
+    </p>
+  </section>
+
+  <section data-tab="mouse">
+    <h2>鼠标与滚轮</h2>
+    <p class="hint">在页面各处移动、点击、滚轮。观察光标是否随链接/文字/默认区域变化。</p>
+    <p style="line-height:2">
+      这是一段普通文字，把指针移到这里应该是 I 型光标。<br>
+      <a href="#" id="link">这是一个链接</a>，悬停时应该变成手型。<br>
+      <span id="empty" style="display:inline-block;min-width:260px">空白区域</span>
+    </p>
+    <div style="height:1200px;padding-top:20px;color:#8b9bb1">（向下滚动，测试滚轮与纵向滚动）</div>
+  </section>
+
+  <section data-tab="drag">
+    <h2>拖拽与右键菜单</h2>
+    <p class="hint">拖动蓝色方块到虚线框；在任意位置右键打开 CEF 菜单。</p>
+    <div id="dragme" draggable="true">drag me</div>
+    <div id="dropzone">drop zone</div>
+  </section>
+</main>
+
+<div id="log" style="padding:0 20px 20px">no events yet</div>
+
+<script>
+const events = [];
+const log = document.getElementById('log');
+const field = document.getElementById('field');
+function note(text) {
+  events.push(text);
+  // The host reads the document title; joining keeps every event visible.
+  document.title = events.join('|');
+  log.textContent = events.join('\n');
+}
+
+// Tabs. Kept in-page so one URL covers every probe; the automation scripts only
+// depend on element ids and the title log, which stay the same.
+const tabs = document.getElementById('tabs');
+const sections = Array.from(document.querySelectorAll('section'));
+
+function selectTab(name) {
+  const button = Array.from(tabs.querySelectorAll('button')).find(b => b.dataset.tab === name);
+  if (!button) return;
+  for (const b of tabs.querySelectorAll('button')) {
+    b.setAttribute('aria-selected', String(b === button));
+  }
+  for (const s of sections) {
+    s.dataset.active = String(s.dataset.tab === name);
+  }
+}
+
+tabs.addEventListener('click', e => {
+  const button = e.target.closest('button[data-tab]');
+  if (button) selectTab(button.dataset.tab);
+});
+
+// `#drag` lets a scripted self-test open the tab whose elements sit at the
+// coordinates it drives; the default tab keeps a human on the typing field.
+if (location.hash === '#drag') selectTab('drag');
+if (location.hash === '#mouse') selectTab('mouse');
+
+function reportLayout() {
+  const r = field.getBoundingClientRect();
+  note('field:' + [r.left, r.top, r.width, r.height].map(Math.round).join(','));
+}
+window.addEventListener('mousedown', e => note('mousedown:' + e.clientX + ',' + e.clientY));
+window.addEventListener('mouseup', e => note('mouseup:' + e.clientX + ',' + e.clientY));
+window.addEventListener('wheel', e => note('wheel:' + Math.round(e.deltaY)), { passive: true });
+// Drag detection: a pointer move with a held button is what text selection and
+// in-page dragging produce. Report the first one so the host can assert it.
+let dragReported = false;
+window.addEventListener('mousemove', e => {
+  if (e.buttons && !dragReported) { dragReported = true; note('drag:' + e.clientX + ',' + e.clientY); }
+});
+window.addEventListener('dragover', e => { e.preventDefault(); note('dragover'); });
+// The context menu itself is drawn by the host, so record that the click event
+// reached the page and what the host answered through the menu callback.
+window.addEventListener('contextmenu', e => note('contextmenu:' + Math.round(e.clientX) + ',' + Math.round(e.clientY)));
+window.addEventListener('drop', e => {
+  e.preventDefault();
+  const files = Array.from(e.dataTransfer.files).map(f => f.name);
+  note('drop:' + (files.join(',') || 'none'));
+});
+window.addEventListener('keydown', e => note('keydown:' + e.key));
+window.addEventListener('compositionstart', () => note('compositionstart'));
+window.addEventListener('compositionupdate', e => note('compositionupdate:' + e.data));
+window.addEventListener('compositionend', () => note('compositionend:' + e.data));
+field.addEventListener('input', e => note('input:' + e.target.value));
+// HTML5 drag inside the page: this is the path CEF's StartDragging covers.
+const dragme = document.getElementById('dragme');
+const dropzone = document.getElementById('dropzone');
+dragme.addEventListener('dragstart', e => { e.dataTransfer.setData('text/plain', 'dragme'); note('dragstart'); });
+dropzone.addEventListener('dragover', e => { e.preventDefault(); });
+dropzone.addEventListener('drop', e => { e.preventDefault(); note('htmldrop:' + e.dataTransfer.getData('text/plain')); });
+</script>
+</html>

@@ -1,0 +1,104 @@
+[package]
+name = "gpui-cef-poc"
+version = "0.2.0"
+edition = "2024"
+license = "MIT"
+description = "Minimal Windows x64 GPUI + CEF software OSR proof of concept"
+default-run = "gpui-cef-component-demo"
+
+[features]
+default = ["component-demo"]
+component-demo = ["dep:rust-cef-gpui"]
+# Keep the original self-test binary and its dependencies explicitly selectable.
+legacy-demo = ["dep:cef", "dep:gpui-component", "dep:image", "dep:raw-window-handle", "dep:smallvec", "dep:windows-core", "dep:windows"]
+
+[[bin]]
+name = "gpui-cef-component-demo"
+path = "src/bin/component-demo.rs"
+required-features = ["component-demo"]
+
+[[bin]]
+name = "gpui-cef-poc"
+path = "src/main.rs"
+required-features = ["legacy-demo"]
+
+# Shared logic remains std-only; the desktop demo targets Windows x64 MSVC.
+[dependencies]
+rust-cef-core.workspace = true
+
+[target.'cfg(target_os = "windows")'.dependencies]
+# The migration demo uses the existing public façade, without validation hooks.
+rust-cef-gpui = { path = "crates/rust-cef-gpui", optional = true }
+# gpui-pre is the pre-release line; gpui-component 0.9.1 pins this exact
+# version, so the two move together or not at all.
+gpui = { version = "=0.3.12", package = "gpui-pre", default-features = false, features = ["windows-manifest"] }
+# gpui-pre split the platform layer out; `Application::new()` no longer exists and
+# this crate supplies `application()` instead.
+gpui_platform = { version = "=0.3.12", package = "gpui-pre-platform" }
+# Styled component set (buttons, menus, inputs) from the GPUI Kit project. It
+# pins the same gpui-pre version, so the two must move together.
+gpui-component = { version = "=0.9.1", default-features = false, optional = true }
+image = { version = "0.25", default-features = false, optional = true }
+# gpui's `Window` implements `HasWindowHandle` from this crate; the raw HWND is
+# needed for the two Win32 calls gpui does not wrap (IME candidate placement).
+raw-window-handle = { version = "0.6", optional = true }
+smallvec = { version = "1.15", optional = true }
+cef = { workspace = true, optional = true }
+# Only for the OLE drag-and-drop loop: `StartDragging` from a page drag has to
+# hand an IDataObject to DoDragDrop, which GPUI's own API does not expose.
+# `#[implement]` expands to code that names `windows_core` directly.
+windows-core = { version = "0.61", optional = true }
+windows = { version = "0.61", optional = true, features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
+    "Win32_System_SystemServices",
+    "Win32_UI_Shell",
+    # IME candidate-window placement: gpui only positions it once, on
+    # WM_IME_STARTCOMPOSITION, which is before CEF reports the caret rectangle.
+    "Win32_UI_Input_Ime",
+    # CreateCaret/SetCaretPos: Chinese IMEs position their candidate window from
+    # the system caret, ignoring ImmSetCandidateWindow unless TSF is enabled.
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    # `STGMEDIUM` / `IDataObject` are gated behind these two in windows 0.6x.
+    # The old gpui 0.2.2 tree happened to enable them transitively; gpui-pre's
+    # does not, so they have to be requested explicitly.
+    "Win32_Graphics_Gdi",
+    "Win32_System_Com_StructuredStorage",
+] }
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+
+[workspace]
+resolver = "3"
+members = [
+    "crates/rust-cef-core",
+    "crates/rust-cef-runtime",
+    "crates/rust-cef-helper",
+    "crates/rust-cef-ui",
+    "crates/rust-cef-gpui",
+]
+exclude = ["validation/api-check", "validation/component-host", "validation/gpui-runtime-probe"]
+
+[workspace.dependencies]
+rust-cef-core = { path = "crates/rust-cef-core" }
+rust-cef-runtime = { path = "crates/rust-cef-runtime" }
+rust-cef-ui = { path = "crates/rust-cef-ui" }
+cef = { git = "https://github.com/tauri-apps/cef-rs", rev = "7b6bf84e76e919790bd61df077e29dc4132eb5e2", default-features = false }
+gpui = { version = "=0.3.12", package = "gpui-pre", default-features = false, features = ["windows-manifest"] }
+gpui-component = { version = "=0.9.1", default-features = false }

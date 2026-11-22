@@ -1,0 +1,11 @@
+/target/
+/.cef/
+/.deps/
+/.cargo-home/
+/.codegraph/
+/.idea/
+/.pi/
+/.agents/
+/execution/
+/AGENTS.md
+*.log

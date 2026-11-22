@@ -1,0 +1,24 @@
+[package]
+name = "gpui-cef-api-check"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Standalone check harness, never a distributable app.
+[workspace]
+
+[[bin]]
+name = "gpui-cef-api-check"
+path = "main.rs"
+
+[dependencies]
+gpui-cef-poc = { path = "../.." }
+gpui = { version = "=0.2.2", default-features = false }
+image = { version = "0.25", default-features = false }
+smallvec = "1.15"
+cef = { git = "https://github.com/tauri-apps/cef-rs", rev = "7b6bf84e76e919790bd61df077e29dc4132eb5e2", default-features = false, features = ["dox"] }
+
+[profile.dev]
+opt-level = 1
+[profile.dev.package."*"]
+opt-level = 2

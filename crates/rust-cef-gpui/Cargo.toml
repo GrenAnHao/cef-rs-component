@@ -1,0 +1,29 @@
+[package]
+name = "rust-cef-gpui"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+description = "Thin GPUI rendering and window adapter over rust-cef-ui"
+
+[features]
+# Test-only forwarding of runtime frame-probe controls. Off by default: the
+# product API and dependency versions stay unchanged unless a validation build
+# opts in explicitly.
+validation = ["rust-cef-ui/validation", "rust-cef-runtime/test-support"]
+
+[dependencies]
+rust-cef-core.workspace = true
+rust-cef-runtime.workspace = true
+rust-cef-ui.workspace = true
+async-channel = "=2.5.0"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+gpui.workspace = true
+# VIEW presentation reuses the same real RenderImage path as the root UI: the
+# image crate supplies the concrete pixel frame, smallvec the GPUI frame list.
+# Both versions are already locked workspace-wide; no new external package is
+# introduced.
+image = { version = "=0.25.10", default-features = false }
+smallvec = "=1.16.5"
+raw-window-handle = "=0.6.2"

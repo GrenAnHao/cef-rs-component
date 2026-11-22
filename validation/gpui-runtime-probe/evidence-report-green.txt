@@ -1,0 +1,15 @@
+
+running 10 tests
+test windows::tests::complete_integrated_evidence_decides_success_not_default_failure ... ok
+test windows::tests::complete_threaded_evidence_decides_success_without_manual_pump ... ok
+test windows::tests::fatal_start_preserves_the_requested_exit_code ... ok
+test windows::tests::incomplete_host_evidence_fails_even_when_native_fields_look_complete ... ok
+test windows::tests::missing_evidence_never_reports_success_or_fabricates_zero ... ok
+test windows::tests::shutdown_barrier_failure_is_not_overwritten_by_complete_diag ... ok
+test windows::tests::threaded_frame_phase_requires_a_consumed_wake ... ok
+test windows::tests::threaded_notified_tick_counts_one_consumed_wake ... ok
+test windows::tests::threaded_success_requires_consumed_frame_notifications ... ok
+test windows::tests::threaded_timer_is_unconditional_failure_in_the_frame_phase ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
