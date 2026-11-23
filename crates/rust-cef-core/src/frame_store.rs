@@ -108,10 +108,7 @@ impl FrameStore {
         let Ok(token) = self.mailbox.capture_token(SurfaceKind::View, width, height) else {
             return false;
         };
-        let frame = OwnedFrame {
-            info: token.info(),
-            pixels: buffer.freeze(),
-        };
+        let frame = OwnedFrame::from_cpu_pixels(token.info(), buffer.freeze());
         self.mailbox.publish(frame).is_ok()
     }
 
@@ -132,10 +129,11 @@ impl FrameStore {
 
     pub fn latest(&self) -> Option<BrowserFrame> {
         let frame = self.mailbox.latest(SurfaceKind::View)?;
+        let bgra = frame.cpu_pixels()?.clone();
         Some(BrowserFrame {
             width: frame.info.width,
             height: frame.info.height,
-            bgra: frame.pixels.clone(),
+            bgra,
             sequence: frame.info.sequence,
         })
     }

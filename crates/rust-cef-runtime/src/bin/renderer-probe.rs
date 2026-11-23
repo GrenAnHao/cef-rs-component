@@ -800,7 +800,24 @@ mod windows {
                 | BrowserEvent::LoadFinished { .. }
                 | BrowserEvent::LoadCancelled { .. }
                 | BrowserEvent::LoadFailed { .. }
-                | BrowserEvent::BeforeUnloadRequested { .. } => {}
+                | BrowserEvent::BeforeUnloadRequested { .. }
+                | BrowserEvent::CursorChanged(_)
+                | BrowserEvent::TooltipChanged(_)
+                | BrowserEvent::StatusMessageChanged(_)
+                | BrowserEvent::FaviconUrlsChanged(_)
+                | BrowserEvent::FullscreenModeChanged(_)
+                | BrowserEvent::LoadingProgressChanged(_)
+                | BrowserEvent::ConsoleMessage { .. }
+                | BrowserEvent::ZoomLevelChanged(_)
+                | BrowserEvent::AudioMutedChanged(_)
+                | BrowserEvent::FocusTaken { .. }
+                | BrowserEvent::GotFocus
+                | BrowserEvent::HostShortcutTriggered { .. }
+                | BrowserEvent::JsMessageReceived { .. }
+                | BrowserEvent::EvalCompleted { .. }
+                | BrowserEvent::StartOutboundDrag(_)
+                | BrowserEvent::OutboundDragCursorChanged(_)
+                | BrowserEvent::AccessibilityTreeUpdated { .. } => {}
             }
             if state.created.saturating_add(state.closed) > 0 {
                 // Lifecycle transitions are counted, never replayed from a log:
@@ -835,7 +852,11 @@ mod windows {
                 state.record_error("frame dimensions overflow");
                 return PublishResult::Rejected;
             };
-            if frame.pixels.len() != stride {
+            let Some(pixels) = frame.cpu_pixels() else {
+                state.record_error("frame payload is not cpu pixels");
+                return PublishResult::Rejected;
+            };
+            if pixels.len() != stride {
                 state.record_error("frame length does not match its dimensions");
                 return PublishResult::Rejected;
             }
@@ -853,7 +874,7 @@ mod windows {
                 .insert(frame.info.browser, frame.info.sequence);
             let valid = width == FRAME_WIDTH_U32 && height == FRAME_HEIGHT_U32 && {
                 let center = ((height as usize / 2) * width as usize + width as usize / 2) * 4;
-                frame.pixels.get(center..center + 4) == Some(&CENTER_BGRA)
+                pixels.get(center..center + 4) == Some(&CENTER_BGRA)
             };
             if valid && state.first_width == 0 {
                 state.first_width = width;

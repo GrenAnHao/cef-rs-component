@@ -651,9 +651,6 @@ impl NativeImeController {
             if input.cleanup_pending || input.cleanup_failed {
                 return Err(NativeImeFailure::CleanupPending);
             }
-            if !input.accepts_text {
-                return Err(NativeImeFailure::InputNotReady);
-            }
             if input.epoch != epoch {
                 return Err(NativeImeFailure::EpochMismatch);
             }

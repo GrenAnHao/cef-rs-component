@@ -14,6 +14,7 @@ use crate::contracts::{
 use crate::{
     frame_budget::BudgetedPixels,
     ime::ImeSnapshot,
+    inbound_drag::InboundDragCommand,
     input::{BrowserTouchEvent, InputEvent, InputResetReason, InputSnapshot},
     js_bridge::{EvalOutcome, EvalRequestId, JsFrameScope},
     mailbox::FrameUpdate,
@@ -101,6 +102,11 @@ pub enum BrowserCommand {
     TouchEvent(BrowserTouchEvent),
     SetNativeBounds(PixelRect),
     NotifyParentMoved,
+    SetScreenOrigin {
+        x_px: i32,
+        y_px: i32,
+    },
+    DragTarget(InboundDragCommand),
 }
 
 impl std::fmt::Debug for BrowserCommand {
@@ -157,6 +163,12 @@ impl std::fmt::Debug for BrowserCommand {
             Self::TouchEvent(touch) => f.debug_tuple("TouchEvent").field(touch).finish(),
             Self::SetNativeBounds(rect) => f.debug_tuple("SetNativeBounds").field(rect).finish(),
             Self::NotifyParentMoved => f.write_str("NotifyParentMoved"),
+            Self::SetScreenOrigin { x_px, y_px } => f
+                .debug_struct("SetScreenOrigin")
+                .field("x_px", x_px)
+                .field("y_px", y_px)
+                .finish(),
+            Self::DragTarget(cmd) => f.debug_tuple("DragTarget").field(cmd).finish(),
         }
     }
 }
@@ -508,13 +520,275 @@ pub struct FrameInfo {
     pub format: PixelFormat,
 }
 
+pub const SHARED_TEXTURE_SLOT_COUNT: usize = 4;
+
+const NO_SHARED_SLOT: u8 = u8::MAX;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TextureFormat {
+    Bgra8888,
+}
+
+impl TextureFormat {
+    #[must_use]
+    pub const fn dxgi_format_raw(self) -> u32 {
+        match self {
+            Self::Bgra8888 => 87, // DXGI_FORMAT_B8G8R8A8_UNORM
+        }
+    }
+}
+
+/// Lock-free quad-buffered slot state coordinator shared between the CEF render
+/// handler pool and UI consumers (`FrameMailbox` -> `SurfacePipeline` -> `CefBrowser`).
+#[derive(Debug)]
+pub struct SharedTextureSlotTracker {
+    latest_ready: std::sync::atomic::AtomicU8,
+    presenting: std::sync::atomic::AtomicU8,
+    next_write_cursor: std::sync::atomic::AtomicU8,
+    consumer_refs: [std::sync::atomic::AtomicU32; SHARED_TEXTURE_SLOT_COUNT],
+}
+
+impl Default for SharedTextureSlotTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SharedTextureSlotTracker {
+    #[must_use]
+    pub const fn new() -> Self {
+        use std::sync::atomic::{AtomicU8, AtomicU32};
+        Self {
+            latest_ready: AtomicU8::new(NO_SHARED_SLOT),
+            presenting: AtomicU8::new(NO_SHARED_SLOT),
+            next_write_cursor: AtomicU8::new(0),
+            consumer_refs: [
+                AtomicU32::new(0),
+                AtomicU32::new(0),
+                AtomicU32::new(0),
+                AtomicU32::new(0),
+            ],
+        }
+    }
+
+    /// Selects a free slot index in `0..SHARED_TEXTURE_SLOT_COUNT` that is neither
+    /// `latest_ready`, `presenting`, nor held by any active consumer lease.
+    pub fn acquire_write_slot(&self) -> Option<usize> {
+        use std::sync::atomic::Ordering;
+
+        let latest = self.latest_ready.load(Ordering::Acquire);
+        let presenting = self.presenting.load(Ordering::Acquire);
+        let start =
+            usize::from(self.next_write_cursor.load(Ordering::Relaxed)) % SHARED_TEXTURE_SLOT_COUNT;
+
+        for offset in 0..SHARED_TEXTURE_SLOT_COUNT {
+            let slot = (start + offset) % SHARED_TEXTURE_SLOT_COUNT;
+            let slot_u8 = slot as u8;
+            if slot_u8 == latest || slot_u8 == presenting {
+                continue;
+            }
+            if self.consumer_refs[slot].load(Ordering::Acquire) != 0 {
+                continue;
+            }
+            self.next_write_cursor
+                .store(((slot + 1) % SHARED_TEXTURE_SLOT_COUNT) as u8, Ordering::Release);
+            return Some(slot);
+        }
+        None
+    }
+
+    pub fn publish_ready(&self, slot_index: usize) {
+        if slot_index < SHARED_TEXTURE_SLOT_COUNT {
+            self.latest_ready
+                .store(slot_index as u8, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    pub fn clear_latest_ready_if(&self, slot_index: usize) {
+        if slot_index < SHARED_TEXTURE_SLOT_COUNT {
+            let _ = self.latest_ready.compare_exchange(
+                slot_index as u8,
+                NO_SHARED_SLOT,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            );
+        }
+    }
+
+    pub fn clear_latest_ready(&self) {
+        self.latest_ready
+            .store(NO_SHARED_SLOT, std::sync::atomic::Ordering::Release);
+    }
+
+    pub fn mark_presenting(&self, slot_index: usize) {
+        if slot_index < SHARED_TEXTURE_SLOT_COUNT {
+            let slot_u8 = slot_index as u8;
+            self.presenting
+                .store(slot_u8, std::sync::atomic::Ordering::Release);
+            let _ = self.latest_ready.compare_exchange(
+                slot_u8,
+                NO_SHARED_SLOT,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            );
+        }
+    }
+
+    pub fn clear_presenting(&self) {
+        self.presenting
+            .store(NO_SHARED_SLOT, std::sync::atomic::Ordering::Release);
+    }
+
+    pub fn clear_presenting_if(&self, slot_index: usize) {
+        if slot_index < SHARED_TEXTURE_SLOT_COUNT {
+            let _ = self.presenting.compare_exchange(
+                slot_index as u8,
+                NO_SHARED_SLOT,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            );
+        }
+    }
+
+    #[must_use]
+    pub fn latest_ready_slot(&self) -> Option<usize> {
+        let raw = self.latest_ready.load(std::sync::atomic::Ordering::Acquire);
+        (raw != NO_SHARED_SLOT).then_some(usize::from(raw))
+    }
+
+    #[must_use]
+    pub fn presenting_slot(&self) -> Option<usize> {
+        let raw = self.presenting.load(std::sync::atomic::Ordering::Acquire);
+        (raw != NO_SHARED_SLOT).then_some(usize::from(raw))
+    }
+
+    #[must_use]
+    pub fn consumer_ref_count(&self, slot_index: usize) -> u32 {
+        self.consumer_refs
+            .get(slot_index)
+            .map_or(0, |count| count.load(std::sync::atomic::Ordering::Acquire))
+    }
+
+    #[must_use]
+    pub fn lease(self: &Arc<Self>, slot_index: usize) -> SharedTextureLease {
+        assert!(
+            slot_index < SHARED_TEXTURE_SLOT_COUNT,
+            "shared texture slot index {slot_index} out of bounds"
+        );
+        self.consumer_refs[slot_index].fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        SharedTextureLease {
+            inner: Arc::new(SharedTextureLeaseInner {
+                tracker: Arc::clone(self),
+                slot_index,
+            }),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct SharedTextureLeaseInner {
+    tracker: Arc<SharedTextureSlotTracker>,
+    slot_index: usize,
+}
+
+impl Drop for SharedTextureLeaseInner {
+    fn drop(&mut self) {
+        // Clear stale ready/presenting flags BEFORE dropping consumer_refs so a producer
+        // cannot re-acquire and re-publish this slot before old flags are cleared.
+        self.tracker.clear_latest_ready_if(self.slot_index);
+        self.tracker.clear_presenting_if(self.slot_index);
+        self.tracker.consumer_refs[self.slot_index]
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct SharedTextureLease {
+    inner: Arc<SharedTextureLeaseInner>,
+}
+
+impl SharedTextureLease {
+    #[must_use]
+    pub fn tracker(&self) -> &Arc<SharedTextureSlotTracker> {
+        &self.inner.tracker
+    }
+
+    #[must_use]
+    pub fn slot_index(&self) -> usize {
+        self.inner.slot_index
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct GpuSharedTextureFrame {
+    pub pool_id: u64,
+    pub shared_handle: isize,
+    pub is_nt_handle: bool,
+    pub keyed_mutex_key: Option<u64>,
+    pub width: u32,
+    pub height: u32,
+    pub format: TextureFormat,
+    pub frame_seq: u64,
+    pub slot_index: usize,
+    pub generation: u64,
+    pub resource_keepalive: std::sync::Weak<()>,
+    pub handle_owner: std::sync::Arc<dyn std::any::Any + Send + Sync>,
+    pub lease: SharedTextureLease,
+}
+
+#[derive(Clone, Debug)]
+pub enum FramePayload {
+    CpuBgra {
+        buffer: Arc<BudgetedPixels>,
+        width: u32,
+        height: u32,
+        format: PixelFormat,
+    },
+    GpuSharedTexture(GpuSharedTextureFrame),
+}
+
 #[derive(Clone, Debug)]
 pub struct OwnedFrame {
     pub info: FrameInfo,
-    /// Immutable premultiplied BGRA pixels owned by the producing Browser's
-    /// CPU budget. The private `Box<[u8]>` inside `BudgetedPixels` cannot be
-    /// cloned or taken out, only copied through `copy_buffer` (same ledger).
-    pub pixels: Arc<BudgetedPixels>,
+    /// Frame image payload: either a budgeted CPU BGRA pixel buffer or a handle
+    /// to a slot in the producer's triple-buffered D3D11 shared texture pool.
+    pub payload: FramePayload,
+}
+
+impl OwnedFrame {
+    #[must_use]
+    pub fn from_cpu_pixels(info: FrameInfo, buffer: Arc<BudgetedPixels>) -> Self {
+        Self {
+            info,
+            payload: FramePayload::CpuBgra {
+                width: info.width,
+                height: info.height,
+                format: info.format,
+                buffer,
+            },
+        }
+    }
+
+    #[must_use]
+    pub fn cpu_pixels(&self) -> Option<&Arc<BudgetedPixels>> {
+        match &self.payload {
+            FramePayload::CpuBgra { buffer, .. } => Some(buffer),
+            FramePayload::GpuSharedTexture(_) => None,
+        }
+    }
+
+    #[must_use]
+    pub fn gpu_texture(&self) -> Option<&GpuSharedTextureFrame> {
+        match &self.payload {
+            FramePayload::CpuBgra { .. } => None,
+            FramePayload::GpuSharedTexture(frame) => Some(frame),
+        }
+    }
+
+    #[must_use]
+    pub fn is_gpu_shared(&self) -> bool {
+        matches!(self.payload, FramePayload::GpuSharedTexture(_))
+    }
 }
 
 pub trait RuntimeDriver {
@@ -785,6 +1059,77 @@ pub trait BrowserControl: Send + Sync {
         Err(EngineError::NotReady)
     }
     fn request_close(&self, mode: CloseMode) -> CloseTicket;
+    /// Latest CEF `RenderHandler::update_drag_cursor` mask for inbound OSR drags.
+    fn drag_target_operation(&self) -> DragOperationMask {
+        DragOperationMask::NONE
+    }
+    /// Fast readiness query for high-rate pointer streaming without locking or
+    /// cloning snapshots.
+    fn is_fast_input_ready(&self) -> bool {
+        let s = self.snapshot();
+        s.state == crate::contracts::SessionState::Alive
+            && s.renderer.state != crate::contracts::RendererState::Terminated
+    }
+    /// High-rate lock-free/coalesced `MouseMove` submission path preserving
+    /// causal order with discrete input commands.
+    fn submit_mouse_move_fast(
+        &self,
+        x: i32,
+        y: i32,
+        leaving: bool,
+        modifiers: MouseModifiers,
+    ) -> Result<(), EngineError> {
+        let snapshot = self.input_snapshot()?;
+        if snapshot.cleanup_pending || snapshot.cleanup_failed {
+            if snapshot.cleanup_pending && !snapshot.cleanup_failed {
+                return Err(EngineError::Backpressure);
+            }
+            return Err(EngineError::NotReady);
+        }
+        self.submit(BrowserCommand::Input(crate::input::InputEvent {
+            epoch: snapshot.epoch,
+            kind: crate::input::InputKind::MouseMove {
+                x,
+                y,
+                leaving,
+                modifiers,
+            },
+        }))
+        .map(|_| ())
+    }
+    /// High-rate lock-free/coalesced `MouseWheel` submission path preserving
+    /// causal order with discrete input commands.
+    fn submit_mouse_wheel_fast(
+        &self,
+        x: i32,
+        y: i32,
+        delta_x: i32,
+        delta_y: i32,
+        modifiers: MouseModifiers,
+    ) -> Result<(), EngineError> {
+        let snapshot = self.input_snapshot()?;
+        if snapshot.cleanup_pending || snapshot.cleanup_failed {
+            if snapshot.cleanup_pending && !snapshot.cleanup_failed {
+                return Err(EngineError::Backpressure);
+            }
+            return Err(EngineError::NotReady);
+        }
+        self.submit(BrowserCommand::Input(crate::input::InputEvent {
+            epoch: snapshot.epoch,
+            kind: crate::input::InputKind::MouseWheel {
+                x,
+                y,
+                delta_x,
+                delta_y,
+                modifiers,
+            },
+        }))
+        .map(|_| ())
+    }
+    /// Latest-wins coalesced zoom submission path avoiding Blink reflow backlog.
+    fn submit_zoom_level_fast(&self, level: f64) -> Result<(), EngineError> {
+        self.submit(BrowserCommand::SetZoomLevel(level)).map(|_| ())
+    }
 }
 
 #[derive(Clone)]
@@ -795,6 +1140,41 @@ pub struct BrowserHandle {
 impl BrowserHandle {
     pub fn new(control: Arc<dyn BrowserControl>) -> Self {
         Self { control }
+    }
+
+    pub fn drag_target_operation(&self) -> DragOperationMask {
+        self.control.drag_target_operation()
+    }
+
+    pub fn is_fast_input_ready(&self) -> bool {
+        self.control.is_fast_input_ready()
+    }
+
+    pub fn submit_mouse_move_fast(
+        &self,
+        x: i32,
+        y: i32,
+        leaving: bool,
+        modifiers: MouseModifiers,
+    ) -> Result<(), EngineError> {
+        self.control
+            .submit_mouse_move_fast(x, y, leaving, modifiers)
+    }
+
+    pub fn submit_mouse_wheel_fast(
+        &self,
+        x: i32,
+        y: i32,
+        delta_x: i32,
+        delta_y: i32,
+        modifiers: MouseModifiers,
+    ) -> Result<(), EngineError> {
+        self.control
+            .submit_mouse_wheel_fast(x, y, delta_x, delta_y, modifiers)
+    }
+
+    pub fn submit_zoom_level_fast(&self, level: f64) -> Result<(), EngineError> {
+        self.control.submit_zoom_level_fast(level)
     }
 
     pub fn submit(&self, command: BrowserCommand) -> Result<CommandId, EngineError> {

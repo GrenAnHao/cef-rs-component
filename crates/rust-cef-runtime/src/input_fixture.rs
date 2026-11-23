@@ -209,10 +209,13 @@ impl FrameInputSender {
         else {
             return PublishResult::Rejected;
         };
+        let Some(pixels) = frame.cpu_pixels() else {
+            return PublishResult::Rejected;
+        };
         if frame.info.surface != SurfaceKind::View
             || frame.info.width == 0
             || frame.info.height == 0
-            || len as usize != frame.pixels.len()
+            || len as usize != pixels.len()
         {
             return PublishResult::Rejected;
         }
@@ -541,7 +544,8 @@ impl InputFixture {
         let Some(frame) = lock(&self.state.frames).clone() else {
             return;
         };
-        let marker = (Arc::as_ptr(&frame.pixels) as usize, frame.info.sequence);
+        let ptr = frame.cpu_pixels().map_or(0, |p| Arc::as_ptr(p) as usize);
+        let marker = (ptr, frame.info.sequence);
         let mut presented = lock(&self.state.presented);
         if *presented == Some(marker) {
             return;
@@ -742,11 +746,12 @@ unsafe fn paint(hwnd: HWND, state: &WndState) {
     // SAFETY: writable RECT; the window is alive for this message.
     let have_client = unsafe { GetClientRect(hwnd, &mut rect) } != 0;
     let (width, height) = (rect.right - rect.left, rect.bottom - rect.top);
-    if let Some(frame) = frame
+    if let Some(ref frame) = frame
+        && let Some(pixels) = frame.cpu_pixels()
         && have_client
         && width > 0
         && height > 0
-        && frame.pixels.len() == frame.info.width as usize * frame.info.height as usize * 4
+        && pixels.len() == frame.info.width as usize * frame.info.height as usize * 4
     {
         let (frame_width, frame_height) = (frame.info.width as i32, frame.info.height as i32);
         let info = BITMAPINFO {
@@ -757,7 +762,7 @@ unsafe fn paint(hwnd: HWND, state: &WndState) {
                 biPlanes: 1,
                 biBitCount: 32,
                 biCompression: BI_RGB,
-                biSizeImage: frame.pixels.len() as u32,
+                biSizeImage: pixels.len() as u32,
                 biXPelsPerMeter: 0,
                 biYPelsPerMeter: 0,
                 biClrUsed: 0,
@@ -778,7 +783,7 @@ unsafe fn paint(hwnd: HWND, state: &WndState) {
                 0,
                 frame_width,
                 frame_height,
-                frame.pixels.as_ptr() as *const c_void,
+                pixels.as_ptr() as *const c_void,
                 &info,
                 DIB_RGB_COLORS,
                 SRCCOPY,

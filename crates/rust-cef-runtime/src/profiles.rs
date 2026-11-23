@@ -1201,12 +1201,17 @@ wrap_request_context_handler! {
             request_initiator: Option<&CefString>,
             _disable_default_handling: Option<&mut ::std::os::raw::c_int>,
         ) -> Option<ResourceRequestHandler> {
-            // DevTools workers (e.g. formatter_worker) have no Browser on the
-            // IO callback (CefSharp IRequestContextHandler.cs:27). Allow only
-            // bundled offline devtools:// assets initiated by devtools://devtools;
-            // all page/service-worker requests stay under TrustedContentPolicy.
+            // DevTools top-level navigations (browser == None, opaque/"null"
+            // initiator in CEF 156 Chrome runtime) and workers (e.g.
+            // formatter_worker, initiator "devtools://devtools") both arrive on
+            // the IO callback without a Browser (CefSharp IRequestContextHandler.cs:27).
+            // Allow only bundled offline devtools:// assets; all webpage and
+            // service-worker requests stay under TrustedContentPolicy.
             if browser.is_none()
-                && crate::devtools::native::policy::is_devtools_initiator(request_initiator)
+                && crate::devtools::native::policy::allows_context_devtools_request(
+                    request_initiator,
+                    _is_navigation != 0,
+                )
                 && request.is_some_and(|r| {
                     crate::devtools::native::policy::is_internal_devtools_resource(
                         &CefString::from(&r.url()).to_string(),

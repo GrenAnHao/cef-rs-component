@@ -100,6 +100,8 @@ fn scope(b: &Arc<Binding>) -> Scope {
         epoch: b.epoch.load(Ordering::Acquire),
         spelling_opening: b.spelling.opening(),
         delivery: Arc::downgrade(&b.target.delivery),
+        target: TargetMenuContext::default(),
+        synthesized_target: false,
     }
 }
 #[test]
@@ -345,6 +347,8 @@ fn capability_items_are_offered_only_for_configured_host_services() {
             source: true,
             devtools: true,
             structure: false,
+            navigation: false,
+            ..Default::default()
         }),
         vec![117, 130, 132, 28440, 28441]
     );
@@ -438,4 +442,308 @@ fn structural_ids_are_refused_unless_the_host_opted_in() {
         unsupported_capabilities(&model, false, false, false, true, |_| false),
         None
     );
+}
+
+#[test]
+fn blank_area_navigation_items_are_prepended_only_when_non_editable() {
+    let mut blank = MenuModel::default();
+    // With navigation opt-in off, blank model stays empty.
+    append_capability_items(&mut blank, MenuCapabilities::default());
+    assert!(blank.entries.is_empty());
+
+    // Non-editable blank area gets Back/Forward/Reload/Select All (+ Copy when selected).
+    prepend_navigation_items(&mut blank, false, true, false, false);
+    let ids: Vec<i32> = blank
+        .entries
+        .iter()
+        .filter_map(|e| match e {
+            MenuItem::Command(c) => Some(c.command_id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ids, vec![100, 101, 102, 117]);
+    assert!(
+        matches!(blank.entries[0], MenuItem::Command(ref c) if c.command_id == 100 && c.enabled)
+    );
+    assert!(
+        matches!(blank.entries[1], MenuItem::Command(ref c) if c.command_id == 101 && !c.enabled)
+    );
+    assert_eq!(unsupported(&blank), None);
+    assert!(blank.validate(config().model_limits).is_ok());
+
+    let mut with_selection = MenuModel::default();
+    prepend_navigation_items(&mut with_selection, false, false, true, true);
+    let sel_ids: Vec<i32> = with_selection
+        .entries
+        .iter()
+        .filter_map(|e| match e {
+            MenuItem::Command(c) => Some(c.command_id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(sel_ids, vec![100, 101, 102, 113, 117]);
+    assert!(with_selection.validate(config().model_limits).is_ok());
+
+    // Editable fields or models already carrying edit commands (110..=116) stay untouched.
+    let mut editable_empty = MenuModel::default();
+    prepend_navigation_items(&mut editable_empty, true, true, true, true);
+    assert!(editable_empty.entries.is_empty());
+
+    let mut editable_cut = MenuModel {
+        entries: vec![MenuItem::Command(MenuCommand {
+            command_id: 112,
+            label: "Cut".into(),
+            enabled: true,
+            visible: true,
+            checked: None,
+            radio_group: None,
+        })],
+        ..Default::default()
+    };
+    prepend_navigation_items(&mut editable_cut, false, true, true, true);
+    assert_eq!(editable_cut.entries.len(), 1);
+}
+
+#[test]
+fn filter_supported_and_prepend_handles_cef_raw_blank_and_editable_models() {
+    let cmd = |id: i32, label: &str| {
+        MenuItem::Command(MenuCommand {
+            command_id: id,
+            label: label.into(),
+            enabled: true,
+            visible: true,
+            checked: None,
+            radio_group: None,
+        })
+    };
+    let mut raw_blank = MenuModel {
+        entries: vec![
+            cmd(100, "Back"),
+            cmd(101, "Forward"),
+            cmd(102, "Reload"),
+            MenuItem::Separator { visible: true },
+            cmd(131, "Print..."),
+            cmd(132, "View source"),
+        ],
+        ..Default::default()
+    };
+    let caps = MenuCapabilities {
+        source: true,
+        devtools: true,
+        navigation: true,
+        ..Default::default()
+    };
+    filter_supported_items(&mut raw_blank, caps, |_| false);
+    prepend_navigation_items(&mut raw_blank, false, false, false, false);
+    append_capability_items(&mut raw_blank, caps);
+    let ids: Vec<i32> = raw_blank
+        .entries
+        .iter()
+        .filter_map(|e| match e {
+            MenuItem::Command(c) => Some(c.command_id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ids, vec![100, 101, 102, 117, 132, 28440, 28441]);
+    assert!(raw_blank.validate(config().model_limits).is_ok());
+    assert_eq!(
+        unsupported_capabilities(&raw_blank, true, false, true, false, |_| false),
+        None
+    );
+
+    let mut raw_editable = MenuModel {
+        entries: vec![
+            cmd(205, "No spelling suggestions"),
+            MenuItem::Separator { visible: true },
+            cmd(110, "Undo"),
+            cmd(113, "Copy"),
+            cmd(114, "Paste"),
+            cmd(117, "Select all"),
+        ],
+        ..Default::default()
+    };
+    filter_supported_items(&mut raw_editable, caps, |_| false);
+    prepend_navigation_items(&mut raw_editable, true, true, true, true);
+    let edit_ids: Vec<i32> = raw_editable
+        .entries
+        .iter()
+        .filter_map(|e| match e {
+            MenuItem::Command(c) => Some(c.command_id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(edit_ids, vec![110, 113, 114, 117]);
+    assert!(!matches!(
+        raw_editable.entries.first(),
+        Some(MenuItem::Separator { .. })
+    ));
+}
+
+#[test]
+fn link_and_image_chromium_commands_survive_filter_with_download_gating_and_no_blank_nav() {
+    let cmd = |id: i32, label: &str| {
+        MenuItem::Command(MenuCommand {
+            command_id: id,
+            label: label.into(),
+            enabled: true,
+            visible: true,
+            checked: None,
+            radio_group: None,
+        })
+    };
+    let make_model = || MenuModel {
+        entries: vec![
+            cmd(50100, "Open link in new tab"),
+            cmd(50104, "Copy link address"),
+            cmd(50120, "Save image as..."),
+            cmd(50121, "Copy image address"),
+            cmd(50122, "Copy image"),
+            cmd(50162, "Inspect"), // stripped because managed 28440 is appended
+        ],
+        ..Default::default()
+    };
+
+    let no_dl = MenuCapabilities {
+        devtools: true,
+        navigation: true,
+        download: false,
+        ..Default::default()
+    };
+    let mut m1 = make_model();
+    filter_supported_items(&mut m1, no_dl, |_| false);
+    prepend_navigation_items(&mut m1, false, true, true, false);
+    append_capability_items(&mut m1, no_dl);
+    let ids1: Vec<i32> = m1
+        .entries
+        .iter()
+        .filter_map(|e| match e {
+            MenuItem::Command(c) => Some(c.command_id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ids1, vec![50100, 50104, 50121, 50122, 28440, 28441]);
+    assert_eq!(
+        unsupported_capabilities_with_caps(&m1, no_dl, |_| false),
+        None
+    );
+
+    let with_dl = MenuCapabilities {
+        download: true,
+        ..no_dl
+    };
+    let mut m2 = make_model();
+    filter_supported_items(&mut m2, with_dl, |_| false);
+    prepend_navigation_items(&mut m2, false, true, true, false);
+    append_capability_items(&mut m2, with_dl);
+    let ids2: Vec<i32> = m2
+        .entries
+        .iter()
+        .filter_map(|e| match e {
+            MenuItem::Command(c) => Some(c.command_id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ids2, vec![50100, 50104, 50120, 50121, 50122, 28440, 28441]);
+    assert_eq!(
+        unsupported_capabilities_with_caps(&m2, with_dl, |_| false),
+        None
+    );
+}
+
+#[test]
+fn alloy_target_items_synthesize_for_links_and_images_respecting_popup_and_download_caps() {
+    let cmd = |id: i32, label: &str| {
+        MenuItem::Command(MenuCommand {
+            command_id: id,
+            label: label.into(),
+            enabled: true,
+            visible: true,
+            checked: None,
+            radio_group: None,
+        })
+    };
+    let extract_ids = |m: &MenuModel| -> Vec<i32> {
+        m.entries
+            .iter()
+            .filter_map(|e| match e {
+                MenuItem::Command(c) => Some(c.command_id),
+                _ => None,
+            })
+            .collect()
+    };
+
+    let full_caps = MenuCapabilities {
+        devtools: true,
+        navigation: true,
+        download: true,
+        popup: true,
+        ..Default::default()
+    };
+
+    // Link only in Alloy model (starts with Back/Forward/Reload/Select All).
+    let mut link_model = MenuModel {
+        entries: vec![
+            cmd(100, "Back"),
+            cmd(101, "Forward"),
+            cmd(102, "Reload"),
+            cmd(117, "Select All"),
+        ],
+        ..Default::default()
+    };
+    let link_target = TargetMenuContext {
+        link_url: Some("https://cn.bing.com/".into()),
+        ..Default::default()
+    };
+    assert!(prepend_target_items(
+        &mut link_model,
+        &link_target,
+        full_caps
+    ));
+    prepend_navigation_items(&mut link_model, false, false, false, false);
+    append_capability_items(&mut link_model, full_caps);
+    assert_eq!(
+        extract_ids(&link_model),
+        vec![50100, 50103, 50104, 117, 28440, 28441]
+    );
+    assert_eq!(
+        unsupported_capabilities_with_caps(&link_model, full_caps, |_| false),
+        None
+    );
+
+    // Image only (data: URL, has_image_contents = true), download & popup gated.
+    let mut img_model = MenuModel {
+        entries: vec![cmd(102, "Reload"), cmd(117, "Select All")],
+        ..Default::default()
+    };
+    let img_target = TargetMenuContext {
+        source_url: Some("data:image/png;base64,iVBOR==".into()),
+        is_image: true,
+        has_image_contents: true,
+        ..Default::default()
+    };
+    assert!(prepend_target_items(&mut img_model, &img_target, full_caps));
+    assert_eq!(
+        extract_ids(&img_model),
+        vec![50123, 50120, 50122, 50121, 117]
+    );
+
+    let limited_caps = MenuCapabilities {
+        navigation: true,
+        download: false,
+        popup: false,
+        ..Default::default()
+    };
+    let mut combined = MenuModel::default();
+    let both_target = TargetMenuContext {
+        link_url: Some("https://cn.bing.com/".into()),
+        source_url: Some("https://cn.bing.com/logo.png".into()),
+        is_image: true,
+        has_image_contents: false,
+    };
+    assert!(prepend_target_items(
+        &mut combined,
+        &both_target,
+        limited_caps
+    ));
+    assert_eq!(extract_ids(&combined), vec![50104, 50121]);
 }

@@ -32,30 +32,191 @@ use crate::{
     registry::{UiRegistry, WritableCefString, wake_frames},
 };
 
+type MonitorRectPair = ((i32, i32, i32, i32), (i32, i32, i32, i32));
+
+const MAX_OSR_TEXTURE_DIMENSION: i32 = rust_cef_core::contracts::MAX_NATIVE_BOUND as i32;
+
+#[derive(Clone, Copy)]
+struct ViewportInner {
+    viewport: Viewport,
+    screen_origin: Option<(i32, i32)>,
+    last_monitor: Option<MonitorRectPair>,
+}
+
 pub(crate) struct ViewportState {
-    viewport: Mutex<Viewport>,
+    inner: Mutex<ViewportInner>,
 }
 
 impl ViewportState {
     pub(crate) fn new(viewport: Viewport) -> Self {
         Self {
-            viewport: Mutex::new(viewport),
+            inner: Mutex::new(ViewportInner {
+                viewport,
+                screen_origin: None,
+                last_monitor: None,
+            }),
         }
+    }
+
+    pub(crate) fn snapshot(&self) -> (Viewport, Option<(i32, i32)>) {
+        let guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (guard.viewport, guard.screen_origin)
     }
 
     pub(crate) fn get(&self) -> Viewport {
-        self.viewport.lock().map(|v| *v).unwrap_or(Viewport {
-            width: 0,
-            height: 0,
-            scale: 1.0,
-        })
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .viewport
     }
 
     pub(crate) fn set(&self, viewport: Viewport) {
-        if let Ok(mut current) = self.viewport.lock() {
-            *current = viewport;
+        let (x_px, y_px) = {
+            let mut guard = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard.viewport = viewport;
+            let Some(origin) = guard.screen_origin else {
+                return;
+            };
+            origin
+        };
+        if let Some((m, w)) = monitor_screen_rects(x_px, y_px, viewport.scale) {
+            let next_rects = ((m.x, m.y, m.width, m.height), (w.x, w.y, w.width, w.height));
+            let mut guard = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if guard.viewport == viewport && guard.screen_origin == Some((x_px, y_px)) {
+                guard.last_monitor = Some(next_rects);
+            }
         }
     }
+
+    pub(crate) fn set_screen_origin(&self, x_px: i32, y_px: i32) -> (bool, bool) {
+        let (origin_changed, scale) = {
+            let mut guard = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let next = Some((x_px, y_px));
+            if guard.screen_origin == next {
+                return (false, false);
+            }
+            guard.screen_origin = next;
+            (true, guard.viewport.scale)
+        };
+        let next_monitor = monitor_screen_rects(x_px, y_px, scale)
+            .map(|(m, w)| ((m.x, m.y, m.width, m.height), (w.x, w.y, w.width, w.height)));
+        let monitor_changed = if let Some(next_rects) = next_monitor {
+            let mut guard = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if guard.screen_origin != Some((x_px, y_px)) {
+                false
+            } else {
+                let changed = guard.last_monitor != Some(next_rects);
+                if changed {
+                    guard.last_monitor = Some(next_rects);
+                }
+                changed
+            }
+        } else {
+            false
+        };
+        (origin_changed, monitor_changed)
+    }
+
+    pub(crate) fn screen_point(&self, view_x: i32, view_y: i32) -> Option<(i32, i32)> {
+        let (viewport, origin) = self.snapshot();
+        let (ox, oy) = origin?;
+        let sx = ox.saturating_add((view_x as f32 * viewport.scale).round() as i32);
+        let sy = oy.saturating_add((view_y as f32 * viewport.scale).round() as i32);
+        Some((sx, sy))
+    }
+}
+
+fn monitor_screen_rects(origin_x: i32, origin_y: i32, scale: f32) -> Option<(Rect, Rect)> {
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct Win32Point {
+        x: i32,
+        y: i32,
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct Win32Rect {
+        left: i32,
+        top: i32,
+        right: i32,
+        bottom: i32,
+    }
+    #[repr(C)]
+    struct MonitorInfo {
+        cb_size: u32,
+        rc_monitor: Win32Rect,
+        rc_work: Win32Rect,
+        dw_flags: u32,
+    }
+    #[allow(clashing_extern_declarations)]
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn MonitorFromPoint(pt: Win32Point, flags: u32) -> *mut std::ffi::c_void;
+        fn GetMonitorInfoW(hmonitor: *mut std::ffi::c_void, lpmi: *mut MonitorInfo) -> i32;
+    }
+    const MONITOR_DEFAULTTONEAREST: u32 = 2;
+    if !scale.is_finite() || scale <= 0.0 {
+        return None;
+    }
+    let hmon = unsafe {
+        MonitorFromPoint(
+            Win32Point {
+                x: origin_x,
+                y: origin_y,
+            },
+            MONITOR_DEFAULTTONEAREST,
+        )
+    };
+    if hmon.is_null() {
+        return None;
+    }
+    let mut info = MonitorInfo {
+        cb_size: std::mem::size_of::<MonitorInfo>() as u32,
+        rc_monitor: Win32Rect {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        },
+        rc_work: Win32Rect {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        },
+        dw_flags: 0,
+    };
+    if unsafe { GetMonitorInfoW(hmon, &mut info) } == 0 {
+        return None;
+    }
+    let to_cef = |r: Win32Rect| -> Rect {
+        let x = (r.left as f32 / scale).round() as i32;
+        let y = (r.top as f32 / scale).round() as i32;
+        let width = ((r.right - r.left) as f32 / scale).round().max(1.0) as i32;
+        let height = ((r.bottom - r.top) as f32 / scale).round().max(1.0) as i32;
+        Rect {
+            x,
+            y,
+            width,
+            height,
+        }
+    };
+    Some((to_cef(info.rc_monitor), to_cef(info.rc_work)))
 }
 
 /// Callback sizes are device pixels, whereas CEF view/popup rectangles are DIP.
@@ -128,12 +289,25 @@ pub(crate) struct BrowserClientState {
     approved_data: Mutex<ApprovedDataPages>,
     pub(crate) options: Arc<BrowserOptions>,
     cursor: Mutex<BrowserCursor>,
+    pub(crate) cursor_slot: rust_cef_core::cursor::CursorSlot,
     last_tooltip: Mutex<String>,
     last_status: Mutex<String>,
+    first_frame_logged: AtomicBool,
+    frame_stats_count: std::sync::atomic::AtomicU64,
+    frame_stats_copy_us_sum: std::sync::atomic::AtomicU64,
     #[cfg(feature = "test-support")]
     probe_console_kinds: AtomicU64,
     #[cfg(feature = "test-support")]
     pub(crate) menu_probe: Arc<crate::menu_probe::MenuProbe>,
+}
+
+fn frame_stats_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("GPUI_CEF_FRAME_STATS")
+            .ok()
+            .is_some_and(|v| !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false"))
+    })
 }
 
 impl BrowserClientState {
@@ -179,8 +353,12 @@ impl BrowserClientState {
             }),
             options: Arc::new(BrowserOptions::default()),
             cursor: Mutex::new(BrowserCursor::Arrow),
+            cursor_slot: rust_cef_core::cursor::CursorSlot::new(),
             last_tooltip: Mutex::new(String::new()),
             last_status: Mutex::new(String::new()),
+            first_frame_logged: AtomicBool::new(false),
+            frame_stats_count: std::sync::atomic::AtomicU64::new(0),
+            frame_stats_copy_us_sum: std::sync::atomic::AtomicU64::new(0),
             accessibility: crate::accessibility::RuntimeAccessibilityState::new(false),
             policy,
         }
@@ -196,6 +374,14 @@ impl BrowserClientState {
         accessibility: Arc<crate::accessibility::RuntimeAccessibilityState>,
     ) -> Self {
         self.accessibility = accessibility;
+        self
+    }
+
+    pub(crate) fn with_cursor_slot(
+        mut self,
+        cursor_slot: rust_cef_core::cursor::CursorSlot,
+    ) -> Self {
+        self.cursor_slot = cursor_slot;
         self
     }
 
@@ -599,7 +785,8 @@ wrap_render_handler! {
             else {
                 return 0;
             };
-            let payload = crate::outbound_drag::extract_drag_payload(drag_data);
+            let scale = self.state.viewport.get().scale;
+            let payload = crate::outbound_drag::extract_drag_payload(drag_data, scale);
             if payload.is_empty() {
                 return 0;
             }
@@ -612,15 +799,15 @@ wrap_render_handler! {
         }
 
         fn update_drag_cursor(&self, _browser: Option<&mut Browser>, operation: DragOperationsMask) {
-            if self.state.options.outbound_drag_policy != OutboundDragPolicy::AllowAsync
-                || !self.state.active.load(Ordering::Acquire)
-            {
+            if !self.state.active.load(Ordering::Acquire) {
                 return;
             }
+            let mask = crate::outbound_drag::cef_mask_to_core(operation);
             if let Some(registry) = self.state.registry.upgrade() {
-                registry.update_outbound_drag_cursor(
+                registry.update_drag_cursor(
                     self.state.browser,
-                    crate::outbound_drag::cef_mask_to_core(operation),
+                    mask,
+                    self.state.options.outbound_drag_policy == OutboundDragPolicy::AllowAsync,
                 );
             }
         }
@@ -637,17 +824,50 @@ wrap_render_handler! {
             *rect = Rect { x: 0, y: 0, width: viewport.width, height: viewport.height };
         }
 
+        fn screen_point(
+            &self,
+            _browser: Option<&mut Browser>,
+            view_x: ::std::os::raw::c_int,
+            view_y: ::std::os::raw::c_int,
+            screen_x: Option<&mut ::std::os::raw::c_int>,
+            screen_y: Option<&mut ::std::os::raw::c_int>,
+        ) -> ::std::os::raw::c_int {
+            if !self.state.active.load(Ordering::Acquire) {
+                return 0;
+            }
+            let Some((sx, sy)) = self.state.viewport.screen_point(view_x, view_y) else {
+                return 0;
+            };
+            if let Some(out_x) = screen_x {
+                *out_x = sx;
+            }
+            if let Some(out_y) = screen_y {
+                *out_y = sy;
+            }
+            1
+        }
+
         fn screen_info(
             &self,
             _browser: Option<&mut Browser>,
             screen_info: Option<&mut ScreenInfo>,
         ) -> ::std::os::raw::c_int {
             let Some(screen_info) = screen_info else { return 0 };
-            let viewport = self.state.viewport.get();
+            let (viewport, screen_origin) = self.state.viewport.snapshot();
             screen_info.device_scale_factor = viewport.scale;
-            let view = Rect { x: 0, y: 0, width: viewport.width, height: viewport.height };
-            screen_info.rect = view.clone();
-            screen_info.available_rect = view;
+            screen_info.depth = 32;
+            screen_info.depth_per_component = 8;
+            if let Some((ox, oy)) = screen_origin
+                && let Some((monitor_rect, work_rect)) =
+                    monitor_screen_rects(ox, oy, viewport.scale)
+            {
+                screen_info.rect = monitor_rect;
+                screen_info.available_rect = work_rect;
+            } else {
+                let view = Rect { x: 0, y: 0, width: viewport.width, height: viewport.height };
+                screen_info.rect = view.clone();
+                screen_info.available_rect = view;
+            }
             1
         }
 
@@ -721,8 +941,15 @@ wrap_render_handler! {
             } else if element_type == PaintElementType::POPUP {
                 SurfaceKind::Popup
             } else { return; };
-            if buffer.is_null() || width <= 0 || height <= 0 {
+            if buffer.is_null() || width < 0 || height < 0 {
                 self.report_capture_failure(FrameError::InvalidDimensions);
+                return;
+            }
+            if width == 0
+                || height == 0
+                || width > MAX_OSR_TEXTURE_DIMENSION
+                || height > MAX_OSR_TEXTURE_DIMENSION
+            {
                 return;
             }
             let (width, height) = (width as u32, height as u32);
@@ -740,6 +967,7 @@ wrap_render_handler! {
             // for this callback. Only the synchronous copy reads the borrowed
             // bytes; both mailbox and observer receive budget-owned pixels.
             let pixels = unsafe { std::slice::from_raw_parts(buffer, length) };
+            let copy_started = std::time::Instant::now();
             #[cfg(feature="test-support")]
             let captured = self.state.capture_fault_probe(surface, "Software", |inject| {
                 // Keep the original CEF buffer borrow intact; the tested copy
@@ -749,6 +977,7 @@ wrap_render_handler! {
             });
             #[cfg(not(feature="test-support"))]
             let captured = self.state.capture.software(token.info(), pixels);
+            let copy_us = copy_started.elapsed().as_micros() as u64;
             let frame = match captured {
                 Ok(frame) => frame,
                 Err(error) => { self.report_engine_failure(error); return; }
@@ -756,6 +985,27 @@ wrap_render_handler! {
             if let Err(error) = self.state.frame_sink.publish_checked(frame) {
                 self.report_capture_failure(error);
                 return;
+            }
+            if !self.state.first_frame_logged.swap(true, Ordering::AcqRel) {
+                eprintln!(
+                    "[gpui-cef] First frame active path: CpuPaint (Software OSR) browser={:?} size={}x{} copy_us={}",
+                    self.state.browser, width, height, copy_us
+                );
+            }
+            if frame_stats_enabled() {
+                let count = self.state.frame_stats_count.fetch_add(1, Ordering::AcqRel) + 1;
+                let total_us =
+                    self.state.frame_stats_copy_us_sum.fetch_add(copy_us, Ordering::AcqRel)
+                        + copy_us;
+                if count == 1 || count % 60 == 0 {
+                    eprintln!(
+                        "[gpui-cef] Frame stats (CpuPaint): browser={:?} frames={} last_copy_us={} avg_copy_us={}",
+                        self.state.browser,
+                        count,
+                        copy_us,
+                        total_us / count
+                    );
+                }
             }
             if let Some(registry) = self.state.registry.upgrade() {
                 registry.note_software_frame();
@@ -776,6 +1026,19 @@ wrap_render_handler! {
             let Some(info) = info else {
                 self.report_capture_failure(FrameError::InvalidDimensions); return;
             };
+            let coded = &info.extra.coded_size;
+            let vis = &info.extra.visible_rect;
+            if coded.width == 0
+                || coded.height == 0
+                || vis.width == 0
+                || vis.height == 0
+                || coded.width > MAX_OSR_TEXTURE_DIMENSION
+                || coded.height > MAX_OSR_TEXTURE_DIMENSION
+                || vis.width > MAX_OSR_TEXTURE_DIMENSION
+                || vis.height > MAX_OSR_TEXTURE_DIMENSION
+            {
+                return;
+            }
             if let Err(error) = crate::capture::validate_accelerated(info) {
                 #[cfg(feature="test-support")]
                 if matches!(&error,rust_cef_core::ports::EngineError::Capture {kind:rust_cef_core::ports::CaptureFailureKind::IncompleteFrame,..}) {
@@ -793,7 +1056,7 @@ wrap_render_handler! {
                         browser:format!("{:?}",self.state.browser),surface:if surface==SurfaceKind::View {"View"} else {"Popup"},
                         thread:crate::executor::current_thread_id(),
                         failure_ordinal:before.2.failures.saturating_add(1),
-                        frame_sha256:before.0.view.frame.as_ref().map(|frame|{use sha2::Digest as _;format!("{:x}",sha2::Sha256::digest(frame.pixels.as_slice()))}),
+                        frame_sha256:before.0.view.frame.as_ref().and_then(|frame|{frame.cpu_pixels().map(|px|{use sha2::Digest as _;format!("{:x}",sha2::Sha256::digest(px.as_slice()))})}),
                         coded:(info.extra.coded_size.width,info.extra.coded_size.height),
                         visible:rect(&info.extra.visible_rect),content:rect(&info.extra.content_rect),
                         source_generation_before:before.0.view.generation,source_generation_after:after.view.generation,
@@ -817,21 +1080,93 @@ wrap_render_handler! {
             };
             #[cfg(feature="test-support")]
             if surface==SurfaceKind::View && !self.state.frame_probe_gate(token.generation(),token.width(),token.height()) {return;}
-            // All native input access, open/copy/map/unmap and COM import
-            // destruction complete before this callback returns to CEF's pool.
+            // Zero-CPU-copy capture copies on the CEF UI thread into the owned triple-buffered
+            // shared texture pool; `Flush()` completes before `Slot` lease publication.
+            let use_shared_pool = self.state.options.accelerated_osr;
+            let copy_us = std::cell::Cell::new(0u64);
             #[cfg(feature="test-support")]
             let captured = self.state.capture_fault_probe(surface, "D3d11", |inject| {
-                if inject { self.state.capture.accelerated_after_map_probe(token.info(), info) }
-                else { self.state.capture.accelerated(token.info(), info) }
+                if inject {
+                    self.state.capture.accelerated_after_map_probe(token.info(), info)
+                } else if use_shared_pool {
+                    self.state
+                        .capture
+                        .accelerated_shared(token.info(), info, || {
+                            self.state.store.try_reclaim_unconsumed_gpu_slot(surface)
+                        })
+                        .map(|(frame, us)| {
+                            copy_us.set(us);
+                            frame
+                        })
+                } else {
+                    self.state.capture.accelerated(token.info(), info)
+                }
             });
             #[cfg(not(feature="test-support"))]
-            let captured = self.state.capture.accelerated(token.info(), info);
+            let captured = if use_shared_pool {
+                self.state
+                    .capture
+                    .accelerated_shared(token.info(), info, || {
+                        self.state.store.try_reclaim_unconsumed_gpu_slot(surface)
+                    })
+                    .map(|(frame, us)| {
+                        copy_us.set(us);
+                        frame
+                    })
+            } else {
+                self.state.capture.accelerated(token.info(), info)
+            };
+            let copy_us = copy_us.get();
             let frame = match captured {
                 Ok(frame) => frame,
+                Err(rust_cef_core::ports::EngineError::Capture {
+                    kind: rust_cef_core::ports::CaptureFailureKind::Busy,
+                    ..
+                }) => {
+                    // All pooled GPU slots are transiently busy between producer and UI;
+                    // drop this intermediate frame rather than raising a fatal Browser fault.
+                    return;
+                }
                 Err(error) => { self.report_engine_failure(error); return; }
             };
+            let gpu_meta = frame.gpu_texture().map(|gpu| {
+                (
+                    gpu.slot_index,
+                    gpu.generation,
+                    gpu.is_nt_handle,
+                    gpu.keyed_mutex_key.is_some(),
+                    gpu.width,
+                    gpu.height,
+                )
+            });
             if let Err(error) = self.state.frame_sink.publish_checked(frame) {
                 self.report_capture_failure(error); return;
+            }
+            if let Some((slot_index, pool_gen, is_nt, has_km, width, height)) = gpu_meta {
+                if !self.state.first_frame_logged.swap(true, Ordering::AcqRel) {
+                    eprintln!(
+                        "[gpui-cef] First frame active path: AcceleratedPaint (D3D11 Shared Texture) browser={:?} size={}x{} slot={} pool_gen={} nt_handle={} keyed_mutex={} copy_us={}",
+                        self.state.browser, width, height, slot_index, pool_gen, is_nt, has_km, copy_us
+                    );
+                }
+                if frame_stats_enabled() {
+                    let count = self.state.frame_stats_count.fetch_add(1, Ordering::AcqRel) + 1;
+                    let total_us =
+                        self.state.frame_stats_copy_us_sum.fetch_add(copy_us, Ordering::AcqRel)
+                            + copy_us;
+                    if count == 1 || count % 60 == 0 {
+                        eprintln!(
+                            "[gpui-cef] Frame stats (AcceleratedPaint): browser={:?} frames={} size={}x{} pool_gen={} last_copy_us={} avg_copy_us={}",
+                            self.state.browser,
+                            count,
+                            width,
+                            height,
+                            pool_gen,
+                            copy_us,
+                            total_us / count
+                        );
+                    }
+                }
             }
             if let Some(registry) = self.state.registry.upgrade() { registry.note_d3d11_frame(); }
         }
@@ -1133,9 +1468,9 @@ wrap_display_handler! {
         fn on_cursor_change(
             &self,
             _browser: Option<&mut Browser>,
-            _cursor: cef::sys::HCURSOR,
+            cursor: cef::sys::HCURSOR,
             type_: CursorType,
-            _custom_cursor_info: Option<&CursorInfo>,
+            custom_cursor_info: Option<&CursorInfo>,
         ) -> i32 {
             let mapped = map_cef_cursor(type_);
             let changed = {
@@ -1151,9 +1486,13 @@ wrap_display_handler! {
                     true
                 }
             };
+            let native = crate::cursor_win::resolve_cef_cursor(cursor, type_, custom_cursor_info);
+            let native_changed = self.state.cursor_slot.set(native);
             if changed {
                 self.state
                     .navigation_event(BrowserEvent::CursorChanged(mapped));
+            } else if native_changed {
+                let _ = self.state.ui.wake();
             }
             // In windowed child HWND mode, return 0 so Chromium/Win32 updates the native child cursor.
             i32::from(!self.state.options.surface_mode.is_native_child_hwnd())
@@ -1478,7 +1817,16 @@ wrap_request_handler! {
         fn on_render_process_responsive(&self,_browser:Option<&mut Browser>){
             if let Some(registry)=self.state.registry.upgrade(){registry.renderer_event(self.state.browser,BrowserEvent::Responsive);}
         }
-        fn on_render_process_terminated(&self,_browser:Option<&mut Browser>,status:TerminationStatus,error_code:i32,_error_string:Option<&CefString>){
+        fn on_render_process_terminated(&self,_browser:Option<&mut Browser>,status:TerminationStatus,error_code:i32,error_string:Option<&CefString>){
+            let reason = error_string.map(ToString::to_string).unwrap_or_default();
+            eprintln!(
+                "[gpui-cef] Renderer terminated: browser={:?} status={} code={} (0x{:08X}) reason={:?}",
+                self.state.browser,
+                status.get_raw(),
+                error_code,
+                error_code as u32,
+                reason
+            );
             if let Some(registry)=self.state.registry.upgrade(){
                 registry.renderer_event(self.state.browser,BrowserEvent::RendererTerminated{native_status:status.get_raw(),code:Some(error_code)});
             }
@@ -1825,7 +2173,10 @@ mod tests {
             let source = self.source.lock().unwrap();
             let latest = source.as_ref().unwrap().latest(frame.info.surface).unwrap();
             assert_eq!(latest.info, frame.info);
-            assert!(Arc::ptr_eq(&latest.pixels, &frame.pixels));
+            assert!(Arc::ptr_eq(
+                latest.cpu_pixels().unwrap(),
+                frame.cpu_pixels().unwrap()
+            ));
             self.frames.fetch_add(1, Ordering::Relaxed);
             // A refused observation tap cannot discard the Source's good slot.
             rust_cef_core::ports::PublishResult::Rejected
@@ -1910,14 +2261,24 @@ mod tests {
         let handler = RuntimeRenderHandler::new(state.clone());
         let first = [1, 2, 3, 255].repeat(4);
         handler.on_paint(None, PaintElementType::VIEW, None, first.as_ptr(), 2, 2);
-        let detached_pixels = source.latest(SurfaceKind::View).unwrap().pixels.clone();
+        let detached_pixels = source
+            .latest(SurfaceKind::View)
+            .unwrap()
+            .cpu_pixels()
+            .unwrap()
+            .clone();
         let next = [4, 5, 6, 127].repeat(4);
         handler.on_paint(None, PaintElementType::VIEW, None, next.as_ptr(), 2, 2);
         assert_eq!(observers.wakes.load(Ordering::Relaxed), 1);
         assert_eq!(observers.frames.load(Ordering::Relaxed), 2);
         assert_eq!(registry.frame_budget_stats(state.browser).unwrap().used, 32);
         assert_eq!(
-            source.latest(SurfaceKind::View).unwrap().pixels.as_slice(),
+            source
+                .latest(SurfaceKind::View)
+                .unwrap()
+                .cpu_pixels()
+                .unwrap()
+                .as_slice(),
             next.as_slice()
         );
         assert_eq!(detached_pixels.as_slice(), first.as_slice());
@@ -1938,7 +2299,12 @@ mod tests {
         handler.on_paint(None, PaintElementType::POPUP, None, popup.as_ptr(), 1, 1);
         assert_eq!(observers.wakes.load(Ordering::Relaxed), 2);
         assert_eq!(
-            source.latest(SurfaceKind::Popup).unwrap().pixels.as_slice(),
+            source
+                .latest(SurfaceKind::Popup)
+                .unwrap()
+                .cpu_pixels()
+                .unwrap()
+                .as_slice(),
             &popup
         );
         assert_eq!(registry.frame_budget_stats(state.browser).unwrap().used, 36);
@@ -2484,5 +2850,94 @@ mod tests {
         assert_eq!(captured.len(), 1);
         assert!(captured[0].policy_allowed);
         assert!(captured[0].user_gesture);
+    }
+
+    #[test]
+    fn screen_origin_only_triggers_monitor_change_when_monitor_rects_change() {
+        let vp = ViewportState::new(Viewport {
+            width: 800,
+            height: 600,
+            scale: 1.0,
+        });
+        assert_eq!(vp.set_screen_origin(0, 0), (true, true));
+        assert_eq!(vp.set_screen_origin(0, 0), (false, false));
+        assert_eq!(vp.set_screen_origin(12, 16), (true, false));
+    }
+
+    #[test]
+    fn viewport_state_snapshot_is_atomic_for_scale_and_origin() {
+        let vp = ViewportState::new(Viewport {
+            width: 800,
+            height: 600,
+            scale: 1.0,
+        });
+        assert_eq!(vp.snapshot(), (Viewport { width: 800, height: 600, scale: 1.0 }, None));
+        let _ = vp.set_screen_origin(100, 200);
+        vp.set(Viewport {
+            width: 1200,
+            height: 800,
+            scale: 1.5,
+        });
+        assert_eq!(
+            vp.snapshot(),
+            (
+                Viewport {
+                    width: 1200,
+                    height: 800,
+                    scale: 1.5,
+                },
+                Some((100, 200))
+            )
+        );
+        assert_eq!(vp.screen_point(10, 20), Some((115, 230)));
+    }
+
+    #[test]
+    fn osr_paint_ignores_zero_and_oversized_16385_frames_without_faulting() {
+        let (_registry, state, observers) = frame_fixture();
+        let handler = RuntimeRenderHandler::new(state);
+        let dummy_px = [1u8, 2, 3, 255];
+
+        // CPU on_paint: 0-dimension and > 16384 frames are dropped without fault.
+        handler.on_paint(None, PaintElementType::VIEW, None, dummy_px.as_ptr(), 0, 100);
+        handler.on_paint(None, PaintElementType::VIEW, None, dummy_px.as_ptr(), 100, 0);
+        handler.on_paint(
+            None,
+            PaintElementType::VIEW,
+            None,
+            dummy_px.as_ptr(),
+            MAX_OSR_TEXTURE_DIMENSION + 1,
+            10,
+        );
+        handler.on_paint(
+            None,
+            PaintElementType::VIEW,
+            None,
+            dummy_px.as_ptr(),
+            10,
+            MAX_OSR_TEXTURE_DIMENSION + 1,
+        );
+
+        // GPU on_accelerated_paint: 0-dimension and > 16384 frames are dropped without fault.
+        let mut zero_info = cef::AcceleratedPaintInfo::default();
+        zero_info.extra.coded_size = cef::Size { width: 0, height: 100 };
+        zero_info.extra.visible_rect = cef::Rect { x: 0, y: 0, width: 0, height: 100 };
+        handler.on_accelerated_paint(None, PaintElementType::VIEW, None, Some(&zero_info));
+
+        let mut oversized_info = cef::AcceleratedPaintInfo::default();
+        oversized_info.extra.coded_size = cef::Size {
+            width: MAX_OSR_TEXTURE_DIMENSION + 1,
+            height: 16,
+        };
+        oversized_info.extra.visible_rect = cef::Rect {
+            x: 0,
+            y: 0,
+            width: MAX_OSR_TEXTURE_DIMENSION + 1,
+            height: 16,
+        };
+        handler.on_accelerated_paint(None, PaintElementType::VIEW, None, Some(&oversized_info));
+
+        assert_eq!(observers.frames.load(Ordering::Relaxed), 0);
+        assert_eq!(observers.failures.load(Ordering::Relaxed), 0);
     }
 }

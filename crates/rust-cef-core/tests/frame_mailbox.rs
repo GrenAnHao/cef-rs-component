@@ -446,7 +446,10 @@ fn close_is_terminal_for_the_same_mailbox_and_clears_both_slots() {
     assert!(mailbox.is_closed());
     assert!(mailbox.latest(SurfaceKind::View).is_none());
     // A detached consumer Arc is still readable; the slot itself is sealed.
-    assert_eq!(held.pixels.as_slice(), flat_2x2().as_slice());
+    assert_eq!(
+        held.cpu_pixels().unwrap().as_slice(),
+        flat_2x2().as_slice()
+    );
 
     let terminal = source.take_update().unwrap();
     assert!(terminal.closed);
@@ -652,7 +655,7 @@ fn copy_buffer_makes_an_exclusive_copy_charged_to_the_same_ledger() {
     assert_eq!(budget.stats().used, 16);
 
     let frame = mailbox.latest(SurfaceKind::View).unwrap();
-    let copy = frame.pixels.copy_buffer().unwrap();
+    let copy = frame.cpu_pixels().unwrap().copy_buffer().unwrap();
     assert_eq!(copy.as_slice(), flat_2x2().as_slice());
     assert_eq!(budget.stats().used, 32);
     drop(copy);
@@ -706,4 +709,76 @@ fn frame_source_trait_exposes_the_same_mailbox_without_producer_state() {
     assert_eq!(update.popup.pixel_height, 0);
     assert!(!source.snapshot().closed);
     assert!(source.take_update().is_none());
+}
+
+#[test]
+fn gpu_shared_texture_triple_buffer_tracker_protects_presenting_and_latest() {
+    use rust_cef_core::ports::{
+        GpuSharedTextureFrame, SharedTextureSlotTracker, TextureFormat,
+    };
+
+    let mailbox = configured();
+    let tracker = Arc::new(SharedTextureSlotTracker::new());
+    let keepalives = [Arc::new(()), Arc::new(()), Arc::new(()), Arc::new(())];
+
+    let make_gpu = |slot: usize, generation: u64| GpuSharedTextureFrame {
+        pool_id: 42,
+        shared_handle: (slot as isize + 1) * 0x100,
+        is_nt_handle: true,
+        keyed_mutex_key: Some(0),
+        width: 2,
+        height: 2,
+        format: TextureFormat::Bgra8888,
+        frame_seq: 0,
+        slot_index: slot,
+        generation,
+        resource_keepalive: Arc::downgrade(&keepalives[slot]),
+        handle_owner: Arc::new(()),
+        lease: tracker.lease(slot),
+    };
+
+    // Frame 1 -> slot 0 -> mailbox latest_ready = 0
+    let s0 = tracker.acquire_write_slot().unwrap();
+    assert_eq!(s0, 0);
+    let t0 = mailbox.capture_token(SurfaceKind::View, 2, 2).unwrap();
+    let pub0 = mailbox.publish_gpu_frame(&t0, make_gpu(s0, 1)).unwrap();
+    assert_eq!(tracker.latest_ready_slot(), Some(0));
+    assert_eq!(pub0.frame.gpu_texture().unwrap().frame_seq, 1);
+
+    // Consumer presents slot 0: slot 0 is pinned while presented
+    tracker.mark_presenting(s0);
+    let presenting_frame = pub0.frame.clone();
+    drop(pub0);
+    assert_eq!(tracker.presenting_slot(), Some(0));
+    assert_eq!(tracker.latest_ready_slot(), None);
+
+    // Producer writes slot 1 -> mailbox latest_ready = 1
+    let s1 = tracker.acquire_write_slot().unwrap();
+    assert_eq!(s1, 1);
+    let t1 = mailbox.capture_token(SurfaceKind::View, 2, 2).unwrap();
+    let pub1 = mailbox.publish_gpu_frame(&t1, make_gpu(s1, 1)).unwrap();
+    drop(pub1);
+    assert_eq!(tracker.latest_ready_slot(), Some(1));
+
+    // Producer overwrites mailbox before UI wakes: acquires slot 2, drops slot 1's lease!
+    let s2 = tracker.acquire_write_slot().unwrap();
+    assert_eq!(s2, 2);
+    let t2 = mailbox.capture_token(SurfaceKind::View, 2, 2).unwrap();
+    let pub2 = mailbox.publish_gpu_frame(&t2, make_gpu(s2, 1)).unwrap();
+    drop(pub2);
+    assert_eq!(tracker.latest_ready_slot(), Some(2));
+    assert_eq!(tracker.consumer_ref_count(1), 0);
+
+    // Quad buffering yields free slot 3 first, then wraps safely back to slot 1 while UI presents slot 0.
+    let s3 = tracker.acquire_write_slot().unwrap();
+    assert_eq!(s3, 3);
+    let t3 = mailbox.capture_token(SurfaceKind::View, 2, 2).unwrap();
+    let pub3 = mailbox.publish_gpu_frame(&t3, make_gpu(s3, 1)).unwrap();
+    drop(pub3);
+    assert_eq!(tracker.latest_ready_slot(), Some(3));
+    assert_eq!(tracker.consumer_ref_count(2), 0);
+
+    let s_next = tracker.acquire_write_slot().unwrap();
+    assert_eq!(s_next, 1);
+    drop(presenting_frame);
 }

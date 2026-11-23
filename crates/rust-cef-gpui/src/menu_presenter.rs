@@ -355,7 +355,9 @@ impl State {
             let live = state.as_ref().is_some_and(|s| {
                 s.current(&reply, cx)
                     && s.window
-                        .update(cx, |_, window, _| window.is_window_active())
+                        .update(cx, |_, window, _| {
+                            crate::native_view::is_window_effectively_active(window)
+                        })
                         .unwrap_or(false)
             });
             // No Entity, Window, presenter RefCell or internal lock is borrowed.
@@ -499,7 +501,8 @@ impl DefaultMenuPresenter {
                 response,
                 focus,
             } => {
-                if !s.original_live(cx) || !window.is_window_active() {
+                if !s.original_live(cx) || !crate::native_view::is_window_effectively_active(window)
+                {
                     return Err(s.reject(MenuPresenterFailure::OriginalNotReady));
                 }
                 let id = presentation.request;
@@ -638,7 +641,7 @@ impl DefaultMenuPresenter {
             return None;
         }
         let reply = s.open.borrow().as_ref().map(|o| o.reply.clone())?;
-        if !s.current(&reply, cx) || !window.is_window_active() {
+        if !s.current(&reply, cx) || !crate::native_view::is_window_effectively_active(window) {
             let _ = s.withdraw(cx);
         }
         None

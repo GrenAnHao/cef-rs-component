@@ -9,8 +9,8 @@ use rust_cef_core::{
     contracts::{BrowserId, Viewport},
     mailbox::{FrameUpdate, SurfaceBounds},
     ports::{
-        BrowserCommand, BrowserHandle, EngineError, FrameSource, OwnedFrame, PixelFormat,
-        SurfaceKind, WindowBinding,
+        BrowserCommand, BrowserHandle, EngineError, FramePayload, FrameSource, OwnedFrame,
+        PixelFormat, SurfaceKind, TextureFormat, WindowBinding,
     },
 };
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
@@ -72,6 +72,8 @@ pub struct SurfacePipeline {
     popup_generation: u64,
     popup_sequence: u64,
     popup_bounds: Option<SurfaceBounds>,
+    presenting_view_frame: Option<Arc<OwnedFrame>>,
+    presenting_popup_frame: Option<Arc<OwnedFrame>>,
 }
 
 impl SurfacePipeline {
@@ -102,6 +104,8 @@ impl SurfacePipeline {
             popup_generation: 0,
             popup_sequence: 0,
             popup_bounds: None,
+            presenting_view_frame: None,
+            presenting_popup_frame: None,
         }
     }
 
@@ -219,12 +223,24 @@ impl SurfacePipeline {
             return Ok(report);
         }
 
+        if update.closed {
+            self.presenting_popup_frame = None;
+            self.presenting_view_frame = None;
+            self.popup_visible = false;
+            self.popup_bounds = None;
+            return Ok(report);
+        }
+
         if let Some(frame) = update.view.frame {
             if self.accept_view(&frame, update.view.generation) {
                 let (generation, seq) = (frame.info.surface_generation, frame.info.sequence);
                 target
-                    .present_view(frame)
+                    .present_view(frame.clone())
                     .map_err(SurfacePipelineError::Target)?;
+                if let Some(gpu) = frame.gpu_texture() {
+                    gpu.lease.tracker().mark_presenting(gpu.slot_index);
+                }
+                self.presenting_view_frame = Some(frame);
                 self.view_generation = generation;
                 self.view_sequence = seq;
                 report.view_presented = true;
@@ -233,9 +249,10 @@ impl SurfacePipeline {
             }
         }
 
-        if !update.popup.visible || update.closed {
+        if !update.popup.visible {
             if self.popup_visible {
                 target.hide_popup().map_err(SurfacePipelineError::Target)?;
+                self.presenting_popup_frame = None;
                 self.popup_visible = false;
                 self.popup_bounds = None;
                 report.popup_hidden = true;
@@ -248,8 +265,12 @@ impl SurfacePipeline {
             {
                 let (generation, seq) = (frame.info.surface_generation, frame.info.sequence);
                 target
-                    .present_popup(bounds, frame)
+                    .present_popup(bounds, frame.clone())
                     .map_err(SurfacePipelineError::Target)?;
+                if let Some(gpu) = frame.gpu_texture() {
+                    gpu.lease.tracker().mark_presenting(gpu.slot_index);
+                }
+                self.presenting_popup_frame = Some(frame);
                 self.popup_visible = true;
                 self.popup_generation = generation;
                 self.popup_sequence = seq;
@@ -267,6 +288,8 @@ impl SurfacePipeline {
     /// accepted for this window binding.
     pub fn retire(&mut self) -> bool {
         self.file_drag = None;
+        self.presenting_popup_frame = None;
+        self.presenting_view_frame = None;
         self.popup_visible = false;
         self.popup_bounds = None;
         self.token.retire()
@@ -294,17 +317,37 @@ fn valid_frame(
     expected_generation: u64,
 ) -> bool {
     let info = frame.info;
-    info.browser == expected_browser
-        && info.surface == expected_surface
-        && info.surface_generation == expected_generation
-        && info.format == PixelFormat::PremultipliedBgra8
-        && info.width > 0
-        && info.height > 0
-        && info
-            .width
-            .checked_mul(info.height)
-            .and_then(|px| px.checked_mul(4))
-            .is_some_and(|expected| frame.pixels.as_slice().len() == expected as usize)
+    if info.browser != expected_browser
+        || info.surface != expected_surface
+        || info.surface_generation != expected_generation
+        || info.format != PixelFormat::PremultipliedBgra8
+        || info.width == 0
+        || info.height == 0
+    {
+        return false;
+    }
+    match &frame.payload {
+        FramePayload::CpuBgra {
+            buffer,
+            width,
+            height,
+            ..
+        } => {
+            *width == info.width
+                && *height == info.height
+                && info
+                    .width
+                    .checked_mul(info.height)
+                    .and_then(|px| px.checked_mul(4))
+                    .is_some_and(|expected| buffer.as_slice().len() == expected as usize)
+        }
+        FramePayload::GpuSharedTexture(gpu) => {
+            gpu.width == info.width
+                && gpu.height == info.height
+                && gpu.format == TextureFormat::Bgra8888
+                && gpu.shared_handle != 0
+        }
+    }
 }
 
 #[cfg(test)]
@@ -395,8 +438,8 @@ mod tests {
         sequence: u64,
     ) -> Arc<OwnedFrame> {
         let pixels = budget.allocate(16).expect("budget alloc").freeze();
-        Arc::new(OwnedFrame {
-            info: FrameInfo {
+        Arc::new(OwnedFrame::from_cpu_pixels(
+            FrameInfo {
                 browser,
                 surface,
                 surface_generation: generation,
@@ -406,7 +449,7 @@ mod tests {
                 format: PixelFormat::PremultipliedBgra8,
             },
             pixels,
-        })
+        ))
     }
 
     #[test]
@@ -503,5 +546,131 @@ mod tests {
             pipeline.poll_frames(&mut target),
             Err(SurfacePipelineError::Retired)
         );
+    }
+
+    #[test]
+    fn pipeline_tracks_gpu_shared_texture_presenting_and_releases_on_retire() {
+        use rust_cef_core::ports::{GpuSharedTextureFrame, SharedTextureSlotTracker};
+
+        let browser = BrowserId::new(RuntimeGeneration::new(1), 2);
+        let control = Arc::new(DummyControl {
+            snapshot: BrowserSnapshot {
+                browser,
+                creation_accepted: true,
+                state: SessionState::Alive,
+                navigation: NavigationSnapshot::default(),
+                renderer: RendererSnapshot::default(),
+            },
+        });
+        let tracker = Arc::new(SharedTextureSlotTracker::new());
+        let keepalive = Arc::new(());
+        let make_gpu = |slot: usize, generation: u64, sequence: u64| {
+            Arc::new(OwnedFrame {
+                info: FrameInfo {
+                    browser,
+                    surface: SurfaceKind::View,
+                    surface_generation: generation,
+                    sequence,
+                    width: 64,
+                    height: 64,
+                    format: PixelFormat::PremultipliedBgra8,
+                },
+                payload: FramePayload::GpuSharedTexture(GpuSharedTextureFrame {
+                    pool_id: 7,
+                    shared_handle: (slot as isize + 1) * 0x200,
+                    is_nt_handle: true,
+                    keyed_mutex_key: Some(0),
+                    width: 64,
+                    height: 64,
+                    format: TextureFormat::Bgra8888,
+                    frame_seq: sequence,
+                    slot_index: slot,
+                    generation: 1,
+                    resource_keepalive: Arc::downgrade(&keepalive),
+                    handle_owner: Arc::new(()),
+                    lease: tracker.lease(slot),
+                }),
+            })
+        };
+
+        let s0 = tracker.acquire_write_slot().unwrap();
+        tracker.publish_ready(s0);
+        let f0 = make_gpu(s0, 1, 1);
+
+        let source = Arc::new(MockSource {
+            update: Mutex::new(Some(FrameUpdate {
+                browser,
+                viewport: None,
+                view: SurfaceSnapshot {
+                    generation: 1,
+                    bounds: SurfaceBounds {
+                        x: 0,
+                        y: 0,
+                        width: 64,
+                        height: 64,
+                    },
+                    visible: true,
+                    pixel_width: 64,
+                    pixel_height: 64,
+                    frame: Some(f0),
+                },
+                popup: SurfaceSnapshot {
+                    generation: 0,
+                    bounds: SurfaceBounds::default(),
+                    visible: false,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                    frame: None,
+                },
+                closed: false,
+            })),
+        });
+        let mut pipeline =
+            SurfacePipeline::from_parts(browser, BrowserHandle::new(control), source.clone(), 9);
+        let mut target = MockTarget::default();
+        let report = pipeline.poll_frames(&mut target).unwrap();
+        assert!(report.view_presented);
+        assert_eq!(tracker.presenting_slot(), Some(s0));
+        assert_eq!(tracker.consumer_ref_count(s0), 1);
+
+        // Next frame replaces slot 0 cleanly and drops slot 0's lease.
+        let s1 = tracker.acquire_write_slot().unwrap();
+        assert_ne!(s1, s0);
+        tracker.publish_ready(s1);
+        let f1 = make_gpu(s1, 1, 2);
+        *source.update.lock().unwrap() = Some(FrameUpdate {
+            browser,
+            viewport: None,
+            view: SurfaceSnapshot {
+                generation: 1,
+                bounds: SurfaceBounds {
+                    x: 0,
+                    y: 0,
+                    width: 64,
+                    height: 64,
+                },
+                visible: true,
+                pixel_width: 64,
+                pixel_height: 64,
+                frame: Some(f1),
+            },
+            popup: SurfaceSnapshot {
+                generation: 0,
+                bounds: SurfaceBounds::default(),
+                visible: false,
+                pixel_width: 0,
+                pixel_height: 0,
+                frame: None,
+            },
+            closed: false,
+        });
+        assert!(pipeline.poll_frames(&mut target).unwrap().view_presented);
+        assert_eq!(tracker.presenting_slot(), Some(s1));
+        assert_eq!(tracker.consumer_ref_count(s0), 0);
+        assert_eq!(tracker.consumer_ref_count(s1), 1);
+
+        assert!(pipeline.retire());
+        assert_eq!(tracker.presenting_slot(), None);
+        assert_eq!(tracker.consumer_ref_count(s1), 0);
     }
 }

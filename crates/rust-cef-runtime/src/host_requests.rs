@@ -160,8 +160,6 @@ impl<V> CallbackTable<V> {
 
 pub(crate) enum FileDialogReply {
     Native(FileDialogCallback),
-    #[cfg(test)]
-    Test(Box<dyn FnOnce(bool) + Send + 'static>),
 }
 
 pub(crate) enum JsDialogReply {
@@ -173,14 +171,10 @@ pub(crate) enum JsDialogReply {
 pub(crate) enum PermissionReply {
     Media(MediaAccessCallback),
     Prompt(PermissionPromptCallback),
-    #[cfg(test)]
-    Test(Box<dyn FnOnce(PermissionDecision) + Send + 'static>),
 }
 
 pub(crate) enum AuthReply {
     Native(AuthCallback),
-    #[cfg(test)]
-    Test(Box<dyn FnOnce(bool) + Send + 'static>),
 }
 
 pub(crate) enum CertificateReply {
@@ -379,8 +373,6 @@ impl HostRequestManager {
             .map(|()| id)
             .map_err(|(reply, err)| match reply {
                 FileDialogReply::Native(cb) => (cb, err),
-                #[cfg(test)]
-                _ => unreachable!(),
             })
     }
 
@@ -431,8 +423,6 @@ impl HostRequestManager {
             .map(|()| id)
             .map_err(|(reply, err)| match reply {
                 AuthReply::Native(cb) => (cb, err),
-                #[cfg(test)]
-                _ => unreachable!(),
             })
     }
 
@@ -760,8 +750,6 @@ impl HostRequestManager {
                     cb.cancel();
                 }
             },
-            #[cfg(test)]
-            Some(FileDialogReply::Test(f)) => f(matches!(decision, FileDialogDecision::Accept(_))),
             None => {}
         }
     }
@@ -821,8 +809,6 @@ impl HostRequestManager {
                 audit.record();
                 cb.cont(mapped);
             }
-            #[cfg(test)]
-            Some(PermissionReply::Test(f)) => f(decision),
             None => {}
         }
     }
@@ -847,8 +833,6 @@ impl HostRequestManager {
                     cb.cancel();
                 }
             },
-            #[cfg(test)]
-            Some(AuthReply::Test(f)) => f(matches!(decision, AuthDecision::Continue(_))),
             None => {}
         }
     }
@@ -1099,8 +1083,6 @@ fn cancel_file_dialog_list(
                 audit.record();
                 cb.cancel();
             }
-            #[cfg(test)]
-            FileDialogReply::Test(f) => f(false),
         }
         if let Some(svc) = &caps.file_dialog {
             svc.on_file_dialog_cancelled(id);
@@ -1143,8 +1125,6 @@ fn cancel_permission_list(
                 audit.record();
                 cb.cont(PermissionRequestResult::IGNORE);
             }
-            #[cfg(test)]
-            PermissionReply::Test(f) => f(PermissionDecision::Ignore),
         }
         if let Some(svc) = &caps.permission {
             svc.on_permission_cancelled(id);
@@ -1163,8 +1143,6 @@ fn cancel_auth_list(
                 audit.record();
                 cb.cancel();
             }
-            #[cfg(test)]
-            AuthReply::Test(f) => f(false),
         }
         if let Some(svc) = &caps.auth {
             svc.on_auth_cancelled(id);

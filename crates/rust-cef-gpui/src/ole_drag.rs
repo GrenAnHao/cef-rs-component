@@ -16,7 +16,7 @@ use std::{
 };
 
 use rust_cef_core::outbound_drag::{
-    DRAG_OP_COPY, DRAG_OP_LINK, DRAG_OP_MOVE, DragOperationMask, DraggedPayload,
+    DRAG_OP_COPY, DRAG_OP_LINK, DRAG_OP_MOVE, DragImage, DragOperationMask, DraggedPayload,
     OutboundDragFinish, OutboundDragStart,
 };
 
@@ -30,6 +30,8 @@ const E_POINTER: i32 = 0x8000_4003u32 as i32;
 const E_OUTOFMEMORY: i32 = 0x8007_000Eu32 as i32;
 const E_INVALIDARG: i32 = 0x8007_0057u32 as i32;
 const DV_E_FORMATETC: i32 = 0x8004_0064u32 as i32;
+const DV_E_LINDEX: i32 = 0x8004_0068u32 as i32;
+const DV_E_TYMED: i32 = 0x8004_0069u32 as i32;
 const OLE_E_ADVISENOTSUPPORTED: i32 = 0x8004_0003u32 as i32;
 
 const DRAGDROP_S_DROP: i32 = 0x0004_0100u32 as i32;
@@ -48,8 +50,22 @@ const MK_MBUTTON: u32 = 0x0010;
 const DATADIR_GET: u32 = 1;
 const DVASPECT_CONTENT: u32 = 1;
 const TYMED_HGLOBAL: u32 = 1;
+const TYMED_ISTREAM: u32 = 4;
+const TYMED_ISTORAGE: u32 = 8;
+const TYMED_GDI: u32 = 16;
+const TYMED_MFPICT: u32 = 32;
+const TYMED_ENHMF: u32 = 64;
 const GMEM_MOVEABLE: u32 = 0x0002;
 const GMEM_ZEROINIT: u32 = 0x0040;
+const CLSCTX_INPROC_SERVER: u32 = 1;
+const DSH_ALLOWDROPDESCRIPTIONTEXT: u32 = 1;
+const BI_RGB: u32 = 0;
+const DIB_RGB_COLORS: u32 = 0;
+const COLOR_KEY_NONE: u32 = 0xFFFF_FFFF;
+const FD_ATTRIBUTES: u32 = 0x0000_0004;
+const FD_FILESIZE: u32 = 0x0000_0040;
+const FD_UNICODE: u32 = 0x8000_0000;
+const FILE_ATTRIBUTE_NORMAL: u32 = 0x0000_0080;
 
 const CF_TEXT: u16 = 1;
 const CF_UNICODETEXT: u16 = 13;
@@ -59,6 +75,20 @@ const CF_HDROP: u16 = 15;
 unsafe extern "system" {
     fn OleInitialize(pv_reserved: *mut c_void) -> i32;
     fn OleUninitialize();
+    fn CoCreateInstance(
+        rclsid: *const Guid,
+        p_unk_outer: *mut c_void,
+        dw_cls_context: u32,
+        riid: *const Guid,
+        ppv: *mut *mut c_void,
+    ) -> i32;
+    fn CreateStreamOnHGlobal(
+        hglobal: *mut c_void,
+        f_delete_on_release: i32,
+        ppstm: *mut *mut c_void,
+    ) -> i32;
+    fn OleDuplicateData(h_src: *mut c_void, cf_format: u16, ui_flags: u32) -> *mut c_void;
+    fn ReleaseStgMedium(medium: *mut StgMedium);
     fn DoDragDrop(
         data_object: *mut c_void,
         drop_source: *mut c_void,
@@ -67,11 +97,25 @@ unsafe extern "system" {
     ) -> i32;
 }
 
+#[link(name = "gdi32")]
+unsafe extern "system" {
+    fn CreateDIBSection(
+        hdc: *mut c_void,
+        pbmi: *const BitmapInfo,
+        usage: u32,
+        ppv_bits: *mut *mut c_void,
+        h_section: *mut c_void,
+        offset: u32,
+    ) -> *mut c_void;
+    fn DeleteObject(ho: *mut c_void) -> i32;
+}
+
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn GlobalAlloc(flags: u32, bytes: usize) -> *mut c_void;
     fn GlobalLock(mem: *mut c_void) -> *mut c_void;
     fn GlobalUnlock(mem: *mut c_void) -> i32;
+    fn GlobalSize(mem: *mut c_void) -> usize;
     fn GlobalFree(mem: *mut c_void) -> *mut c_void;
 }
 
@@ -80,6 +124,8 @@ unsafe extern "system" {
     fn RegisterClipboardFormatW(format: *const u16) -> u32;
     fn GetCursorPos(point: *mut Point) -> i32;
     fn ScreenToClient(hwnd: *mut c_void, point: *mut Point) -> i32;
+    fn GetDC(hwnd: *mut c_void) -> *mut c_void;
+    fn ReleaseDC(hwnd: *mut c_void, hdc: *mut c_void) -> i32;
     fn SetTimer(
         hwnd: *mut c_void,
         id_event: usize,
@@ -126,6 +172,99 @@ const IID_IENUMFORMATETC: Guid = Guid {
     data4: [0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46],
 };
 
+const CLSID_DRAG_DROP_HELPER: Guid = Guid {
+    data1: 0x4657_278A,
+    data2: 0x411B,
+    data3: 0x11D2,
+    data4: [0x83, 0x9A, 0x00, 0xC0, 0x4F, 0xD9, 0x18, 0xD0],
+};
+
+const IID_IDRAG_SOURCE_HELPER: Guid = Guid {
+    data1: 0xDE5B_F786,
+    data2: 0x477A,
+    data3: 0x11D2,
+    data4: [0x83, 0x9D, 0x00, 0xC0, 0x4F, 0xD9, 0x18, 0xD0],
+};
+
+const IID_IDRAG_SOURCE_HELPER2: Guid = Guid {
+    data1: 0x83E0_7D0D,
+    data2: 0x0C5F,
+    data3: 0x4163,
+    data4: [0xBF, 0x1A, 0x60, 0xB2, 0x74, 0x05, 0x1E, 0x40],
+};
+
+#[repr(C)]
+struct IUnknownVtbl {
+    query_interface: unsafe extern "system" fn(*mut c_void, *const Guid, *mut *mut c_void) -> i32,
+    add_ref: unsafe extern "system" fn(*mut c_void) -> u32,
+    release: unsafe extern "system" fn(*mut c_void) -> u32,
+}
+
+#[repr(C)]
+struct IStreamVtbl {
+    base: IUnknownVtbl,
+    read: unsafe extern "system" fn(*mut c_void, *mut c_void, u32, *mut u32) -> i32,
+    write: unsafe extern "system" fn(*mut c_void, *const c_void, u32, *mut u32) -> i32,
+    seek: unsafe extern "system" fn(*mut c_void, i64, u32, *mut u64) -> i32,
+    set_size: unsafe extern "system" fn(*mut c_void, u64) -> i32,
+}
+
+#[repr(C)]
+struct IDragSourceHelperVtbl {
+    query_interface: unsafe extern "system" fn(*mut c_void, *const Guid, *mut *mut c_void) -> i32,
+    add_ref: unsafe extern "system" fn(*mut c_void) -> u32,
+    release: unsafe extern "system" fn(*mut c_void) -> u32,
+    initialize_from_bitmap:
+        unsafe extern "system" fn(*mut c_void, *const ShDragImage, *mut c_void) -> i32,
+    initialize_from_window:
+        unsafe extern "system" fn(*mut c_void, *mut c_void, *const Point, *mut c_void) -> i32,
+}
+
+#[repr(C)]
+struct IDragSourceHelper2Vtbl {
+    base: IDragSourceHelperVtbl,
+    set_flags: unsafe extern "system" fn(*mut c_void, u32) -> i32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct Size {
+    cx: i32,
+    cy: i32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ShDragImage {
+    size_drag_image: Size,
+    pt_offset: Point,
+    hbmp_drag_image: *mut c_void,
+    cr_color_key: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct BitmapInfoHeader {
+    bi_size: u32,
+    bi_width: i32,
+    bi_height: i32,
+    bi_planes: u16,
+    bi_bit_count: u16,
+    bi_compression: u32,
+    bi_size_image: u32,
+    bi_x_pels_per_meter: i32,
+    bi_y_pels_per_meter: i32,
+    bi_clr_used: u32,
+    bi_clr_important: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct BitmapInfo {
+    bmi_header: BitmapInfoHeader,
+    bmi_colors: [u32; 1],
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct FormatEtc {
@@ -159,6 +298,57 @@ struct DropFiles {
 struct Point {
     x: i32,
     y: i32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct FileTime {
+    dw_low_date_time: u32,
+    dw_high_date_time: u32,
+}
+
+#[repr(C, packed(1))]
+#[derive(Clone, Copy)]
+struct FileDescriptorW {
+    dw_flags: u32,
+    clsid: Guid,
+    sizel: Size,
+    pointl: Point,
+    dw_file_attributes: u32,
+    ft_creation_time: FileTime,
+    ft_last_access_time: FileTime,
+    ft_last_write_time: FileTime,
+    n_file_size_high: u32,
+    n_file_size_low: u32,
+    c_file_name: [u16; 260],
+}
+
+#[repr(C, packed(1))]
+#[derive(Clone, Copy)]
+struct FileGroupDescriptorW {
+    c_items: u32,
+    fgd: [FileDescriptorW; 1],
+}
+
+#[derive(Clone, Copy)]
+struct ClipboardFormats {
+    html: u16,
+    url_w: u16,
+    url_a: u16,
+    file_desc_w: u16,
+    file_contents: u16,
+}
+
+impl ClipboardFormats {
+    fn register_os() -> Self {
+        Self {
+            html: register_clip_format("HTML Format"),
+            url_w: register_clip_format("UniformResourceLocatorW"),
+            url_a: register_clip_format("UniformResourceLocator"),
+            file_desc_w: register_clip_format("FileGroupDescriptorW"),
+            file_contents: register_clip_format("FileContents"),
+        }
+    }
 }
 
 pub fn core_mask_to_dropeffect(mask: DragOperationMask) -> u32 {
@@ -244,6 +434,45 @@ pub fn build_hdrop_bytes(paths: &[String]) -> Vec<u8> {
     }
     out.extend_from_slice(&0u16.to_le_bytes());
     out
+}
+
+/// Builds a 1-item Unicode `FILEGROUPDESCRIPTORW` payload for `CFSTR_FILEDESCRIPTORW`
+/// matching Chromium's `OSExchangeDataProviderWin::SetFileContents`.
+pub fn build_file_group_descriptor_w(file_name: &str, byte_len: usize) -> Vec<u8> {
+    let mut name_buf = [0u16; 260];
+    for (dst, unit) in name_buf[..259].iter_mut().zip(file_name.encode_utf16()) {
+        *dst = unit;
+    }
+    let len_u64 = byte_len as u64;
+    let descriptor = FileGroupDescriptorW {
+        c_items: 1,
+        fgd: [FileDescriptorW {
+            dw_flags: FD_ATTRIBUTES | FD_FILESIZE | FD_UNICODE,
+            clsid: Guid {
+                data1: 0,
+                data2: 0,
+                data3: 0,
+                data4: [0; 8],
+            },
+            sizel: Size::default(),
+            pointl: Point::default(),
+            dw_file_attributes: FILE_ATTRIBUTE_NORMAL,
+            ft_creation_time: FileTime::default(),
+            ft_last_access_time: FileTime::default(),
+            ft_last_write_time: FileTime::default(),
+            n_file_size_high: (len_u64 >> 32) as u32,
+            n_file_size_low: len_u64 as u32,
+            c_file_name: name_buf,
+        }],
+    };
+    // SAFETY: `FileGroupDescriptorW` is `#[repr(C, packed(1))]` of plain integers without padding.
+    let bytes = unsafe {
+        std::slice::from_raw_parts(
+            (&descriptor as *const FileGroupDescriptorW).cast::<u8>(),
+            size_of::<FileGroupDescriptorW>(),
+        )
+    };
+    bytes.to_vec()
 }
 
 fn format_utf16le_nul(text: &str) -> Vec<u8> {
@@ -549,6 +778,193 @@ struct FormatEntry {
     bytes: Vec<u8>,
 }
 
+struct DynamicFormatEntry {
+    format: FormatEtc,
+    medium: StgMedium,
+}
+
+impl Drop for DynamicFormatEntry {
+    fn drop(&mut self) {
+        if self.medium.tymed != 0 {
+            unsafe {
+                ReleaseStgMedium(&mut self.medium);
+            }
+        }
+    }
+}
+
+fn clone_stg_medium(src: &StgMedium, cf_format: u16) -> Result<StgMedium, i32> {
+    match src.tymed {
+        TYMED_HGLOBAL => {
+            if src.data.is_null() {
+                return Err(E_INVALIDARG);
+            }
+            let size = unsafe { GlobalSize(src.data) };
+            let ptr = unsafe { GlobalLock(src.data) };
+            if ptr.is_null() {
+                return Err(E_OUTOFMEMORY);
+            }
+            let slice = if size == 0 {
+                &[][..]
+            } else {
+                unsafe { std::slice::from_raw_parts(ptr.cast::<u8>(), size) }
+            };
+            let copy = alloc_hglobal(slice);
+            unsafe {
+                GlobalUnlock(src.data);
+            }
+            copy.map(|data| StgMedium {
+                tymed: TYMED_HGLOBAL,
+                data,
+                p_unk_for_release: ptr::null_mut(),
+            })
+        }
+        TYMED_GDI | TYMED_MFPICT | TYMED_ENHMF => {
+            if src.data.is_null() {
+                return Err(E_INVALIDARG);
+            }
+            let dup = unsafe { OleDuplicateData(src.data, cf_format, 0) };
+            if dup.is_null() {
+                return Err(E_OUTOFMEMORY);
+            }
+            Ok(StgMedium {
+                tymed: src.tymed,
+                data: dup,
+                p_unk_for_release: ptr::null_mut(),
+            })
+        }
+        TYMED_ISTREAM | TYMED_ISTORAGE => {
+            if src.data.is_null() {
+                return Err(E_INVALIDARG);
+            }
+            unsafe {
+                let vtbl = *(src.data.cast::<*const IUnknownVtbl>());
+                ((*vtbl).add_ref)(src.data);
+            }
+            Ok(StgMedium {
+                tymed: src.tymed,
+                data: src.data,
+                p_unk_for_release: ptr::null_mut(),
+            })
+        }
+        _ => Err(DV_E_TYMED),
+    }
+}
+
+fn create_drag_dib(image: &DragImage) -> Option<*mut c_void> {
+    if image.validate().is_err() {
+        return None;
+    }
+    let bmi = BitmapInfo {
+        bmi_header: BitmapInfoHeader {
+            bi_size: size_of::<BitmapInfoHeader>() as u32,
+            bi_width: image.width as i32,
+            // Negative height creates a top-down 32-bit BGRA DIB matching `image.bgra`.
+            bi_height: -(image.height as i32),
+            bi_planes: 1,
+            bi_bit_count: 32,
+            bi_compression: BI_RGB,
+            ..BitmapInfoHeader::default()
+        },
+        bmi_colors: [0],
+    };
+    let screen_dc = unsafe { GetDC(ptr::null_mut()) };
+    let mut bits: *mut c_void = ptr::null_mut();
+    let hbmp = unsafe {
+        CreateDIBSection(
+            screen_dc,
+            &bmi,
+            DIB_RGB_COLORS,
+            &mut bits,
+            ptr::null_mut(),
+            0,
+        )
+    };
+    if !screen_dc.is_null() {
+        unsafe {
+            ReleaseDC(ptr::null_mut(), screen_dc);
+        }
+    }
+    if hbmp.is_null() || bits.is_null() {
+        if !hbmp.is_null() {
+            unsafe {
+                DeleteObject(hbmp);
+            }
+        }
+        return None;
+    }
+    unsafe {
+        ptr::copy_nonoverlapping(image.bgra.as_ptr(), bits.cast::<u8>(), image.bgra.len());
+    }
+    Some(hbmp)
+}
+
+/// Registers Chromium's drag ghost image onto our `IDataObject` via Windows
+/// Shell's `CLSID_DragDropHelper` (`IDragSourceHelper::InitializeFromBitmap`),
+/// matching Chromium's `ui/base/dragdrop/os_exchange_data_provider_win.cc`.
+fn attach_drag_image(data_object: *mut DataObject, image: &DragImage) -> bool {
+    let Some(hbmp) = create_drag_dib(image) else {
+        return false;
+    };
+    let mut helper_ptr: *mut c_void = ptr::null_mut();
+    let hr = unsafe {
+        CoCreateInstance(
+            &CLSID_DRAG_DROP_HELPER,
+            ptr::null_mut(),
+            CLSCTX_INPROC_SERVER,
+            &IID_IDRAG_SOURCE_HELPER,
+            &mut helper_ptr,
+        )
+    };
+    if hr < 0 || helper_ptr.is_null() {
+        unsafe {
+            DeleteObject(hbmp);
+        }
+        return false;
+    }
+
+    // Opt into Shell drop description tooltips (e.g. "Copy to ...") when available.
+    let mut helper2_ptr: *mut c_void = ptr::null_mut();
+    unsafe {
+        let vtbl = *(helper_ptr.cast::<*const IDragSourceHelperVtbl>());
+        if ((*vtbl).query_interface)(helper_ptr, &IID_IDRAG_SOURCE_HELPER2, &mut helper2_ptr) >= 0
+            && !helper2_ptr.is_null()
+        {
+            let vtbl2 = *(helper2_ptr.cast::<*const IDragSourceHelper2Vtbl>());
+            let _ = ((*vtbl2).set_flags)(helper2_ptr, DSH_ALLOWDROPDESCRIPTIONTEXT);
+            ((*vtbl2).base.release)(helper2_ptr);
+        }
+    }
+
+    let shdi = ShDragImage {
+        size_drag_image: Size {
+            cx: image.width as i32,
+            cy: image.height as i32,
+        },
+        pt_offset: Point {
+            x: image.hotspot_x,
+            y: image.hotspot_y,
+        },
+        hbmp_drag_image: hbmp,
+        cr_color_key: COLOR_KEY_NONE,
+    };
+    let init_hr = unsafe {
+        let vtbl = *(helper_ptr.cast::<*const IDragSourceHelperVtbl>());
+        let res = ((*vtbl).initialize_from_bitmap)(helper_ptr, &shdi, data_object.cast::<c_void>());
+        ((*vtbl).release)(helper_ptr);
+        res
+    };
+    if init_hr < 0 {
+        // InitializeFromBitmap only takes ownership of `hbmp` on success.
+        unsafe {
+            DeleteObject(hbmp);
+        }
+        false
+    } else {
+        true
+    }
+}
+
 #[repr(C)]
 struct DataObjectVtbl {
     query_interface:
@@ -580,6 +996,7 @@ struct DataObject {
     vtbl: *const DataObjectVtbl,
     ref_count: AtomicU32,
     entries: Vec<FormatEntry>,
+    dynamic: RefCell<Vec<DynamicFormatEntry>>,
 }
 
 static DATA_OBJECT_VTBL: DataObjectVtbl = DataObjectVtbl {
@@ -598,7 +1015,7 @@ static DATA_OBJECT_VTBL: DataObjectVtbl = DataObjectVtbl {
 };
 
 impl DataObject {
-    fn new_raw(payload: &DraggedPayload, cf_html: u16, cf_url_w: u16) -> *mut Self {
+    fn new_raw(payload: &DraggedPayload, formats: ClipboardFormats) -> *mut Self {
         let mut entries = Vec::new();
         let make_fmt = |cf_format: u16| FormatEtc {
             cf_format,
@@ -607,6 +1024,58 @@ impl DataObject {
             lindex: -1,
             tymed: TYMED_HGLOBAL,
         };
+        // Order matches Chromium `PrepareDragData` so virtual/disk file formats take
+        // precedence over URL/text fallbacks in Windows Explorer, chat apps, and editors.
+        if !payload.file_paths.is_empty() {
+            entries.push(FormatEntry {
+                format: make_fmt(CF_HDROP),
+                bytes: build_hdrop_bytes(&payload.file_paths),
+            });
+        }
+        if formats.file_desc_w != 0
+            && formats.file_contents != 0
+            && let Some(fc) = &payload.file_contents
+            && fc.validate().is_ok()
+        {
+            entries.push(FormatEntry {
+                format: make_fmt(formats.file_desc_w),
+                bytes: build_file_group_descriptor_w(&fc.file_name, fc.bytes.len()),
+            });
+            entries.push(FormatEntry {
+                format: FormatEtc {
+                    cf_format: formats.file_contents,
+                    ptd: ptr::null_mut(),
+                    dw_aspect: DVASPECT_CONTENT,
+                    lindex: 0,
+                    tymed: TYMED_HGLOBAL | TYMED_ISTREAM,
+                },
+                bytes: fc.bytes.clone(),
+            });
+        }
+        if formats.html != 0
+            && let Some(html) = payload.html.as_deref()
+        {
+            entries.push(FormatEntry {
+                format: make_fmt(formats.html),
+                bytes: format_cf_html(html),
+            });
+        }
+        if formats.url_w != 0
+            && let Some(url) = payload.url.as_deref()
+        {
+            entries.push(FormatEntry {
+                format: make_fmt(formats.url_w),
+                bytes: format_utf16le_nul(url),
+            });
+        }
+        if formats.url_a != 0
+            && let Some(url) = payload.url.as_deref()
+        {
+            entries.push(FormatEntry {
+                format: make_fmt(formats.url_a),
+                bytes: format_ansi_nul(url),
+            });
+        }
         if let Some(plain) = payload.text.as_deref().or(payload.url.as_deref()) {
             entries.push(FormatEntry {
                 format: make_fmt(CF_UNICODETEXT),
@@ -617,42 +1086,52 @@ impl DataObject {
                 bytes: format_ansi_nul(plain),
             });
         }
-        if !payload.file_paths.is_empty() {
-            entries.push(FormatEntry {
-                format: make_fmt(CF_HDROP),
-                bytes: build_hdrop_bytes(&payload.file_paths),
-            });
-        }
-        if cf_html != 0
-            && let Some(html) = payload.html.as_deref()
-        {
-            entries.push(FormatEntry {
-                format: make_fmt(cf_html),
-                bytes: format_cf_html(html),
-            });
-        }
-        if cf_url_w != 0
-            && let Some(url) = payload.url.as_deref()
-        {
-            entries.push(FormatEntry {
-                format: make_fmt(cf_url_w),
-                bytes: format_utf16le_nul(url),
-            });
-        }
         Box::into_raw(Box::new(Self {
             vtbl: &DATA_OBJECT_VTBL,
             ref_count: AtomicU32::new(1),
             entries,
+            dynamic: RefCell::new(Vec::new()),
         }))
     }
 
-    fn find_entry(&self, req: &FormatEtc) -> Option<&FormatEntry> {
-        if req.dw_aspect != DVASPECT_CONTENT || (req.tymed & TYMED_HGLOBAL) == 0 {
-            return None;
+    fn find_entry(&self, req: &FormatEtc) -> Result<&FormatEntry, i32> {
+        if req.dw_aspect != DVASPECT_CONTENT {
+            return Err(DV_E_FORMATETC);
         }
-        self.entries
-            .iter()
-            .find(|entry| entry.format.cf_format == req.cf_format)
+        let mut saw_format = false;
+        let mut saw_lindex = false;
+        for entry in &self.entries {
+            if entry.format.cf_format != req.cf_format {
+                continue;
+            }
+            saw_format = true;
+            let lindex_ok = if entry.format.lindex == -1 {
+                req.lindex == -1 || req.lindex == 0
+            } else {
+                req.lindex == entry.format.lindex || req.lindex == -1
+            };
+            if !lindex_ok {
+                continue;
+            }
+            saw_lindex = true;
+            if (req.tymed & entry.format.tymed) != 0 {
+                return Ok(entry);
+            }
+        }
+        if !saw_format {
+            Err(DV_E_FORMATETC)
+        } else if !saw_lindex {
+            Err(DV_E_LINDEX)
+        } else {
+            Err(DV_E_TYMED)
+        }
+    }
+
+    fn matches_dynamic(entry: &DynamicFormatEntry, req: &FormatEtc) -> bool {
+        entry.format.cf_format == req.cf_format
+            && (req.dw_aspect == 0 || entry.format.dw_aspect == req.dw_aspect)
+            && (req.lindex == -1 || entry.format.lindex == -1 || entry.format.lindex == req.lindex)
+            && (req.tymed & entry.medium.tymed) != 0
     }
 }
 
@@ -716,21 +1195,63 @@ unsafe extern "system" fn data_object_get_data(
     }
     let req = unsafe { &*pformatetc_in };
     let obj = unsafe { &*this };
-    let Some(entry) = obj.find_entry(req) else {
-        return DV_E_FORMATETC;
-    };
-    match alloc_hglobal(&entry.bytes) {
-        Ok(hglobal) => {
-            unsafe {
-                *pmedium = StgMedium {
-                    tymed: TYMED_HGLOBAL,
-                    data: hglobal,
-                    p_unk_for_release: ptr::null_mut(),
-                };
-            }
-            S_OK
+    {
+        let dynamic = obj.dynamic.borrow();
+        if let Some(entry) = dynamic
+            .iter()
+            .find(|entry| DataObject::matches_dynamic(entry, req))
+        {
+            return match clone_stg_medium(&entry.medium, entry.format.cf_format) {
+                Ok(cloned) => {
+                    unsafe { *pmedium = cloned };
+                    S_OK
+                }
+                Err(hr) => hr,
+            };
         }
-        Err(hr) => hr,
+    }
+    let entry = match obj.find_entry(req) {
+        Ok(entry) => entry,
+        Err(hr) => return hr,
+    };
+    let hglobal = match alloc_hglobal(&entry.bytes) {
+        Ok(hglobal) => hglobal,
+        Err(hr) => return hr,
+    };
+    if (req.tymed & TYMED_HGLOBAL) != 0 && (entry.format.tymed & TYMED_HGLOBAL) != 0 {
+        unsafe {
+            *pmedium = StgMedium {
+                tymed: TYMED_HGLOBAL,
+                data: hglobal,
+                p_unk_for_release: ptr::null_mut(),
+            };
+        }
+        S_OK
+    } else if (req.tymed & TYMED_ISTREAM) != 0 && (entry.format.tymed & TYMED_ISTREAM) != 0 {
+        let mut stream: *mut c_void = ptr::null_mut();
+        let hr = unsafe { CreateStreamOnHGlobal(hglobal, 1, &mut stream) };
+        if hr < 0 || stream.is_null() {
+            unsafe {
+                GlobalFree(hglobal);
+            }
+            return if hr < 0 { hr } else { E_OUTOFMEMORY };
+        }
+        // Clamp IStream size to exact byte length so GlobalAlloc heap rounding never leaks padding.
+        unsafe {
+            let vtbl = *(stream.cast::<*const IStreamVtbl>());
+            let _ = ((*vtbl).set_size)(stream, entry.bytes.len() as u64);
+            *pmedium = StgMedium {
+                tymed: TYMED_ISTREAM,
+                data: stream,
+                p_unk_for_release: ptr::null_mut(),
+            };
+        }
+        S_OK
+    } else {
+        unsafe {
+            GlobalFree(hglobal);
+        }
+        DV_E_TYMED
     }
 }
 
@@ -750,10 +1271,19 @@ unsafe extern "system" fn data_object_query_get_data(
         return E_INVALIDARG;
     }
     let req = unsafe { &*pformatetc };
-    if unsafe { &*this }.find_entry(req).is_some() {
+    let obj = unsafe { &*this };
+    let has_dynamic = obj
+        .dynamic
+        .borrow()
+        .iter()
+        .any(|entry| DataObject::matches_dynamic(entry, req));
+    if has_dynamic {
         S_OK
     } else {
-        DV_E_FORMATETC
+        match obj.find_entry(req) {
+            Ok(_) => S_OK,
+            Err(hr) => hr,
+        }
     }
 }
 
@@ -777,12 +1307,39 @@ unsafe extern "system" fn data_object_get_canonical(
 }
 
 unsafe extern "system" fn data_object_set_data(
-    _this: *mut DataObject,
-    _pformatetc: *const FormatEtc,
-    _pmedium: *const StgMedium,
-    _f_release: i32,
+    this: *mut DataObject,
+    pformatetc: *const FormatEtc,
+    pmedium: *const StgMedium,
+    f_release: i32,
 ) -> i32 {
-    E_NOTIMPL
+    if this.is_null() || pformatetc.is_null() || pmedium.is_null() {
+        return E_INVALIDARG;
+    }
+    let mut format = unsafe { *pformatetc };
+    format.ptd = ptr::null_mut();
+    let incoming = unsafe { *pmedium };
+    let owned_medium = if f_release != 0 {
+        incoming
+    } else {
+        match clone_stg_medium(&incoming, format.cf_format) {
+            Ok(cloned) => cloned,
+            Err(hr) => return hr,
+        }
+    };
+    let obj = unsafe { &*this };
+    let mut dynamic = obj.dynamic.borrow_mut();
+    if let Some(pos) = dynamic.iter().position(|entry| {
+        entry.format.cf_format == format.cf_format
+            && entry.format.dw_aspect == format.dw_aspect
+            && entry.format.lindex == format.lindex
+    }) {
+        dynamic.remove(pos);
+    }
+    dynamic.push(DynamicFormatEntry {
+        format,
+        medium: owned_medium,
+    });
+    S_OK
 }
 
 unsafe extern "system" fn data_object_enum_format_etc(
@@ -800,11 +1357,16 @@ unsafe extern "system" fn data_object_enum_format_etc(
     if dw_direction != DATADIR_GET {
         return E_NOTIMPL;
     }
-    let formats = unsafe { &*this }
-        .entries
-        .iter()
-        .map(|entry| entry.format)
-        .collect();
+    let obj = unsafe { &*this };
+    let mut formats: Vec<FormatEtc> = obj.entries.iter().map(|entry| entry.format).collect();
+    for entry in obj.dynamic.borrow().iter() {
+        if !formats
+            .iter()
+            .any(|existing| existing.cf_format == entry.format.cf_format)
+        {
+            formats.push(entry.format);
+        }
+    }
     let enumerator = EnumFormatEtc::new_raw(formats, 0);
     unsafe { *ppenum_formatetc = enumerator.cast::<c_void>() };
     S_OK
@@ -916,9 +1478,11 @@ pub fn run_ole_drag(
         };
     }
 
-    let cf_html = register_clip_format("HTML Format");
-    let cf_url_w = register_clip_format("UniformResourceLocatorW");
-    let data_object = DataObject::new_raw(&start.payload, cf_html, cf_url_w);
+    let formats = ClipboardFormats::register_os();
+    let data_object = DataObject::new_raw(&start.payload, formats);
+    if let Some(image) = &start.payload.image {
+        let _ = attach_drag_image(data_object, image);
+    }
     let drop_source = DropSource::new_raw();
 
     let mut effect = DROPEFFECT_NONE;
@@ -983,6 +1547,11 @@ mod tests {
         assert_eq!(size_of::<FormatEtc>(), 32);
         assert_eq!(size_of::<StgMedium>(), 24);
         assert_eq!(size_of::<DropFiles>(), 20);
+        assert_eq!(size_of::<ShDragImage>(), 32);
+        assert_eq!(size_of::<BitmapInfoHeader>(), 40);
+        assert_eq!(size_of::<BitmapInfo>(), 44);
+        assert_eq!(size_of::<FileDescriptorW>(), 592);
+        assert_eq!(size_of::<FileGroupDescriptorW>(), 596);
     }
 
     #[test]
@@ -1078,9 +1647,14 @@ mod tests {
             Some("https://example.com"),
             vec!["C:\\file.txt".into()],
         );
-        let cf_html = 0xC100;
-        let cf_url_w = 0xC101;
-        let obj = DataObject::new_raw(&payload, cf_html, cf_url_w);
+        let formats = ClipboardFormats {
+            html: 0xC100,
+            url_w: 0xC101,
+            url_a: 0xC102,
+            file_desc_w: 0xC103,
+            file_contents: 0xC104,
+        };
+        let obj = DataObject::new_raw(&payload, formats);
         unsafe {
             let mut queried: *mut c_void = ptr::null_mut();
             assert_eq!(data_object_qi(obj, &IID_IDATAOBJECT, &mut queried), S_OK);
@@ -1124,13 +1698,217 @@ mod tests {
                 enum_fmt_next(enumerator, 8, out.as_mut_ptr(), &mut fetched),
                 S_FALSE
             );
-            assert_eq!(fetched, 5);
+            assert_eq!(fetched, 6);
             assert_eq!(enum_fmt_reset(enumerator), S_OK);
 
             let mut cloned_ptr: *mut c_void = ptr::null_mut();
             assert_eq!(enum_fmt_clone(enumerator, &mut cloned_ptr), S_OK);
             assert_eq!(enum_fmt_release(cloned_ptr.cast::<EnumFormatEtc>()), 0);
             assert_eq!(enum_fmt_release(enumerator), 0);
+            assert_eq!(data_object_release(obj), 0);
+        }
+    }
+
+    #[test]
+    fn drag_source_helper_attaches_shdragimage_via_set_data() {
+        let ole_hr = unsafe { OleInitialize(ptr::null_mut()) };
+        assert!(ole_hr >= 0, "OleInitialize failed: 0x{:08x}", ole_hr as u32);
+        let payload = DraggedPayload::bounded(Some("link"), None, Some("https://cn.bing.com/"), []);
+        // 2x2 BGRA (straight/unpremultiplied alpha):
+        // top row = 50% alpha pure blue [0xFF, 0x00, 0x00, 0x80]
+        // bottom row = 100% alpha pure red [0x00, 0x00, 0xFF, 0xFF]
+        let pixels = vec![
+            0xFF, 0x00, 0x00, 0x80, 0xFF, 0x00, 0x00, 0x80, // top row
+            0x00, 0x00, 0xFF, 0xFF, 0x00, 0x00, 0xFF, 0xFF, // bottom row
+        ];
+        let image = DragImage::bounded(2, 2, 1, 0, pixels).unwrap();
+        let formats = ClipboardFormats::register_os();
+        let obj = DataObject::new_raw(&payload, formats);
+
+        assert!(attach_drag_image(obj, &image));
+        let cf_drag_image_bits = register_clip_format("DragImageBits");
+        assert_ne!(cf_drag_image_bits, 0);
+        let fmt = FormatEtc {
+            cf_format: cf_drag_image_bits,
+            ptd: ptr::null_mut(),
+            dw_aspect: DVASPECT_CONTENT,
+            lindex: -1,
+            tymed: TYMED_HGLOBAL,
+        };
+        unsafe {
+            assert_eq!(data_object_query_get_data(obj, &fmt), S_OK);
+            let mut medium = StgMedium {
+                tymed: 0,
+                data: ptr::null_mut(),
+                p_unk_for_release: ptr::null_mut(),
+            };
+            assert_eq!(data_object_get_data(obj, &fmt, &mut medium), S_OK);
+            assert_eq!(medium.tymed, TYMED_HGLOBAL);
+            assert!(!medium.data.is_null());
+            let size = GlobalSize(medium.data);
+            let ptr = GlobalLock(medium.data);
+            assert!(!ptr.is_null());
+            let bytes = std::slice::from_raw_parts(ptr.cast::<u8>(), size);
+            assert!(size >= 24 + 16, "unexpected DragImageBits size: {size}");
+            // Windows DragImageBits starts with (width, height, hotspot_x, hotspot_y, flags, color_key)
+            // followed by bottom-up premultiplied BGRA pixels. Verify top-down input did NOT flip
+            // upside down (row 0 in DragImageBits is our bottom red row, row 1 is our top 50%-blue row)
+            // and straight-alpha input was premultiplied once (B == A on the 50%-blue pixel).
+            let width = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+            let height = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+            let hot_x = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+            let hot_y = u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]);
+            assert_eq!((width, height, hot_x, hot_y), (2, 2, 1, 0));
+            let bottom_px = &bytes[24..28];
+            let top_px = &bytes[32..36];
+            assert!(
+                bottom_px[2] > 0 && bottom_px[0] == 0,
+                "bottom row should be red: {bottom_px:?}"
+            );
+            assert!(
+                top_px[0] > 0 && top_px[2] == 0,
+                "top row should be blue: {top_px:?}"
+            );
+            assert_eq!(
+                top_px[0], top_px[3],
+                "straight-alpha blue should premultiply once: {top_px:?}"
+            );
+            GlobalUnlock(medium.data);
+            ReleaseStgMedium(&mut medium);
+            assert_eq!(data_object_release(obj), 0);
+            if ole_hr == S_OK || ole_hr == S_FALSE {
+                OleUninitialize();
+            }
+        }
+    }
+
+    #[test]
+    fn virtual_image_file_contents_serves_descriptor_hglobal_and_istream() {
+        use rust_cef_core::outbound_drag::DraggedFileContents;
+
+        let png = b"\x89PNG\r\n\x1A\nTESTIMAGEBYTES".to_vec();
+        let fc = DraggedFileContents::bounded(Some("bing_photo.png"), png.clone()).unwrap();
+        let payload = DraggedPayload::bounded(
+            None,
+            Some("<img src=\"https://cn.bing.com/p.png\">"),
+            Some("https://cn.bing.com/p.png"),
+            [],
+        )
+        .with_file_contents(Some(fc));
+        let formats = ClipboardFormats::register_os();
+        assert_ne!(formats.file_desc_w, 0);
+        assert_ne!(formats.file_contents, 0);
+        let obj = DataObject::new_raw(&payload, formats);
+
+        unsafe {
+            // 1. EnumFormatEtc lists FileGroupDescriptorW + FileContents ahead of URL/text.
+            let mut enum_ptr: *mut c_void = ptr::null_mut();
+            assert_eq!(
+                data_object_enum_format_etc(obj, DATADIR_GET, &mut enum_ptr),
+                S_OK
+            );
+            let enumerator = enum_ptr.cast::<EnumFormatEtc>();
+            let mut listed = [FormatEtc {
+                cf_format: 0,
+                ptd: ptr::null_mut(),
+                dw_aspect: 0,
+                lindex: 0,
+                tymed: 0,
+            }; 10];
+            let mut fetched = 0u32;
+            assert_eq!(
+                enum_fmt_next(enumerator, 10, listed.as_mut_ptr(), &mut fetched),
+                S_FALSE
+            );
+            assert!(fetched >= 7);
+            assert_eq!(listed[0].cf_format, formats.file_desc_w);
+            assert_eq!(listed[1].cf_format, formats.file_contents);
+            assert_eq!(listed[1].lindex, 0);
+            assert_eq!(listed[1].tymed, TYMED_HGLOBAL | TYMED_ISTREAM);
+            assert_eq!(enum_fmt_release(enumerator), 0);
+
+            // 2. FileGroupDescriptorW encodes cItems=1, size, and UTF-16 filename.
+            let fmt_desc = FormatEtc {
+                cf_format: formats.file_desc_w,
+                ptd: ptr::null_mut(),
+                dw_aspect: DVASPECT_CONTENT,
+                lindex: -1,
+                tymed: TYMED_HGLOBAL,
+            };
+            let mut med = StgMedium {
+                tymed: 0,
+                data: ptr::null_mut(),
+                p_unk_for_release: ptr::null_mut(),
+            };
+            assert_eq!(data_object_get_data(obj, &fmt_desc, &mut med), S_OK);
+            assert_eq!(med.tymed, TYMED_HGLOBAL);
+            let desc_ptr = GlobalLock(med.data).cast::<FileGroupDescriptorW>();
+            assert!(!desc_ptr.is_null());
+            let desc = ptr::read_unaligned(desc_ptr);
+            let c_items = desc.c_items;
+            let dw_flags = desc.fgd[0].dw_flags;
+            let file_size = desc.fgd[0].n_file_size_low;
+            let name_buf = desc.fgd[0].c_file_name;
+            let nul_pos = name_buf.iter().position(|&u| u == 0).unwrap();
+            let decoded_name = String::from_utf16(&name_buf[..nul_pos]).unwrap();
+            assert_eq!(c_items, 1);
+            assert_eq!(dw_flags, FD_ATTRIBUTES | FD_FILESIZE | FD_UNICODE);
+            assert_eq!(file_size as usize, png.len());
+            assert_eq!(decoded_name, "bing_photo.png");
+            GlobalUnlock(med.data);
+            ReleaseStgMedium(&mut med);
+
+            // 3. FileContents lindex=0 over TYMED_HGLOBAL returns exact bytes.
+            let fmt_hglobal = FormatEtc {
+                cf_format: formats.file_contents,
+                ptd: ptr::null_mut(),
+                dw_aspect: DVASPECT_CONTENT,
+                lindex: 0,
+                tymed: TYMED_HGLOBAL,
+            };
+            assert_eq!(data_object_get_data(obj, &fmt_hglobal, &mut med), S_OK);
+            assert_eq!(med.tymed, TYMED_HGLOBAL);
+            let p = GlobalLock(med.data).cast::<u8>();
+            let got = std::slice::from_raw_parts(p, png.len()).to_vec();
+            assert_eq!(got, png);
+            GlobalUnlock(med.data);
+            ReleaseStgMedium(&mut med);
+
+            // 4. FileContents lindex=0 over TYMED_ISTREAM returns readable COM IStream with exact EOF.
+            let fmt_stream = FormatEtc {
+                cf_format: formats.file_contents,
+                ptd: ptr::null_mut(),
+                dw_aspect: DVASPECT_CONTENT,
+                lindex: 0,
+                tymed: TYMED_ISTREAM,
+            };
+            assert_eq!(data_object_query_get_data(obj, &fmt_stream), S_OK);
+            assert_eq!(data_object_get_data(obj, &fmt_stream, &mut med), S_OK);
+            assert_eq!(med.tymed, TYMED_ISTREAM);
+            assert!(!med.data.is_null());
+            let mut stream_buf = vec![0u8; png.len() + 32];
+            let mut read_bytes = 0u32;
+            let vtbl = *(med.data.cast::<*const IStreamVtbl>());
+            let hr = ((*vtbl).read)(
+                med.data,
+                stream_buf.as_mut_ptr().cast::<c_void>(),
+                stream_buf.len() as u32,
+                &mut read_bytes,
+            );
+            assert!(hr >= 0);
+            assert_eq!(read_bytes as usize, png.len());
+            assert_eq!(&stream_buf[..read_bytes as usize], png.as_slice());
+            ReleaseStgMedium(&mut med);
+
+            // 5. Out-of-range FileContents lindex=1 returns DV_E_LINDEX.
+            let fmt_bad_index = FormatEtc {
+                cf_format: formats.file_contents,
+                ptd: ptr::null_mut(),
+                dw_aspect: DVASPECT_CONTENT,
+                lindex: 1,
+                tymed: TYMED_HGLOBAL | TYMED_ISTREAM,
+            };
+            assert_eq!(data_object_query_get_data(obj, &fmt_bad_index), DV_E_LINDEX);
             assert_eq!(data_object_release(obj), 0);
         }
     }

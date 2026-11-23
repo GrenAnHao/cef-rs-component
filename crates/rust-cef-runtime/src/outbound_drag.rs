@@ -13,8 +13,9 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use cef::*;
 use rust_cef_core::contracts::BrowserId;
 use rust_cef_core::outbound_drag::{
-    DragOperationMask, DraggedPayload, MAX_DRAG_FILE_PATH_BYTES, MAX_DRAG_FILE_PATHS,
-    OutboundDragFinish, OutboundDragLedger, OutboundDragStart,
+    DragImage, DragOperationMask, DraggedFileContents, DraggedPayload,
+    MAX_DRAG_FILE_CONTENTS_BYTES, MAX_DRAG_FILE_PATH_BYTES, MAX_DRAG_FILE_PATHS,
+    MAX_DRAG_IMAGE_BYTES, OutboundDragFinish, OutboundDragLedger, OutboundDragStart,
 };
 use rust_cef_core::ports::EngineError;
 
@@ -37,16 +38,149 @@ fn cef_userfree_to_string(value: CefStringUserfree) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
-/// Copies only the fields indicated by `DragData` flags within bounded byte and entry limits.
-pub(crate) fn extract_drag_payload(data: &DragData) -> DraggedPayload {
+/// Extracts Chromium's rendered drag ghost bitmap (`CefDragData::GetImage` +
+/// `GetImageHotspot`) as bounded top-down unpremultiplied 32-bit BGRA for Win32
+/// `IDragSourceHelper::InitializeFromBitmap` (matching Chromium's
+/// `ui/base/dragdrop/os_exchange_data_provider_win.cc`).
+fn extract_drag_image(data: &DragData, scale_factor: f32) -> Option<DragImage> {
+    if data.has_image() == 0 {
+        return None;
+    }
+    let image = data.image()?;
+    if image.is_empty() != 0 {
+        return None;
+    }
+    let req_scale = if scale_factor.is_finite() && scale_factor > 0.0 {
+        scale_factor
+    } else {
+        1.0
+    };
+    let mut actual_scale = req_scale;
+    let mut rep_w = 0i32;
+    let mut rep_h = 0i32;
+    if image.representation_info(
+        req_scale,
+        Some(&mut actual_scale),
+        Some(&mut rep_w),
+        Some(&mut rep_h),
+    ) == 0
+        || !actual_scale.is_finite()
+        || actual_scale <= 0.0
+    {
+        actual_scale = 1.0;
+    }
+    let mut pixel_width = 0i32;
+    let mut pixel_height = 0i32;
+    let binary = image.as_bitmap(
+        actual_scale,
+        ColorType::BGRA_8888,
+        AlphaType::POSTMULTIPLIED,
+        Some(&mut pixel_width),
+        Some(&mut pixel_height),
+    )?;
+    if pixel_width <= 0 || pixel_height <= 0 {
+        return None;
+    }
+    let width = u32::try_from(pixel_width).ok()?;
+    let height = u32::try_from(pixel_height).ok()?;
+    let expected = (width as usize)
+        .checked_mul(height as usize)?
+        .checked_mul(4)?;
+    let size = binary.size();
+    if expected == 0 || expected > MAX_DRAG_IMAGE_BYTES || size != expected {
+        return None;
+    }
+    let mut bgra = vec![0u8; expected];
+    let copied = binary.data(Some(&mut bgra), 0);
+    if copied != expected {
+        return None;
+    }
+    let hotspot = data.image_hotspot();
+    let hotspot_x = (hotspot.x as f32 * actual_scale).round() as i32;
+    let hotspot_y = (hotspot.y as f32 * actual_scale).round() as i32;
+    DragImage::bounded(width, height, hotspot_x, hotspot_y, bgra)
+}
+
+wrap_write_handler! {
+    struct DragFileWriteHandler {
+        buf: Arc<Mutex<Vec<u8>>>,
+        max_bytes: usize,
+    }
+
+    impl WriteHandler {
+        fn write(&self, ptr: *const u8, size: usize, n: usize) -> usize {
+            if ptr.is_null() || size == 0 || n == 0 {
+                return 0;
+            }
+            let mut guard = lock(&self.buf);
+            let remaining = self.max_bytes.saturating_sub(guard.len());
+            let elements = (remaining / size).min(n);
+            let Some(copy_len) = elements.checked_mul(size) else {
+                return 0;
+            };
+            if copy_len == 0 {
+                return 0;
+            }
+            let slice = unsafe { std::slice::from_raw_parts(ptr, copy_len) };
+            guard.extend_from_slice(slice);
+            elements
+        }
+
+        fn seek(&self, _offset: i64, _whence: ::std::os::raw::c_int) -> ::std::os::raw::c_int {
+            -1
+        }
+
+        fn tell(&self) -> i64 {
+            lock(&self.buf).len() as i64
+        }
+
+        fn flush(&self) -> ::std::os::raw::c_int {
+            0
+        }
+
+        fn may_block(&self) -> ::std::os::raw::c_int {
+            0
+        }
+    }
+}
+
+/// Extracts virtual file bytes dragged out of the web view (e.g. an `<img>`)
+/// via `CefDragData::GetFileName()` + `GetFileContents()` (bounded to
+/// `MAX_DRAG_FILE_CONTENTS_BYTES`).
+fn extract_file_contents(data: &DragData) -> Option<DraggedFileContents> {
+    let expected = data.file_contents(None);
+    if expected == 0 || expected > MAX_DRAG_FILE_CONTENTS_BYTES {
+        return None;
+    }
+    let buf = Arc::new(Mutex::new(Vec::with_capacity(expected)));
+    let mut handler = DragFileWriteHandler::new(Arc::clone(&buf), MAX_DRAG_FILE_CONTENTS_BYTES);
+    let mut writer = stream_writer_create_for_handler(Some(&mut handler))?;
+    let written = data.file_contents(Some(&mut writer));
+    drop(writer);
+    drop(handler);
+    if written == 0 {
+        return None;
+    }
+    let bytes = std::mem::take(&mut *lock(&buf));
+    if bytes.is_empty() || bytes.len() > MAX_DRAG_FILE_CONTENTS_BYTES {
+        return None;
+    }
+    let suggested = cef_userfree_to_string(data.file_name());
+    DraggedFileContents::bounded(suggested.as_deref(), bytes)
+}
+
+/// Copies all supported fields from `CefDragData` within bounded byte and entry limits.
+pub(crate) fn extract_drag_payload(data: &DragData, scale_factor: f32) -> DraggedPayload {
     let mut file_paths = Vec::new();
-    if data.is_file() != 0 {
+    let is_file = data.is_file() != 0;
+    if is_file {
         let mut list = CefStringList::new();
         if data.file_paths(Some(&mut list)) != 0 {
             file_paths =
                 read_cef_string_list(&mut list, MAX_DRAG_FILE_PATHS, MAX_DRAG_FILE_PATH_BYTES);
         }
     }
+    let file_contents = extract_file_contents(data);
     let is_fragment = data.is_fragment() != 0;
     let is_link = data.is_link() != 0;
     let text = if is_fragment || is_link {
@@ -54,7 +188,7 @@ pub(crate) fn extract_drag_payload(data: &DragData) -> DraggedPayload {
     } else {
         None
     };
-    let html = if is_fragment {
+    let html = if is_fragment || is_file || file_contents.is_some() {
         cef_userfree_to_string(data.fragment_html())
     } else {
         None
@@ -64,7 +198,10 @@ pub(crate) fn extract_drag_payload(data: &DragData) -> DraggedPayload {
     } else {
         None
     };
+    let image = extract_drag_image(data, scale_factor);
     DraggedPayload::bounded(text.as_deref(), html.as_deref(), url.as_deref(), file_paths)
+        .with_file_contents(file_contents)
+        .with_image(image)
 }
 
 /// Manages single-in-flight asynchronous outbound drag state per Browser.

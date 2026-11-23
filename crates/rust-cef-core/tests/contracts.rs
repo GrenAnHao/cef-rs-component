@@ -292,6 +292,15 @@ fn browser_options_validate_frame_rate_encoding_and_console_bounds() {
         ));
     }
 
+    let defaults = BrowserOptions::default();
+    assert_eq!(defaults.accelerated_osr, cfg!(target_os = "windows"));
+    assert_eq!(
+        defaults.effective_frame_rate(),
+        rust_cef_core::contracts::DEFAULT_WINDOWLESS_FRAME_RATE
+    );
+    assert_eq!(defaults.effective_frame_rate(), 120);
+    assert!(!defaults.with_accelerated_osr(false).accelerated_osr);
+
     let mut cfg = browser_config(None);
     cfg.options = BrowserOptions::default()
         .with_frame_rate(120)

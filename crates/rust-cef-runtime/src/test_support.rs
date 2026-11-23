@@ -457,7 +457,10 @@ pub struct NativeFrameRejection {
 /// Validation-only digest of the actual owned frame bytes, without copying them.
 pub fn probe_frame_sha256(frame: &rust_cef_core::ports::OwnedFrame) -> String {
     use sha2::Digest;
-    format!("{:x}", sha2::Sha256::digest(frame.pixels.as_slice()))
+    match frame.cpu_pixels() {
+        Some(pixels) => format!("{:x}", sha2::Sha256::digest(pixels.as_slice())),
+        None => format!("gpu:{}:{}", frame.info.width, frame.info.height),
+    }
 }
 
 /// Publish readiness by a same-directory rename only after the PID file is

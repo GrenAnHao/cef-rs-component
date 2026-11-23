@@ -182,32 +182,6 @@ wrap_client! {
     }
 }
 
-/// Internal lifecycle scaffold only. Before enabling Show, a real caller must
-/// supply/verify the original window/render/policy/context and resource owner.
-/// An issued slot is required; preparation failure cannot undo native admission.
-pub(crate) fn build(registry: &Arc<UiRegistry>, id: AuxiliaryId) -> Result<Client, EngineError> {
-    registry.devtools.client_preflight(id)?;
-    let profile = registry.recorded_auxiliary_profile(id.owner)?;
-    // Pending issued ownership keeps Runtime from sealing CEF/profile resources.
-    if currently_on(ThreadId::UI) == 0 {
-        return Err(EngineError::InvalidRequest);
-    }
-    let close_commands = policy::CloseCommands::resolve(registry)?;
-    registry.devtools.attach_client(id, profile)?;
-    Ok(AuxiliaryClient::new(Arc::new(Life {
-        id,
-        _profile: profile,
-        book: registry.devtools.clone(),
-        registry: Arc::downgrade(registry),
-        ui: std::thread::current().id(),
-        native: AtomicI32::new(0),
-        closed: AtomicBool::new(false),
-        prepared: false,
-        close_commands,
-        expected_context: Weak::new(),
-    })))
-}
-
 /// Host-initiated Life construction without a menu scope. Still no Show: the
 /// caller must already hold a counted original ExpectedContext for this id and
 /// pass all native/window/policy gates before Show. Mirrors `build` but keeps
@@ -245,6 +219,7 @@ pub(crate) fn build_for_host(
 /// Preparation only, still no Show, native profile/window/policy permission or
 /// capability. Pure preflight precedes CEF UI qualification to avoid post-shutdown
 /// CEF calls for already-retired IDs. Rollback waits for the final interface field.
+#[cfg(feature = "test-support")]
 pub(super) fn prepare(
     registry: &Arc<UiRegistry>,
     id: AuxiliaryId,

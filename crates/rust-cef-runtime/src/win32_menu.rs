@@ -139,6 +139,9 @@ unsafe extern "system" {
         lptpm: *const c_void,
     ) -> i32;
     fn EndMenu() -> i32;
+    fn GetForegroundWindow() -> Handle;
+    fn GetFocus() -> Handle;
+    fn SetFocus(hwnd: Handle) -> Handle;
     fn PostMessageW(hwnd: Handle, msg: u32, wparam: usize, lparam: isize) -> i32;
     fn SendMessageW(hwnd: Handle, msg: u32, wparam: usize, lparam: isize) -> isize;
     fn RegisterClassExW(wc: *const WndClassExW) -> u16;
@@ -734,6 +737,17 @@ impl HostInner {
             }
         }
         self.in_modal_loop.set(false);
+        // TrackPopupMenuEx can leave Win32 thread focus unset (GetFocus() == 0)
+        // after the popup closes; restore keyboard focus to the still-foreground
+        // owner window so NativeKeyboardServices continues routing keys.
+        unsafe {
+            if IsWindow(owner_hwnd) != 0
+                && GetForegroundWindow() == owner_hwnd
+                && GetFocus() != owner_hwnd
+            {
+                let _ = SetFocus(owner_hwnd);
+            }
+        }
 
         let finished = self.active.borrow_mut().take();
         let outcome = match finished {

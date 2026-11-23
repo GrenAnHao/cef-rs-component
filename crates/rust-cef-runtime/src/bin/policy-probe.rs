@@ -204,9 +204,13 @@ mod windows {
             }
             let mut s = lock(&self.seen);
             s.frames += 1;
+            let Some(pixels) = frame.cpu_pixels() else {
+                s.error.get_or_insert("frame-layout");
+                return PublishResult::Rejected;
+            };
             if frame.info.width != 320
                 || frame.info.height != 240
-                || frame.pixels.len() != 320 * 240 * 4
+                || pixels.len() != 320 * 240 * 4
             {
                 s.error.get_or_insert("frame-layout");
                 return PublishResult::Rejected;
@@ -216,11 +220,11 @@ mod windows {
                 return PublishResult::Rejected;
             }
             let pixel = (4 * 320 + 4) * 4; // Visible button covers center. Sample fixed background instead.
-            if frame.pixels[pixel..pixel + 4] == [126, 76, 26, 255] {
+            if pixels[pixel..pixel + 4] == [126, 76, 26, 255] {
                 s.valid.insert(frame.info.browser);
             }
             let center = (120 * 320 + 160) * 4;
-            s.center = frame.pixels[center..center + 4].to_vec();
+            s.center = pixels[center..center + 4].to_vec();
             let show = s.selected == Some(frame.info.browser);
             s.latest.insert(frame.info.browser, frame.clone());
             drop(s);
@@ -428,8 +432,10 @@ mod windows {
                 frame.info.browser == id
                     && frame.info.width == 320
                     && frame.info.height == 240
-                    && frame.pixels.len() == 320 * 240 * 4
-                    && frame.pixels[(4 * 320 + 4) * 4..(4 * 320 + 4) * 4 + 4] == [126, 76, 26, 255]
+                    && frame.cpu_pixels().is_some_and(|px| {
+                        px.len() == 320 * 240 * 4
+                            && px[(4 * 320 + 4) * 4..(4 * 320 + 4) * 4 + 4] == [126, 76, 26, 255]
+                    })
             })
         }
         fn click(&mut self, handle: &BrowserHandle) -> Result<(), String> {
@@ -1071,7 +1077,7 @@ mark('loaded');fetch({forbidden},{{mode:'no-cors'}}).catch(()=>{{}});</script>"#
             let sample = (4 * 320 + 4) * 4;
             report["last_paint"] = json!({"browser_local":frame.info.browser.local(),"width":frame.info.width,
                 "height":frame.info.height,"sequence":frame.info.sequence,
-                "background_bgra":frame.pixels.get(sample..sample+4)});
+                "background_bgra":frame.cpu_pixels().and_then(|px| px.get(sample..sample+4))});
         }
         if let Some(active) = &h.active {
             let s = active.snapshot();

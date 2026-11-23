@@ -11,7 +11,7 @@ use std::{
     thread::ThreadId,
 };
 
-type Hwnd = *mut std::ffi::c_void;
+type Hwnd = isize;
 #[link(name = "user32")]
 unsafe extern "system" {
     fn IsWindow(hwnd: Hwnd) -> i32;
@@ -54,6 +54,7 @@ struct WindowProof {
     ui: ThreadId,
 }
 impl WindowProof {
+    #[cfg(test)]
     fn capture(hwnd: usize, system: &impl WindowSystem) -> Result<Self, EngineError> {
         if hwnd == 0 {
             return Err(EngineError::NotReady);
@@ -121,24 +122,7 @@ impl NativeWindows {
             e.into_inner()
         })
     }
-    /// Future Show caller must validate original menu/window/context admission
-    /// and an exclusive non-Views, non-child native Chrome window role before
-    /// issuing creation. Returned HWND/PID/TID/root samples do not prove that
-    /// role or an unchanged HWND. This function neither issues nor focuses.
-    pub fn capture(
-        &self,
-        registry: &UiRegistry,
-        id: AuxiliaryId,
-        native_id: i32,
-    ) -> Result<(), EngineError> {
-        self.book.window_capture_ready(id, native_id)?;
-        // Native resource lookup clones Rust Arc only, native getters/release are
-        // outside its locks. Never substitute the parent or GetForegroundWindow.
-        let hwnd = registry
-            .auxiliary_native
-            .window_handle(registry, id, native_id)?;
-        self.insert_observed(id, native_id, hwnd, &Windows)
-    }
+    #[cfg(test)]
     fn insert_observed(
         &self,
         id: AuxiliaryId,

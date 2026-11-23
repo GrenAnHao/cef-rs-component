@@ -17,8 +17,8 @@ use rust_cef_core::{
     frame_store::frame_len,
     mailbox::FrameMailbox,
     ports::{
-        CaptureFailureKind, EngineError, FrameCapture, FrameInfo, FrameInput, FrameSink,
-        OwnedFrame, PublishResult, SurfaceKind, UiDispatcher,
+        CaptureFailureKind, EngineError, FrameCapture, FrameInfo, FrameInput, FramePayload,
+        FrameSink, OwnedFrame, PublishResult, SurfaceKind, UiDispatcher,
     },
 };
 use serde::Serialize;
@@ -86,9 +86,24 @@ pub struct CaptureDiagnostics {
     pub abandoned: bool,
 }
 
+pub(crate) fn gpu_disabled_by_env() -> bool {
+    match std::env::var("GPUI_CEF_DISABLE_GPU") {
+        Ok(val) => {
+            !val.is_empty()
+                && val != "0"
+                && !val.eq_ignore_ascii_case("false")
+                && val != "in-process"
+                && val != "swiftshader"
+        }
+        Err(_) => false,
+    }
+}
+
 struct State {
     owner: u64,
     backend: Option<RenderPreference>,
+    shared_texture_output: bool,
+    allow_software_fallback: bool,
     retired: bool,
     in_flight: bool,
     on_idle: Option<Box<dyn FnOnce() + Send + 'static>>,
@@ -177,6 +192,8 @@ impl CaptureEndpoint {
             state: Mutex::new(State {
                 owner: 0,
                 backend: None,
+                shared_texture_output: false,
+                allow_software_fallback: false,
                 retired: false,
                 in_flight: false,
                 on_idle: None,
@@ -198,7 +215,7 @@ impl CaptureEndpoint {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
-    fn check(&self, state: &State, backend: RenderPreference) -> Result<(), EngineError> {
+    fn check_owner_and_live(&self, state: &State) -> Result<(), EngineError> {
         if self.abandoned.load(Ordering::Acquire) {
             return Err(EngineError::Closed);
         }
@@ -218,13 +235,44 @@ impl CaptureEndpoint {
         if !test && cef::currently_on(cef::ThreadId::UI) == 0 {
             return Err(EngineError::WrongThread);
         }
-        if state.backend != Some(backend) {
+        Ok(())
+    }
+    fn check(&self, state: &State, backend: RenderPreference) -> Result<(), EngineError> {
+        self.check_owner_and_live(state)?;
+        let matches = state.backend == Some(backend)
+            || (backend == RenderPreference::SoftwareRequired && state.allow_software_fallback);
+        if !matches {
             return Err(CaptureFault::new(CaptureFailureKind::WrongBackend).engine());
         }
         Ok(())
     }
+    #[allow(dead_code)]
     pub(crate) fn prepare(&self, backend: RenderPreference) -> Result<(), EngineError> {
-        self.prepare_with(backend, D3d11Capture::new)
+        self.prepare_with_options(backend, cfg!(target_os = "windows"), false)
+            .map(|_| ())
+    }
+
+    pub(crate) fn prepare_with_options(
+        &self,
+        backend: RenderPreference,
+        accelerated_osr: bool,
+        switches_disable_gpu: bool,
+    ) -> Result<bool, EngineError> {
+        let effective_backend = if backend == RenderPreference::SoftwareRequired
+            || !accelerated_osr
+            || gpu_disabled_by_env()
+            || switches_disable_gpu
+        {
+            RenderPreference::SoftwareRequired
+        } else {
+            backend
+        };
+        let gpu_enabled = self.prepare_with(
+            effective_backend,
+            backend == RenderPreference::Auto,
+            D3d11Capture::new,
+        )?;
+        Ok(gpu_enabled)
     }
 
     #[cfg(feature = "test-support")]
@@ -235,16 +283,18 @@ impl CaptureEndpoint {
         if backend != RenderPreference::D3d11Required {
             return Err(CaptureFault::new(CaptureFailureKind::WrongBackend).engine());
         }
-        self.prepare_with(backend, |owner| {
+        self.prepare_with(backend, false, |owner| {
             D3d11Capture::new_with_fault(owner, Some(d3d11::D3dFaultPoint::DeviceCreation))
-        })
+        })?;
+        Ok(())
     }
 
     fn prepare_with(
         &self,
         backend: RenderPreference,
+        allow_auto_fallback: bool,
         create_device: impl FnOnce(u64) -> Result<D3d11Capture, CaptureFault>,
-    ) -> Result<(), EngineError> {
+    ) -> Result<bool, EngineError> {
         if cef::currently_on(cef::ThreadId::UI) == 0 {
             return Err(EngineError::WrongThread);
         }
@@ -263,6 +313,7 @@ impl CaptureEndpoint {
             state.owner = owner;
             state.diagnostics.owner_thread = owner;
             state.backend = Some(backend);
+            state.allow_software_fallback = true;
             state.diagnostics.requested_backend = Some(match backend {
                 RenderPreference::SoftwareRequired => "Software",
                 RenderPreference::D3d11Required => "D3d11",
@@ -271,18 +322,28 @@ impl CaptureEndpoint {
         }
         let gpu = match backend {
             RenderPreference::SoftwareRequired => None,
-            RenderPreference::D3d11Required => match create_device(owner) {
+            RenderPreference::D3d11Required | RenderPreference::Auto => match create_device(owner) {
                 Ok(gpu) => Some(gpu),
                 Err(fault) => {
+                    if allow_auto_fallback || backend == RenderPreference::Auto {
+                        self.record_failure(&fault.engine());
+                        let mut state = self.lock();
+                        state.backend = Some(RenderPreference::SoftwareRequired);
+                        state.shared_texture_output = false;
+                        state.allow_software_fallback = true;
+                        drop(state);
+                        self.commit_gpu(None)?;
+                        return Ok(false);
+                    }
                     self.record_failure(&fault.engine());
                     return Err(fault.engine());
                 }
             },
-            RenderPreference::Auto => {
-                return Err(CaptureFault::new(CaptureFailureKind::WrongBackend).engine());
-            }
         };
-        self.commit_gpu(gpu)
+        let shared = gpu.is_some();
+        self.lock().shared_texture_output = shared;
+        self.commit_gpu(gpu)?;
+        Ok(shared)
     }
     fn commit_gpu(&self, gpu: Option<D3d11Capture>) -> Result<(), EngineError> {
         // Native construction/drop is outside the state lock. Preparation is a
@@ -396,6 +457,73 @@ impl CaptureEndpoint {
         state.diagnostics.observed_backend = Some("Software");
         Ok(frame)
     }
+    pub(crate) fn accelerated_shared(
+        &self,
+        info: FrameInfo,
+        input: &cef::AcceleratedPaintInfo,
+        try_reclaim_unconsumed: impl FnMut() -> Option<usize>,
+    ) -> Result<(OwnedFrame, u64), EngineError> {
+        {
+            let state = self.lock();
+            self.check_owner_and_live(&state)?;
+            if !matches!(
+                state.backend,
+                Some(RenderPreference::D3d11Required | RenderPreference::Auto)
+            ) {
+                return Err(CaptureFault::new(CaptureFailureKind::WrongBackend).engine());
+            }
+        }
+        validate_accelerated(input)?;
+        if input.extra.visible_rect.width != info.width as i32
+            || input.extra.visible_rect.height != info.height as i32
+        {
+            return Err(CaptureFault::new(CaptureFailureKind::InvalidDimensions).engine());
+        }
+        let gpu = {
+            let mut state = self.lock();
+            self.check_owner_and_live(&state)?;
+            if !matches!(
+                state.backend,
+                Some(RenderPreference::D3d11Required | RenderPreference::Auto)
+            ) {
+                return Err(CaptureFault::new(CaptureFailureKind::WrongBackend).engine());
+            }
+            if state.in_flight {
+                return Err(CaptureFault::new(CaptureFailureKind::Busy).engine());
+            }
+            let gpu = state.gpu.take().ok_or(EngineError::NotReady)?;
+            state.in_flight = true;
+            gpu
+        };
+        let mut checkout = GpuCheckout {
+            endpoint: self,
+            gpu: Some(gpu),
+            _ui: std::marker::PhantomData,
+        };
+        let gpu = checkout.gpu.as_mut().expect("one GPU per UI checkout");
+        let result = gpu
+            .copy_to_shared_pool(info.surface, input, try_reclaim_unconsumed)
+            .map_err(CaptureFault::engine);
+        let metrics = gpu.metrics();
+        update_metrics(&mut self.lock().diagnostics, metrics);
+        drop(checkout);
+        if self.is_abandoned() {
+            return Err(EngineError::Closed);
+        }
+        let (gpu_frame, copy_us) = result?;
+        let mut state = self.lock();
+        state.diagnostics.d3d11_captures += 1;
+        state.diagnostics.observed_backend = Some("D3d11");
+        drop(state);
+        Ok((
+            OwnedFrame {
+                info,
+                payload: FramePayload::GpuSharedTexture(gpu_frame),
+            },
+            copy_us,
+        ))
+    }
+
     pub(crate) fn accelerated(
         &self,
         info: FrameInfo,
@@ -518,8 +646,10 @@ impl CaptureEndpoint {
                 return Ok(());
             }
             // No native object exists for an unprepared/software endpoint.
-            if state.gpu.is_some() {
-                self.check(&state, RenderPreference::D3d11Required)?;
+            if let Some(gpu_backend) = state.backend
+                && state.gpu.is_some()
+            {
+                self.check(&state, gpu_backend)?;
             }
             state.retired = true;
             state.diagnostics.retired = true;
@@ -596,10 +726,15 @@ fn accelerated_frame_bytes(extra: &cef::AcceleratedPaintInfoCommon) -> Result<us
     let right = end(v.x, v.width);
     let bottom = end(v.y, v.height);
     let invalid = || CaptureFault::new(CaptureFailureKind::InvalidDimensions);
+    let max_bound = i64::from(rust_cef_core::contracts::MAX_NATIVE_BOUND);
     if v.x < 0
         || v.y < 0
         || v.width <= 0
         || v.height <= 0
+        || i64::from(extra.coded_size.width) > max_bound
+        || i64::from(extra.coded_size.height) > max_bound
+        || i64::from(v.width) > max_bound
+        || i64::from(v.height) > max_bound
         || right > i64::from(extra.coded_size.width)
         || bottom > i64::from(extra.coded_size.height)
         || c.x < v.x

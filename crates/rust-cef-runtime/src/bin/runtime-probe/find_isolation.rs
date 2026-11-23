@@ -181,8 +181,8 @@ impl FindIsolationProbe {
                 && frame.info.surface_generation == before.surface_generation
                 && (frame.info.width, frame.info.height) == (320, 240)
                 && frame
-                    .pixels
-                    .get(4 * (120 * 320 + 160)..4 * (120 * 320 + 160) + 4)
+                    .cpu_pixels()
+                    .and_then(|px| px.get(4 * (120 * 320 + 160)..4 * (120 * 320 + 160) + 4))
                     == Some(&[126, 76, 26, 255])
             {
                 break frame.info;

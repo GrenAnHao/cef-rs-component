@@ -542,7 +542,10 @@ mod windows {
             let center = ((height as usize / 2) * width as usize + width as usize / 2) * 4;
             if width == FRAME_WIDTH_U32
                 && height == FRAME_HEIGHT_U32
-                && frame.pixels.get(center..center + 4) == Some(&CENTER_BGRA)
+                && frame
+                    .cpu_pixels()
+                    .and_then(|px| px.get(center..center + 4))
+                    == Some(&CENTER_BGRA)
             {
                 self.width.store(width, Ordering::Release);
                 self.height.store(height, Ordering::Release);

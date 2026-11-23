@@ -3,10 +3,12 @@ use crate::executor::NativeAudit;
 use cef::*;
 use rust_cef_core::{
     file_drop::{FileDragPhase, FileDragStage},
+    inbound_drag::InboundDragCommand,
     input::{
         ActiveTouchTracker, BrowserTouchEvent, InputEvent, InputKind, InputSnapshot,
         MAX_PRESSED_KEYS, MouseButton, TouchEventType, TouchPointerType, Utf16Range,
     },
+    outbound_drag::DragOperationMask,
     ports::{EngineError, MouseModifiers},
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -52,6 +54,7 @@ pub(crate) struct NativeInput {
     keys: BTreeMap<i32, (i32, bool, MouseModifiers)>,
     composition: bool,
     file_drag: FileDragPhase,
+    inbound_drag_active: bool,
     touches: ActiveTouchTracker,
     last_pointer: (i32, i32),
     pub(crate) admitted: u64,
@@ -80,6 +83,52 @@ impl NativeInput {
             last_native_error: self.last_native_error.clone(),
             accepts_text: false,
         }
+    }
+
+    pub(crate) fn dispatch_mouse_move_raw(
+        &mut self,
+        x: i32,
+        y: i32,
+        leaving: bool,
+        modifiers: MouseModifiers,
+        host: &BrowserHost,
+        audit: &NativeAudit,
+    ) {
+        self.last_pointer = (x, y);
+        audit.record();
+        host.send_mouse_move_event(
+            Some(&MouseEvent {
+                x,
+                y,
+                modifiers: self.mouse_flags(modifiers),
+            }),
+            i32::from(leaving),
+        );
+        self.executed = self.executed.saturating_add(1);
+    }
+
+    pub(crate) fn dispatch_mouse_wheel_raw(
+        &mut self,
+        x: i32,
+        y: i32,
+        delta_x: i32,
+        delta_y: i32,
+        modifiers: MouseModifiers,
+        host: &BrowserHost,
+        audit: &NativeAudit,
+    ) {
+        self.last_pointer = (x, y);
+        audit.record();
+        host.send_mouse_wheel_event(
+            Some(&MouseEvent {
+                x,
+                y,
+                modifiers: self.mouse_flags(modifiers),
+            }),
+            delta_x,
+            delta_y,
+        );
+        self.executed = self.executed.saturating_add(1);
     }
 
     pub(crate) fn dispatch(
@@ -161,21 +210,42 @@ impl NativeInput {
                 modifiers,
             } => {
                 self.last_pointer = (*x, *y);
-                let (id, native) = button_type(*button);
+                let id = button_id(*button);
                 if !*up {
                     self.buttons.insert(id);
                 }
-                let flags =
-                    self.mouse_flags(*modifiers) & if *up { !button_flag(id) } else { u32::MAX };
-                audit.record();
-                host.send_mouse_click_event(
-                    Some(&event(*x, *y, flags)),
-                    native,
-                    i32::from(*up),
-                    i32::from(*click_count),
-                );
-                if *up {
-                    self.buttons.remove(&id);
+                if let Some(native) = native_button_type(*button) {
+                    let flags = self.mouse_flags(*modifiers)
+                        & if *up { !button_flag(id) } else { u32::MAX };
+                    audit.record();
+                    host.send_mouse_click_event(
+                        Some(&event(*x, *y, flags)),
+                        native,
+                        i32::from(*up),
+                        i32::from(*click_count),
+                    );
+                    if *up {
+                        self.buttons.remove(&id);
+                    }
+                } else {
+                    if *up {
+                        self.buttons.remove(&id);
+                    }
+                    // CEF's `cef_mouse_button_type_t` only defines LEFT/MIDDLE/RIGHT.
+                    // Dispatch real Chromium `kBack`/`kForward` mouse events via built-in
+                    // CDP `Input.dispatchMouseEvent` so pages (e.g. MouseTester, games,
+                    // custom handlers) receive genuine `button: 3`/`4` DOM events.
+                    dispatch_cdp_side_mouse(
+                        host,
+                        audit,
+                        *x,
+                        *y,
+                        *button,
+                        *up,
+                        *click_count,
+                        *modifiers,
+                        &self.buttons,
+                    );
                 }
             }
             InputKind::MouseWheel {
@@ -218,6 +288,7 @@ impl NativeInput {
                         KeyEventType::RAWKEYDOWN
                     },
                     modifiers: flags(*modifiers)
+                        | windows_key_extra_flags(*windows_key_code, *native_key_code)
                         | if *repeat {
                             rust_cef_core::keymap::EVENTFLAG_IS_REPEAT
                         } else {
@@ -232,6 +303,29 @@ impl NativeInput {
                 };
                 audit.record();
                 host.send_key_event(Some(&key));
+                // GPUI's Win32 WM_CHAR translation strips control characters (`\r` / `0x0D`),
+                // so Chromium never receives a CHAR event for Enter unless we emit it after
+                // RAWKEYDOWN (matching CefSharp WpfKeyboardHandler WM_CHAR for VK_RETURN).
+                if !*up
+                    && !*system
+                    && *windows_key_code == 0x0D
+                    && !modifiers.control
+                    && !modifiers.platform
+                {
+                    let char_key = KeyEvent {
+                        size: std::mem::size_of::<KeyEvent>(),
+                        type_: KeyEventType::CHAR,
+                        modifiers: key.modifiers,
+                        windows_key_code: 0x0D,
+                        native_key_code: *native_key_code,
+                        is_system_key: 0,
+                        character: 0x0D,
+                        unmodified_character: 0x0D,
+                        focus_on_editable_field: 0,
+                    };
+                    audit.record();
+                    host.send_key_event(Some(&char_key));
+                }
                 if *up {
                     self.record_key(
                         *windows_key_code,
@@ -325,12 +419,129 @@ impl NativeInput {
                 .fold(0, |bits, id| bits | button_flag(id))
     }
 
+    pub(crate) fn clear_buttons(&mut self) {
+        self.buttons.clear();
+    }
+
     pub(crate) fn has_native_state(&self) -> bool {
         !self.keys.is_empty()
             || !self.buttons.is_empty()
             || self.composition
             || self.file_drag.is_active()
+            || self.inbound_drag_active
             || !self.touches.is_empty()
+    }
+
+    pub(crate) fn dispatch_drag_target(
+        &mut self,
+        cmd: &InboundDragCommand,
+        host: &BrowserHost,
+        audit: &NativeAudit,
+    ) -> Result<(), EngineError> {
+        cmd.validate()?;
+        let event = |x, y, modifiers| MouseEvent { x, y, modifiers };
+        match cmd {
+            InboundDragCommand::Enter {
+                payload,
+                x,
+                y,
+                modifiers,
+                allowed_ops,
+            } => {
+                if self.inbound_drag_active {
+                    self.inbound_drag_active = false;
+                    audit.record();
+                    host.drag_target_drag_leave();
+                }
+                audit.record();
+                let mut data =
+                    cef::drag_data_create().ok_or(EngineError::Backend { code: None })?;
+                audit.record();
+                data.reset_file_contents();
+                if let Some(url) = &payload.url
+                    && !url.is_empty()
+                {
+                    audit.record();
+                    data.set_link_url(Some(&CefString::from(url.as_str())));
+                }
+                if let Some(title) = &payload.url_title
+                    && !title.is_empty()
+                {
+                    audit.record();
+                    data.set_link_title(Some(&CefString::from(title.as_str())));
+                }
+                if let Some(text) = &payload.text
+                    && !text.is_empty()
+                {
+                    audit.record();
+                    data.set_fragment_text(Some(&CefString::from(text.as_str())));
+                }
+                if let Some(html) = &payload.html
+                    && !html.is_empty()
+                {
+                    audit.record();
+                    data.set_fragment_html(Some(&CefString::from(html.as_str())));
+                }
+                if let Some(base) = &payload.html_base_url
+                    && !base.is_empty()
+                {
+                    audit.record();
+                    data.set_fragment_base_url(Some(&CefString::from(base.as_str())));
+                }
+                for path in &payload.files {
+                    let text = path.to_str().ok_or(EngineError::InvalidRequest)?;
+                    audit.record();
+                    data.add_file(Some(&CefString::from(text)), None);
+                }
+                self.inbound_drag_active = true;
+                self.last_pointer = (*x, *y);
+                audit.record();
+                host.drag_target_drag_enter(
+                    Some(&mut data),
+                    Some(&event(*x, *y, flags(*modifiers))),
+                    crate::outbound_drag::core_mask_to_cef(*allowed_ops),
+                );
+            }
+            InboundDragCommand::Over {
+                x,
+                y,
+                modifiers,
+                allowed_ops,
+            } => {
+                if !self.inbound_drag_active {
+                    return Err(EngineError::InvalidRequest);
+                }
+                self.last_pointer = (*x, *y);
+                audit.record();
+                host.drag_target_drag_over(
+                    Some(&event(*x, *y, flags(*modifiers))),
+                    crate::outbound_drag::core_mask_to_cef(*allowed_ops),
+                );
+            }
+            InboundDragCommand::Leave => {
+                if self.inbound_drag_active {
+                    self.inbound_drag_active = false;
+                    audit.record();
+                    host.drag_target_drag_leave();
+                }
+            }
+            InboundDragCommand::Drop { x, y, modifiers } => {
+                if !self.inbound_drag_active {
+                    return Err(EngineError::InvalidRequest);
+                }
+                self.inbound_drag_active = false;
+                self.last_pointer = (*x, *y);
+                audit.record();
+                host.drag_target_drag_over(
+                    Some(&event(*x, *y, flags(*modifiers))),
+                    crate::outbound_drag::core_mask_to_cef(DragOperationMask::EVERY),
+                );
+                audit.record();
+                host.drag_target_drop(Some(&event(*x, *y, flags(*modifiers))));
+            }
+        }
+        self.executed = self.executed.saturating_add(1);
+        Ok(())
     }
 
     pub(crate) fn dispatch_touch(
@@ -357,9 +568,10 @@ impl NativeInput {
     }
 
     fn cancel_file_drag(&mut self, host: &BrowserHost, audit: &NativeAudit) {
-        if self.file_drag.is_active() {
+        if self.file_drag.is_active() || self.inbound_drag_active {
             // Clear before a native call which can synchronously reenter.
             self.file_drag = FileDragPhase::Idle;
+            self.inbound_drag_active = false;
             audit.record();
             host.drag_target_drag_leave();
         }
@@ -392,23 +604,50 @@ impl NativeInput {
         let (x, y) = self.last_pointer;
         self.keys.clear();
         for id in self.buttons.iter().copied().collect::<Vec<_>>() {
-            let button = match id {
-                0 => MouseButtonType::LEFT,
-                1 => MouseButtonType::MIDDLE,
-                _ => MouseButtonType::RIGHT,
-            };
-            audit.record();
-            host.send_mouse_click_event(
-                Some(&MouseEvent {
-                    x,
-                    y,
-                    modifiers: self.mouse_flags(MouseModifiers::default()) & !button_flag(id),
-                }),
-                button,
-                1,
-                1,
-            );
-            self.buttons.remove(&id);
+            match id {
+                0..=2 => {
+                    let button = match id {
+                        0 => MouseButtonType::LEFT,
+                        1 => MouseButtonType::MIDDLE,
+                        _ => MouseButtonType::RIGHT,
+                    };
+                    audit.record();
+                    host.send_mouse_click_event(
+                        Some(&MouseEvent {
+                            x,
+                            y,
+                            modifiers: self.mouse_flags(MouseModifiers::default())
+                                & !button_flag(id),
+                        }),
+                        button,
+                        1,
+                        1,
+                    );
+                    self.buttons.remove(&id);
+                }
+                3 | 4 => {
+                    self.buttons.remove(&id);
+                    let button = if id == 3 {
+                        MouseButton::Back
+                    } else {
+                        MouseButton::Forward
+                    };
+                    dispatch_cdp_side_mouse(
+                        host,
+                        audit,
+                        x,
+                        y,
+                        button,
+                        true,
+                        1,
+                        MouseModifiers::default(),
+                        &self.buttons,
+                    );
+                }
+                _ => {
+                    self.buttons.remove(&id);
+                }
+            }
         }
         audit.record();
         host.send_capture_lost_event();
@@ -423,19 +662,133 @@ fn file_copy_mask() -> DragOperationsMask {
 fn flags(m: MouseModifiers) -> u32 {
     rust_cef_core::keymap::modifier_flags(m.shift, m.control, m.alt, m.platform)
 }
-fn button_type(b: MouseButton) -> (u8, MouseButtonType) {
+fn windows_key_extra_flags(vk: i32, lparam: i32) -> u32 {
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn GetKeyState(n_virt_key: i32) -> i16;
+        fn MapVirtualKeyW(u_code: u32, u_map_type: u32) -> u32;
+    }
+    let mut extra = rust_cef_core::keymap::windows_key_location_flags(vk, lparam);
+    if vk == 0x10 && extra == 0 {
+        let scancode = (lparam as u32 >> 16) & 0x00FF;
+        if scancode != 0 {
+            const MAPVK_VSC_TO_VK_EX: u32 = 3;
+            match unsafe { MapVirtualKeyW(scancode, MAPVK_VSC_TO_VK_EX) } {
+                0xA0 => extra |= rust_cef_core::keymap::EVENTFLAG_IS_LEFT,
+                0xA1 => extra |= rust_cef_core::keymap::EVENTFLAG_IS_RIGHT,
+                _ => {}
+            }
+        }
+    }
+    if (unsafe { GetKeyState(0x14) } & 1) != 0 {
+        extra |= rust_cef_core::keymap::EVENTFLAG_CAPS_LOCK_ON;
+    }
+    if (unsafe { GetKeyState(0x90) } & 1) != 0 {
+        extra |= rust_cef_core::keymap::EVENTFLAG_NUM_LOCK_ON;
+    }
+    extra
+}
+fn button_id(b: MouseButton) -> u8 {
     match b {
-        MouseButton::Left => (0, MouseButtonType::LEFT),
-        MouseButton::Middle => (1, MouseButtonType::MIDDLE),
-        MouseButton::Right => (2, MouseButtonType::RIGHT),
+        MouseButton::Left => 0,
+        MouseButton::Middle => 1,
+        MouseButton::Right => 2,
+        MouseButton::Back => 3,
+        MouseButton::Forward => 4,
+    }
+}
+fn native_button_type(b: MouseButton) -> Option<MouseButtonType> {
+    match b {
+        MouseButton::Left => Some(MouseButtonType::LEFT),
+        MouseButton::Middle => Some(MouseButtonType::MIDDLE),
+        MouseButton::Right => Some(MouseButtonType::RIGHT),
+        MouseButton::Back | MouseButton::Forward => None,
     }
 }
 fn button_flag(id: u8) -> u32 {
     match id {
         0 => rust_cef_core::keymap::EVENTFLAG_LEFT_MOUSE_BUTTON,
         1 => rust_cef_core::keymap::EVENTFLAG_MIDDLE_MOUSE_BUTTON,
-        _ => rust_cef_core::keymap::EVENTFLAG_RIGHT_MOUSE_BUTTON,
+        2 => rust_cef_core::keymap::EVENTFLAG_RIGHT_MOUSE_BUTTON,
+        _ => 0,
     }
+}
+fn cdp_buttons_mask(buttons: &BTreeSet<u8>) -> i32 {
+    let mut mask = 0i32;
+    for &id in buttons {
+        mask |= match id {
+            0 => 1,  // Left
+            2 => 2,  // Right
+            1 => 4,  // Middle
+            3 => 8,  // Back (XButton1)
+            4 => 16, // Forward (XButton2)
+            _ => 0,
+        };
+    }
+    mask
+}
+fn cdp_modifiers(m: MouseModifiers) -> i32 {
+    let mut bits = 0i32;
+    if m.alt {
+        bits |= 1;
+    }
+    if m.control {
+        bits |= 2;
+    }
+    if m.platform {
+        bits |= 4;
+    }
+    if m.shift {
+        bits |= 8;
+    }
+    bits
+}
+#[allow(clippy::too_many_arguments)]
+fn dispatch_cdp_side_mouse(
+    host: &BrowserHost,
+    audit: &NativeAudit,
+    x: i32,
+    y: i32,
+    button: MouseButton,
+    up: bool,
+    click_count: u8,
+    modifiers: MouseModifiers,
+    buttons: &BTreeSet<u8>,
+) {
+    let button_name = match button {
+        MouseButton::Back => "back",
+        MouseButton::Forward => "forward",
+        _ => return,
+    };
+    let Some(mut params) = cef::dictionary_value_create() else {
+        return;
+    };
+    params.set_string(
+        Some(&CefString::from("type")),
+        Some(&CefString::from(if up {
+            "mouseReleased"
+        } else {
+            "mousePressed"
+        })),
+    );
+    params.set_double(Some(&CefString::from("x")), f64::from(x));
+    params.set_double(Some(&CefString::from("y")), f64::from(y));
+    params.set_string(
+        Some(&CefString::from("button")),
+        Some(&CefString::from(button_name)),
+    );
+    params.set_int(Some(&CefString::from("buttons")), cdp_buttons_mask(buttons));
+    params.set_int(Some(&CefString::from("clickCount")), i32::from(click_count));
+    params.set_int(
+        Some(&CefString::from("modifiers")),
+        cdp_modifiers(modifiers),
+    );
+    audit.record();
+    let _ = host.execute_dev_tools_method(
+        0,
+        Some(&CefString::from("Input.dispatchMouseEvent")),
+        Some(&mut params),
+    );
 }
 /// CEF's CefRange::InvalidRange(); None at our public input boundary must not
 /// become a null pointer for the SDK's required const CefRange& argument.

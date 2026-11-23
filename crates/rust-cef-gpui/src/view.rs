@@ -37,6 +37,7 @@ use std::{
     fmt,
     rc::Rc,
     sync::Arc,
+    time::{Duration, Instant},
 };
 
 use gpui::{
@@ -45,8 +46,8 @@ use gpui::{
     FocusHandle, Hitbox, HitboxBehavior, InteractiveElement as _, IntoElement, KeyDownEvent,
     KeyUpEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement as _,
     PinchEvent, Pixels, Point, Render, RenderImage, Role, ScrollDelta, ScrollEvent,
-    StatefulInteractiveElement as _, Styled as _, Subscription, UTF16Selection, Window, canvas,
-    div, px, size,
+    StatefulInteractiveElement as _, Styled as _, Subscription, TouchPhase, UTF16Selection, Window,
+    canvas, div, prelude::FluentBuilder as _, px, rgb, size,
 };
 use image::{Frame, ImageBuffer, Rgba};
 use rust_cef_core::{
@@ -54,8 +55,8 @@ use rust_cef_core::{
     contracts::{
         BrowserCursor, BrowserId, CefFeatureState, MAX_FAVICON_URL_BYTES, MAX_FAVICON_URLS,
         MAX_STATUS_MESSAGE_BYTES, MAX_TOOLTIP_BYTES, MAX_ZOOM_LEVEL, MIN_ZOOM_LEVEL,
-        NavigationSnapshot, RendererState, SessionState, ShortcutId, Viewport, truncate_utf8_bytes,
-        zoom_level_to_milli,
+        NavigationSnapshot, RendererState, SessionState, ShortcutId, Viewport,
+        step_canonical_zoom_level, truncate_utf8_bytes, zoom_level_to_milli,
     },
     file_drop::{FileDragPhase, FileDropPaths},
     frame_budget::FrameError,
@@ -69,8 +70,8 @@ use rust_cef_core::{
     outbound_drag::{OutboundDragFinish, OutboundDragStart},
     ports::{
         BrowserCommand, BrowserEvent, BrowserHandle, CloseMode, CommandId, EngineError, FrameInfo,
-        FrameSource, ImeGeometry, MouseModifiers, OwnedFrame, PixelFormat, SurfaceKind,
-        WindowBinding,
+        FramePayload, FrameSource, ImeGeometry, MouseModifiers, OwnedFrame, PixelFormat,
+        SurfaceKind, WindowBinding,
     },
 };
 use smallvec::smallvec;
@@ -213,6 +214,17 @@ pub struct ViewDiagnostics {
     pub input: InputDiagnostics,
     /// Actual owner-thread IMM positioning attempts, not Chinese IME proof.
     pub ime: NativeImeDiagnostics,
+    pub zoom_level_milli: i32,
+    pub zoom_gate: ZoomGateStats,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ZoomGateStats {
+    pub requests: u64,
+    pub dispatched: u64,
+    pub coalesced: u64,
+    pub frame_ack_flushes: u64,
+    pub timeout_flushes: u64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -294,24 +306,45 @@ impl PaintDiagnostics {
     }
 }
 
-/// The displayed image plus the exact identity it carries.
+#[derive(Clone)]
+enum PresentedContent {
+    CpuImage(Arc<RenderImage>),
+    GpuTexture(Arc<OwnedFrame>),
+}
+
+impl PresentedContent {
+    fn size_px(&self) -> (u32, u32) {
+        match self {
+            Self::CpuImage(image) => {
+                let size = image.size(0);
+                (u32::from(size.width), u32::from(size.height))
+            }
+            Self::GpuTexture(frame) => (frame.info.width, frame.info.height),
+        }
+    }
+}
+
+/// The displayed content plus the exact identity it carries.
 ///
-/// Metadata is committed or retained together with the image owner: a failed
+/// Metadata is committed or retained together with the owner: a failed
 /// atlas drop restores the complete old slot, never a half-cleared one.
 struct ImageSlot {
-    image: Arc<RenderImage>,
+    content: PresentedContent,
     sequence: u64,
     generation: u64,
     width: u32,
     height: u32,
+    captured_scale: Option<f32>,
+    backdrop_rgb: u32,
 }
 
-/// The exact image a render pass will paint, plus the identity and stamp it
+/// The exact content a render pass will paint, plus the identity and stamp it
 /// needs to pass the prepaint/paint gate.
 struct PaintFrame {
-    image: Arc<RenderImage>,
+    content: PresentedContent,
     sequence: u64,
     generation: u64,
+    captured_scale: Option<f32>,
     stamp: PaintStamp,
 }
 
@@ -406,6 +439,139 @@ impl ViewUxState {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PendingZoom {
+    target_milli: i32,
+    submitted_at: Instant,
+}
+
+const ZOOM_IN_FLIGHT_TIMEOUT: Duration = Duration::from_millis(120);
+const ZOOM_EPSILON: f64 = 1e-6;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ZoomFlushAction {
+    Idle,
+    UnlockedNoTail,
+    Dispatch { level: f64, via_timeout: bool },
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct ZoomGate {
+    desired_zoom_level: f64,
+    last_sent_zoom_level: f64,
+    zoom_in_flight: Option<(u64, Instant)>,
+    stats: ZoomGateStats,
+}
+
+impl ZoomGate {
+    fn desired_zoom_level(&self) -> f64 {
+        self.desired_zoom_level
+    }
+
+    fn stats(&self) -> ZoomGateStats {
+        self.stats
+    }
+
+    fn is_busy(&self) -> bool {
+        self.zoom_in_flight.is_some()
+            || (self.desired_zoom_level - self.last_sent_zoom_level).abs() > ZOOM_EPSILON
+    }
+
+    fn has_deferred_tail(&self) -> bool {
+        self.zoom_in_flight.is_some()
+            && (self.desired_zoom_level - self.last_sent_zoom_level).abs() > ZOOM_EPSILON
+    }
+
+    fn in_flight_since(&self) -> Option<Instant> {
+        self.zoom_in_flight.map(|(_, sent_at)| sent_at)
+    }
+
+    fn expire_if_ready(&mut self, current_frame_seq: u64, now: Instant) -> Option<bool> {
+        let (sent_seq, sent_at) = self.zoom_in_flight?;
+        if current_frame_seq > sent_seq {
+            self.zoom_in_flight = None;
+            Some(false)
+        } else if now.saturating_duration_since(sent_at) > ZOOM_IN_FLIGHT_TIMEOUT {
+            self.zoom_in_flight = None;
+            Some(true)
+        } else {
+            None
+        }
+    }
+
+    fn plan_request(&mut self, target: f64, current_frame_seq: u64, now: Instant) -> Option<f64> {
+        self.stats.requests = self.stats.requests.saturating_add(1);
+        let _ = self.expire_if_ready(current_frame_seq, now);
+        if self.zoom_in_flight.is_none() {
+            if (target - self.last_sent_zoom_level).abs() > ZOOM_EPSILON {
+                Some(target)
+            } else {
+                self.desired_zoom_level = target;
+                None
+            }
+        } else {
+            self.desired_zoom_level = target;
+            self.stats.coalesced = self.stats.coalesced.saturating_add(1);
+            None
+        }
+    }
+
+    fn poll_flush(&mut self, current_frame_seq: u64, now: Instant) -> ZoomFlushAction {
+        let unlock = self.expire_if_ready(current_frame_seq, now);
+        if self.zoom_in_flight.is_some() {
+            return ZoomFlushAction::Idle;
+        }
+        if (self.desired_zoom_level - self.last_sent_zoom_level).abs() > ZOOM_EPSILON {
+            ZoomFlushAction::Dispatch {
+                level: self.desired_zoom_level,
+                via_timeout: unlock == Some(true),
+            }
+        } else if unlock.is_some() {
+            ZoomFlushAction::UnlockedNoTail
+        } else {
+            ZoomFlushAction::Idle
+        }
+    }
+
+    fn commit_sent(
+        &mut self,
+        sent_level: f64,
+        current_frame_seq: u64,
+        now: Instant,
+        tail_flush_via_timeout: Option<bool>,
+    ) {
+        self.desired_zoom_level = sent_level;
+        self.last_sent_zoom_level = sent_level;
+        self.zoom_in_flight = Some((current_frame_seq, now));
+        self.stats.dispatched = self.stats.dispatched.saturating_add(1);
+        match tail_flush_via_timeout {
+            Some(false) => {
+                self.stats.frame_ack_flushes = self.stats.frame_ack_flushes.saturating_add(1);
+            }
+            Some(true) => {
+                self.stats.timeout_flushes = self.stats.timeout_flushes.saturating_add(1);
+            }
+            None => {}
+        }
+    }
+
+    fn abort_deferred_tail(&mut self) {
+        self.desired_zoom_level = self.last_sent_zoom_level;
+        self.zoom_in_flight = None;
+    }
+
+    fn clear_in_flight(&mut self) {
+        self.zoom_in_flight = None;
+    }
+
+    fn sync_external(&mut self, level: f64) {
+        if level.is_finite() && !self.is_busy() {
+            self.desired_zoom_level = level;
+            self.last_sent_zoom_level = level;
+        }
+    }
+}
+
 pub type TakeFocusCallback =
     Box<dyn FnMut(bool, &mut CefBrowser, &mut Window, &mut Context<CefBrowser>)>;
 pub type ShortcutCallback =
@@ -469,6 +635,10 @@ pub struct CefBrowser {
     /// Last `SetViewport` accepted by the Browser handle, shared with prepaint
     /// so an unchanged layout does not resubmit one every frame.
     sent_viewport: Rc<Cell<Option<Viewport>>>,
+    in_flight_viewport: Rc<Cell<Option<(Viewport, std::time::Instant)>>>,
+    sent_screen_origin: Rc<Cell<Option<(i32, i32)>>>,
+    minimized_hidden: Rc<Cell<bool>>,
+    drop_surface_geometry: Rc<Cell<(f32, f32, f32, f32, f32)>>,
     /// Finite release, close, activation and bounds observers, all owned here.
     /// They are never detached into the App for the process lifetime.
     subscriptions: [Option<Subscription>; 6],
@@ -481,10 +651,23 @@ pub struct CefBrowser {
     on_outbound_drag: Option<OutboundDragCallback>,
     ax_snapshot: Option<AxTreeSnapshot>,
     pinch_zoom_enabled: bool,
+    ctrl_wheel_zoom_enabled: bool,
+    scroll_accumulator: keymap::ScrollWheelAccumulator,
+    ctrl_wheel_zoom_notches: f32,
+    ctrl_wheel_last_at: Option<Instant>,
+    pending_zoom: Option<PendingZoom>,
+    latest_view_frame_seq: u64,
+    zoom_gate: ZoomGate,
+    zoom_timeout_task: Option<gpui::Task<()>>,
+    last_hover_dip: Option<(f32, f32)>,
     on_take_focus: Option<TakeFocusCallback>,
     on_shortcut: Option<ShortcutCallback>,
     on_js_message: Option<JsMessageCallback>,
     on_eval_completed: Option<EvalCompletedCallback>,
+    hwnd_raw: Option<isize>,
+    native_cursor_revision: u64,
+    native_cursor: rust_cef_core::cursor::NativeCursorData,
+    pointer_over_surface: bool,
 }
 
 impl CefBrowser {
@@ -512,9 +695,14 @@ impl CefBrowser {
             return Err(ViewError::SurfaceModeMismatch);
         }
         let window_handle = window.window_handle();
+        let hwnd_raw = crate::native_view::window_hwnd(window).map(|h| h.get() as isize);
         let window_id = window_handle.window_id().as_u64();
         let scale_factor = checked_scale(window.scale_factor())?;
         let sent_viewport = Rc::new(Cell::new(None));
+        let in_flight_viewport = Rc::new(Cell::new(None));
+        let sent_screen_origin = Rc::new(Cell::new(None));
+        let minimized_hidden = Rc::new(Cell::new(false));
+        let drop_surface_geometry = Rc::new(Cell::new((0.0, 0.0, 0.0, 0.0, scale_factor)));
         let paint = Rc::new(RefCell::new(PaintDiagnostics {
             scale_factor,
             ..PaintDiagnostics::default()
@@ -574,6 +762,10 @@ impl CefBrowser {
             needs_resync: false,
             paint,
             sent_viewport,
+            in_flight_viewport,
+            sent_screen_origin,
+            minimized_hidden,
+            drop_surface_geometry,
             subscriptions: [None, None, None, None, None, None],
             menu,
             ux: ViewUxState::default(),
@@ -583,10 +775,23 @@ impl CefBrowser {
             on_outbound_drag: None,
             ax_snapshot: initial_ax_snapshot,
             pinch_zoom_enabled: false,
+            ctrl_wheel_zoom_enabled: false,
+            scroll_accumulator: keymap::ScrollWheelAccumulator::default(),
+            ctrl_wheel_zoom_notches: 0.0,
+            ctrl_wheel_last_at: None,
+            pending_zoom: None,
+            latest_view_frame_seq: 0,
+            zoom_gate: ZoomGate::default(),
+            zoom_timeout_task: None,
+            last_hover_dip: None,
             on_take_focus: None,
             on_shortcut: None,
             on_js_message: None,
             on_eval_completed: None,
+            hwnd_raw,
+            native_cursor_revision: 0,
+            native_cursor: rust_cef_core::cursor::NativeCursorData::default(),
+            pointer_over_surface: false,
         });
 
         // Release runs while the entity still exists but before it is dropped.
@@ -624,9 +829,10 @@ impl CefBrowser {
             }
             close_handle.request_close(CloseMode::Graceful);
         });
+        crate::native_view::install_smooth_resize_hook(window);
         view.update(cx, move |view, cx| {
             let activation = cx.observe_window_activation(window, |view, window, cx| {
-                if !window.is_window_active() {
+                if !crate::native_view::is_window_effectively_active(window) {
                     if let Some(b) = crate::menu::project(&view.menu) {
                         b.readiness(false);
                     }
@@ -639,13 +845,67 @@ impl CefBrowser {
                     view.project_menu_focus(window, cx);
                 }
             });
-            let bounds = cx.observe_window_bounds(window, |view, window, cx| {
+            let last_observed_extent = Cell::new(None::<(f32, f32, f32)>);
+            let bounds = cx.observe_window_bounds(window, move |view, window, cx| {
                 if let Some(b) = crate::menu::project(&view.menu) {
                     b.geometry_changed();
                 }
-                view.ime_request = None;
-                view.refresh_ime(window, cx);
-                cx.notify();
+                let in_sizemove = crate::native_view::is_window_in_sizemove(window);
+                let minimized = crate::native_view::is_gpui_window_minimized(window);
+                if minimized != view.minimized_hidden.get()
+                    && view.attachment.handle().snapshot().state == SessionState::Alive
+                {
+                    if view
+                        .attachment
+                        .handle()
+                        .submit(BrowserCommand::SetVisible(!minimized))
+                        .is_ok()
+                    {
+                        view.minimized_hidden.set(minimized);
+                    }
+                }
+                let wb = window.bounds();
+                let extent = (
+                    f32::from(wb.size.width),
+                    f32::from(wb.size.height),
+                    window.scale_factor(),
+                );
+                let size_changed = last_observed_extent.replace(Some(extent)) != Some(extent);
+                if !in_sizemove {
+                    if !minimized
+                        && view.attachment.handle().snapshot().state == SessionState::Alive
+                        && let Some((cx_px, cy_px)) =
+                            crate::native_view::window_client_screen_origin(window)
+                    {
+                        let (sx, sy, _, _) = view.paint.borrow().surface_bounds;
+                        let scale = view.paint.borrow().scale_factor;
+                        let origin = (
+                            cx_px.saturating_add((sx * scale).round() as i32),
+                            cy_px.saturating_add((sy * scale).round() as i32),
+                        );
+                        if view.sent_screen_origin.get() != Some(origin)
+                            && view
+                                .attachment
+                                .handle()
+                                .submit(BrowserCommand::SetScreenOrigin {
+                                    x_px: origin.0,
+                                    y_px: origin.1,
+                                })
+                                .is_ok()
+                        {
+                            view.sent_screen_origin.set(Some(origin));
+                        }
+                    }
+                    view.ime_request = None;
+                    view.refresh_ime(window, cx);
+                    cx.notify();
+                } else if !minimized && size_changed {
+                    if view.composition.is_some() {
+                        view.ime_request = None;
+                        view.refresh_ime(window, cx);
+                    }
+                    cx.notify();
+                }
             });
             let focus = view.focus.clone();
             let menu_focus_in = cx.on_focus_in(&focus, window, |view, window, cx| {
@@ -693,7 +953,7 @@ impl CefBrowser {
                 return;
             }
             let ready = window.window_handle() == self.window_handle
-                && window.is_window_active()
+                && crate::native_view::is_window_effectively_active(window)
                 && snapshot.state == SessionState::Alive
                 && snapshot.renderer.state != RendererState::Terminated
                 && (self.focus.is_focused(window) || binding.owns_focus(window, cx));
@@ -735,6 +995,24 @@ impl CefBrowser {
         )
     }
 
+    pub(crate) fn native_drop_target_attachment(
+        &self,
+    ) -> (
+        WindowToken,
+        AnyWindowHandle,
+        BrowserHandle,
+        Rc<Cell<(f32, f32, f32, f32, f32)>>,
+        Option<crate::ole_drag::IntegratedPumpCallback>,
+    ) {
+        (
+            self.token.clone(),
+            self.window_handle,
+            self.attachment.handle().clone(),
+            self.drop_surface_geometry.clone(),
+            self.outbound_drag_pump.clone(),
+        )
+    }
+
     pub(crate) fn native_touch_event(
         &mut self,
         mut event: BrowserTouchEvent,
@@ -742,7 +1020,9 @@ impl CefBrowser {
     ) -> Result<CommandId, ViewError> {
         self.check_window(window)?;
         self.check_live()?;
-        if event.event_type == TouchEventType::Pressed && !window.is_window_active() {
+        if event.event_type == TouchEventType::Pressed
+            && !crate::native_view::is_window_effectively_active(window)
+        {
             return Err(ViewError::Input(EngineError::NotReady));
         }
         let (bx, by, width, height) = self.paint.borrow().surface_bounds;
@@ -829,6 +1109,9 @@ impl CefBrowser {
             }
             SourcePoll::Empty => Ok(false),
         };
+        // A new CEF frame committed in this consume unlocks any in-flight zoom
+        // request and flushes the single latest deferred target immediately.
+        self.flush_zoom_gate(window, cx);
         // A single show update must reopen projected readiness in this turn,
         // not depend on another frame/wake arriving after hidden was cleared.
         self.project_menu_focus(window, cx);
@@ -949,6 +1232,8 @@ impl CefBrowser {
             pending_click: self.click.borrow().pending(),
             input: self.input.borrow().diagnostics(self.attachment.handle()),
             ime: self.native_ime.diagnostics(),
+            zoom_level_milli: self.ux.zoom_level_milli,
+            zoom_gate: self.zoom_gate.stats(),
             popup: PopupDiagnostics {
                 generation: self.popup_generation,
                 visible: self.popup_visible,
@@ -979,6 +1264,16 @@ impl CefBrowser {
         self.ux.cursor
     }
 
+    pub fn native_cursor(&self) -> &rust_cef_core::cursor::NativeCursorData {
+        &self.native_cursor
+    }
+
+    fn surface_client_rect_px(&self) -> (i32, i32, i32, i32) {
+        let paint = self.paint.borrow();
+        let scale = paint.scale_factor.max(1.0);
+        surface_bounds_to_px(paint.surface_bounds, scale)
+    }
+
     pub fn tooltip(&self) -> &str {
         &self.ux.tooltip
     }
@@ -1001,6 +1296,10 @@ impl CefBrowser {
 
     pub fn zoom_level(&self) -> f64 {
         f64::from(self.ux.zoom_level_milli) / 1000.0
+    }
+
+    pub fn zoom_gate_stats(&self) -> ZoomGateStats {
+        self.zoom_gate.stats()
     }
 
     pub fn audio_muted(&self) -> bool {
@@ -1069,10 +1368,158 @@ impl CefBrowser {
 
     pub fn set_zoom_level(&mut self, level: f64) -> Result<CommandId, ViewError> {
         self.check_live()?;
-        self.attachment
+        let cmd_id = self
+            .attachment
             .handle()
             .submit(BrowserCommand::SetZoomLevel(level))
-            .map_err(ViewError::Input)
+            .map_err(ViewError::Input)?;
+        if let Ok(milli) = zoom_level_to_milli(level) {
+            let now = Instant::now();
+            let clamped = level.clamp(MIN_ZOOM_LEVEL, MAX_ZOOM_LEVEL);
+            self.zoom_timeout_task = None;
+            self.zoom_gate
+                .commit_sent(clamped, self.latest_view_frame_seq, now, None);
+            self.ux.zoom_level_milli = milli;
+            self.pending_zoom = Some(PendingZoom {
+                target_milli: milli,
+                submitted_at: now,
+            });
+        }
+        Ok(cmd_id)
+    }
+
+    pub fn step_zoom(&mut self, steps: i32, window: &mut Window, cx: &mut Context<Self>) {
+        if self.check_window(window).is_err() || self.check_live().is_err() {
+            return;
+        }
+        let base = if self.zoom_gate.is_busy() {
+            self.zoom_gate.desired_zoom_level()
+        } else {
+            self.zoom_level()
+        };
+        let next = step_canonical_zoom_level(base, steps);
+        let _ = self.apply_target_zoom(next, window, cx);
+    }
+
+    pub fn reset_zoom(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.check_window(window).is_err() || self.check_live().is_err() {
+            return;
+        }
+        let _ = self.apply_target_zoom(0.0, window, cx);
+    }
+
+    fn apply_target_zoom(
+        &mut self,
+        next_level: f64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let clamped = if next_level.is_finite() {
+            next_level.clamp(MIN_ZOOM_LEVEL, MAX_ZOOM_LEVEL)
+        } else {
+            return false;
+        };
+        let Ok(milli) = zoom_level_to_milli(clamped) else {
+            return false;
+        };
+        let now = Instant::now();
+        if let Some(level_to_send) =
+            self.zoom_gate
+                .plan_request(clamped, self.latest_view_frame_seq, now)
+        {
+            if self
+                .attachment
+                .handle()
+                .submit_zoom_level_fast(level_to_send)
+                .is_err()
+            {
+                return false;
+            }
+            self.zoom_timeout_task = None;
+            self.zoom_gate
+                .commit_sent(level_to_send, self.latest_view_frame_seq, now, None);
+        } else if self.zoom_gate.has_deferred_tail() {
+            self.arm_zoom_timeout_timer(now, window, cx);
+        } else {
+            self.zoom_timeout_task = None;
+        }
+        self.ux.zoom_level_milli = milli;
+        self.pending_zoom = Some(PendingZoom {
+            target_milli: milli,
+            submitted_at: now,
+        });
+        cx.notify();
+        window.refresh();
+        true
+    }
+
+    fn arm_zoom_timeout_timer(
+        &mut self,
+        now: Instant,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.zoom_timeout_task.is_some() {
+            return;
+        }
+        let Some(sent_at) = self.zoom_gate.in_flight_since() else {
+            return;
+        };
+        let remaining = ZOOM_IN_FLIGHT_TIMEOUT
+            .saturating_sub(now.saturating_duration_since(sent_at))
+            .saturating_add(Duration::from_millis(2));
+        self.zoom_timeout_task = Some(cx.spawn_in(window, async move |weak, cx| {
+            cx.background_executor().timer(remaining).await;
+            let _ = cx.update(|window, app| {
+                let _ = weak.update(app, |view, cx| {
+                    view.zoom_timeout_task = None;
+                    view.flush_zoom_gate(window, cx);
+                });
+            });
+        }));
+    }
+
+    fn flush_zoom_gate(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.check_window(window).is_err() || self.check_live().is_err() {
+            self.zoom_timeout_task = None;
+            self.zoom_gate.clear_in_flight();
+            return;
+        }
+        let now = Instant::now();
+        match self.zoom_gate.poll_flush(self.latest_view_frame_seq, now) {
+            ZoomFlushAction::Idle => {}
+            ZoomFlushAction::UnlockedNoTail => {
+                self.zoom_timeout_task = None;
+            }
+            ZoomFlushAction::Dispatch { level, via_timeout } => {
+                self.zoom_timeout_task = None;
+                if self
+                    .attachment
+                    .handle()
+                    .submit_zoom_level_fast(level)
+                    .is_ok()
+                {
+                    self.zoom_gate.commit_sent(
+                        level,
+                        self.latest_view_frame_seq,
+                        now,
+                        Some(via_timeout),
+                    );
+                    if let Ok(milli) = zoom_level_to_milli(level) {
+                        self.ux.zoom_level_milli = milli;
+                        self.pending_zoom = Some(PendingZoom {
+                            target_milli: milli,
+                            submitted_at: now,
+                        });
+                    }
+                    cx.notify();
+                    window.refresh();
+                } else {
+                    self.zoom_gate.abort_deferred_tail();
+                    self.pending_zoom = None;
+                }
+            }
+        }
     }
 
     pub fn set_audio_muted(&mut self, muted: bool) -> Result<CommandId, ViewError> {
@@ -1105,6 +1552,8 @@ impl CefBrowser {
             finish.y,
             finish.operation,
         );
+        self.input.borrow_mut().clear_held_buttons();
+        self.click.borrow_mut().cancel();
         self.attachment
             .handle()
             .submit(BrowserCommand::FinishOutboundDrag(finish))
@@ -1138,6 +1587,14 @@ impl CefBrowser {
         self.pinch_zoom_enabled
     }
 
+    pub fn set_ctrl_wheel_zoom_enabled(&mut self, enabled: bool) {
+        self.ctrl_wheel_zoom_enabled = enabled;
+    }
+
+    pub fn ctrl_wheel_zoom_enabled(&self) -> bool {
+        self.ctrl_wheel_zoom_enabled
+    }
+
     pub fn send_touch_event(&mut self, event: BrowserTouchEvent) -> Result<CommandId, ViewError> {
         self.check_live()?;
         let event = event.validate_and_normalize().map_err(ViewError::Input)?;
@@ -1157,28 +1614,52 @@ impl CefBrowser {
         }
     }
 
-    fn pointer_pinch(&mut self, event: &PinchEvent, window: &mut Window) {
+    fn pointer_pinch(&mut self, event: &PinchEvent, window: &mut Window, cx: &mut Context<Self>) {
         if !self.pinch_zoom_enabled
             || self.check_window(window).is_err()
             || self.check_live().is_err()
         {
             return;
         }
-        if let Some(next) = compute_pinch_zoom(self.zoom_level(), event.delta)
-            && let Ok(milli) = zoom_level_to_milli(next)
-            && self
-                .attachment
-                .handle()
-                .submit(BrowserCommand::SetZoomLevel(next))
-                .is_ok()
-        {
-            self.ux.zoom_level_milli = milli;
+        match event.phase {
+            TouchPhase::Started | TouchPhase::Ended | TouchPhase::Cancelled => {}
+            TouchPhase::Moved => {
+                let base = if self.zoom_gate.is_busy() {
+                    self.zoom_gate.desired_zoom_level()
+                } else {
+                    self.zoom_level()
+                };
+                if let Some(next) = compute_pinch_zoom(base, event.delta) {
+                    let _ = self.apply_target_zoom(next, window, cx);
+                }
+            }
         }
     }
 
     fn sync_ux(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let now = Instant::now();
         let nav = self.attachment.handle().snapshot().navigation;
+        let prev_zoom_milli = self.ux.zoom_level_milli;
         self.ux.apply_snapshot(&nav);
+        let _ = self
+            .zoom_gate
+            .expire_if_ready(self.latest_view_frame_seq, now);
+        if self.zoom_gate.is_busy() {
+            if let Ok(desired_milli) = zoom_level_to_milli(self.zoom_gate.desired_zoom_level()) {
+                self.ux.zoom_level_milli = desired_milli;
+            }
+        } else {
+            reconcile_zoom_from_snapshot(
+                nav.zoom_level_milli,
+                now,
+                &mut self.ux,
+                &mut self.pending_zoom,
+            );
+            if self.pending_zoom.is_none() {
+                self.zoom_gate
+                    .sync_external(f64::from(self.ux.zoom_level_milli) / 1000.0);
+            }
+        }
         let events = self.attachment.handle().take_ux_events();
         let mut focus_taken = Vec::new();
         let mut shortcuts = Vec::new();
@@ -1199,7 +1680,40 @@ impl CefBrowser {
                 BrowserEvent::AccessibilityTreeUpdated { .. } => {
                     a11y_updated = true;
                 }
+                BrowserEvent::ZoomLevelChanged(milli) => {
+                    if self.zoom_gate.is_busy() {
+                        if let Ok(desired_milli) =
+                            zoom_level_to_milli(self.zoom_gate.desired_zoom_level())
+                        {
+                            self.ux.zoom_level_milli = desired_milli;
+                        }
+                    } else if let Some(pending) = self.pending_zoom {
+                        if (milli - pending.target_milli).abs() <= 2 {
+                            self.ux.zoom_level_milli = milli;
+                            self.pending_zoom = None;
+                            self.zoom_gate
+                                .sync_external(f64::from(milli) / 1000.0);
+                        }
+                    } else {
+                        self.ux.zoom_level_milli = milli;
+                        self.zoom_gate
+                            .sync_external(f64::from(milli) / 1000.0);
+                    }
+                }
                 other => {
+                    if matches!(
+                        other,
+                        BrowserEvent::LoadStarted {
+                            is_main_frame: true
+                        }
+                    ) {
+                        self.last_hover_dip = None;
+                        self.ux.tooltip.clear();
+                        self.scroll_accumulator.reset();
+                        self.ctrl_wheel_zoom_notches = 0.0;
+                        self.zoom_timeout_task = None;
+                        self.zoom_gate.clear_in_flight();
+                    }
                     let (focus, shortcut) = self.ux.apply_event(other);
                     if let Some(next) = focus {
                         focus_taken.push(next);
@@ -1209,6 +1723,9 @@ impl CefBrowser {
                     }
                 }
             }
+        }
+        if self.ux.zoom_level_milli != prev_zoom_milli {
+            window.refresh();
         }
         let latest_ax = self.attachment.ax_tree().snapshot();
         if a11y_updated
@@ -1250,6 +1767,8 @@ impl CefBrowser {
                         finish.y,
                         finish.operation,
                     );
+                    self.input.borrow_mut().clear_held_buttons();
+                    self.click.borrow_mut().cancel();
                     let _ = self
                         .attachment
                         .handle()
@@ -1275,9 +1794,28 @@ impl CefBrowser {
                             finish.y,
                             finish.operation,
                         );
+                        // OLE DoDragDrop consumes the physical button-up; clear local held
+                        // button tracking so the next MouseMove does not trigger a spurious
+                        // FocusLost reset.
+                        view.input.borrow_mut().clear_held_buttons();
+                        view.click.borrow_mut().cancel();
                     });
                 }));
             }
+        }
+        let (cursor_rev, native_cursor) = self.attachment.cursor_slot().snapshot();
+        if cursor_rev != self.native_cursor_revision || self.native_cursor != native_cursor {
+            self.native_cursor_revision = cursor_rev;
+            self.native_cursor = native_cursor;
+            let key = surface_cursor_key(self.browser);
+            let rect_px = self.surface_client_rect_px();
+            crate::native_view::update_surface_cursor(
+                window,
+                key,
+                &self.native_cursor,
+                rect_px,
+                self.pointer_over_surface,
+            );
         }
     }
 
@@ -1318,7 +1856,9 @@ impl CefBrowser {
         self.check_window(window)?;
         self.check_live()?;
         self.sync_focus(window, cx);
-        if !self.focus.is_focused(window) || !window.is_window_active() {
+        if !self.focus.is_focused(window)
+            || !crate::native_view::is_window_effectively_active(window)
+        {
             self.reset_input(InputResetReason::FocusLost);
             return Err(ViewError::Input(EngineError::NotReady));
         }
@@ -1400,7 +1940,7 @@ impl CefBrowser {
         if !self.token.is_live() {
             return Err(InputCallbackGate::BindingRetired);
         }
-        if !window.is_window_active() {
+        if !crate::native_view::is_window_effectively_active(window) {
             return Err(InputCallbackGate::WindowInactive);
         }
         if !self.focus.is_focused(window) {
@@ -1459,6 +1999,7 @@ impl CefBrowser {
         window: &Window,
         bounds: Bounds<Pixels>,
     ) -> Option<(u64, u64, ImeGeometry, u64)> {
+        let composition = self.composition.as_ref()?;
         self.text_context(window).ok()?;
         let owner = self.attachment.handle().snapshot();
         if owner.browser != self.browser
@@ -1473,7 +2014,6 @@ impl CefBrowser {
         {
             return None;
         }
-        let composition = self.composition.as_ref()?;
         let viewport = viewport_for(bounds, window.scale_factor()).ok()?;
         // Applied metadata is read from the authoritative producer, not merely
         // a locally accepted SetViewport or a matching rounded pixel size.
@@ -1504,19 +2044,6 @@ impl CefBrowser {
     }
 
     fn refresh_ime(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let has_composition = self.composition.is_some() || self.input.borrow().pending_mark();
-        if has_composition
-            && self
-                .attachment
-                .handle()
-                .input_snapshot()
-                .is_ok_and(|s| !s.accepts_text)
-        {
-            // A non-frame keyboard-mode wake may revoke text while the GPUI
-            // view still owns focus. Use the existing cleanup lane, not a
-            // direct native call or focus restoration during rendering.
-            self.reset_input(InputResetReason::FocusLost);
-        }
         let (x, y, width, height) = self.paint.borrow().surface_bounds;
         let bounds = Bounds {
             origin: Point { x: px(x), y: px(y) },
@@ -1568,7 +2095,7 @@ impl CefBrowser {
         if !self.token.is_live() {
             return Err(InputCallbackGate::BindingRetired);
         }
-        if !window.is_window_active() {
+        if !crate::native_view::is_window_effectively_active(window) {
             return Err(InputCallbackGate::WindowInactive);
         }
         if !self.focus.is_focused(window) {
@@ -1582,15 +2109,13 @@ impl CefBrowser {
         if snapshot.cleanup_pending || snapshot.cleanup_failed {
             return Err(InputCallbackGate::CleanupUnavailable);
         }
-        if !snapshot.accepts_text {
-            return Err(InputCallbackGate::TextNotAccepted);
-        }
         Ok(())
     }
 
     fn sync_focus(&mut self, window: &Window, cx: &App) {
         self.project_menu_focus(window, cx);
-        let focused = window.is_window_active() && self.focus.is_focused(window);
+        let focused = crate::native_view::is_window_effectively_active(window)
+            && self.focus.is_focused(window);
         if self.was_focused && !focused {
             self.reset_input(InputResetReason::FocusLost);
         }
@@ -1692,6 +2217,14 @@ impl CefBrowser {
             return Err(error);
         }
         if update.closed {
+            self.zoom_timeout_task = None;
+            self.zoom_gate.clear_in_flight();
+            self.pointer_over_surface = false;
+            self.attachment.cursor_slot().clear();
+            crate::native_view::clear_surface_cursor(
+                self.hwnd_raw,
+                surface_cursor_key(self.browser),
+            );
             self.reset_input(InputResetReason::Closing);
             let invalidate = self.popup_visible && self.popup_image.is_some();
             self.popup_visible = false;
@@ -1765,14 +2298,19 @@ impl CefBrowser {
                 self.reset_input(InputResetReason::FocusLost);
             }
             if changed {
+                let had_popup = self.popup_visible || self.popup_image.is_some();
                 self.popup_visible = false;
                 self.popup_invalid = true;
-                // Revoke closures before attempting a fallible atlas removal.
-                self.advance_binding()?;
-                let clear = self.clear_popup(window);
-                cx.notify();
-                self.needs_resync = true;
-                clear?;
+                if had_popup {
+                    // Revoke popup closures before attempting a fallible atlas removal.
+                    self.advance_binding()?;
+                    let clear = self.clear_popup(window);
+                    cx.notify();
+                    self.needs_resync = true;
+                    clear?;
+                } else {
+                    self.needs_resync = true;
+                }
             }
             let snapshot = self.attachment.frame_source().snapshot();
             // Use the exact producer-applied context, never command admission
@@ -1869,6 +2407,9 @@ impl CefBrowser {
                 self.popup_created = self.popup_created.saturating_add(1);
                 self.advance_binding()?;
                 window.refresh();
+                if crate::native_view::is_window_in_sizemove(window) {
+                    crate::native_view::request_sizemove_present(window);
+                }
                 Ok(true)
             }
             Err(message) => Err(self.window_error(message)),
@@ -1929,7 +2470,7 @@ impl CefBrowser {
                 return Ok(false);
             }
 
-            let candidate = match image_slot_from_frame(frame) {
+            let mut candidate = match image_slot_from_frame(frame) {
                 Ok(candidate) => candidate,
                 Err(error) => {
                     // The old good image is untouched. One explicit follow-up
@@ -1940,6 +2481,7 @@ impl CefBrowser {
                     return Err(error);
                 }
             };
+            candidate.captured_scale = update.viewport.map(|v| v.scale);
 
             match commit_image_change(&mut self.image, Some(candidate), |old| {
                 drop_atlas_image(window, old)
@@ -1949,9 +2491,30 @@ impl CefBrowser {
                         self.released_images = self.released_images.saturating_add(1);
                     }
                     self.created_images = self.created_images.saturating_add(1);
+                    self.latest_view_frame_seq =
+                        self.latest_view_frame_seq.max(frame.info.sequence);
                     self.needs_resync = false;
+                    self.in_flight_viewport.set(None);
+                    if crate::native_view::is_window_in_sizemove(window)
+                        && !self.minimized_hidden.get()
+                        && let Some(latest_vp) = self.viewport_context
+                        && self.sent_viewport.get() != Some(latest_vp)
+                        && self.attachment.handle().snapshot().state == SessionState::Alive
+                        && self
+                            .attachment
+                            .handle()
+                            .submit(BrowserCommand::SetViewport(latest_vp))
+                            .is_ok()
+                    {
+                        self.sent_viewport.set(Some(latest_vp));
+                        self.in_flight_viewport
+                            .set(Some((latest_vp, std::time::Instant::now())));
+                    }
                     self.advance_binding()?;
                     window.refresh();
+                    if crate::native_view::is_window_in_sizemove(window) {
+                        crate::native_view::request_sizemove_present(window);
+                    }
                     Ok(true)
                 }
                 Err(message) => {
@@ -1975,14 +2538,25 @@ impl CefBrowser {
     /// as successful in that case, and no loop or timer is created.
     fn release_on_entity_release(&mut self, app: &mut App, window_handle: AnyWindowHandle) {
         self.cancel_outbound_drags();
+        self.zoom_timeout_task = None;
+        self.zoom_gate.clear_in_flight();
+        self.pointer_over_surface = false;
+        self.pending_zoom = None;
         self.ax_snapshot = None;
         self.attachment.ax_tree().clear();
+        self.attachment.cursor_slot().clear();
+        crate::native_view::clear_surface_cursor(self.hwnd_raw, surface_cursor_key(self.browser));
         self.reset_input(InputResetReason::Closing);
         self.token.retire();
         self.needs_resync = false;
         let view = self.image.take();
         let popup = self.popup_image.take();
-        if view.is_none() && popup.is_none() {
+        let has_cpu = [&view, &popup]
+            .into_iter()
+            .flatten()
+            .any(|slot| matches!(slot.content, PresentedContent::CpuImage(_)));
+        if !has_cpu {
+            // GpuTexture leases drop immediately here with no GPUI atlas entry to remove.
             return;
         }
         let diagnostics = self.paint.clone();
@@ -1993,7 +2567,9 @@ impl CefBrowser {
                 }
                 let mut error = None;
                 for slot in [view, popup].into_iter().flatten() {
-                    if let Err(message) = drop_atlas_image(window, slot.image) {
+                    if let PresentedContent::CpuImage(image) = slot.content
+                        && let Err(message) = drop_atlas_image(window, image)
+                    {
                         error.get_or_insert(message);
                     }
                 }
@@ -2041,6 +2617,7 @@ impl CefBrowser {
         window: &Window,
         expected_epoch: Option<u64>,
     ) -> bool {
+        let is_transient = crate::input::is_transient_pointer_input(&kind);
         let result = {
             let mut lane = self.input.borrow_mut();
             match expected_epoch {
@@ -2072,12 +2649,16 @@ impl CefBrowser {
             Err(error) => {
                 // Overflow retains the original pending slot, but no later
                 // local composition is presented as though it was accepted.
-                if !expected_epoch.is_some_and(|epoch| {
-                    self.attachment
-                        .handle()
-                        .input_snapshot()
-                        .is_ok_and(|s| s.epoch != epoch)
-                }) {
+                // Dropped transient pointer samples under backpressure must not
+                // disturb active composition/IME state.
+                if !(is_transient && error == EngineError::Backpressure)
+                    && !expected_epoch.is_some_and(|epoch| {
+                        self.attachment
+                            .handle()
+                            .input_snapshot()
+                            .is_ok_and(|s| s.epoch != epoch)
+                    })
+                {
                     self.clear_local_input();
                 }
                 self.record_message(format!("input admission refused: {error:?}"));
@@ -2349,11 +2930,12 @@ impl CefBrowser {
             .check_window(window)
             .and_then(|_| self.check_live())
             .is_err()
-            || !window.is_window_active()
+            || !crate::native_view::is_window_effectively_active(window)
             || self.attachment.handle().snapshot().state != SessionState::Alive
         {
             return;
         }
+        self.last_hover_dip = None;
         let Some((x, y)) = self.point(event.position, false) else {
             return;
         };
@@ -2364,6 +2946,8 @@ impl CefBrowser {
         if count == 0 {
             return;
         }
+        // Match CefSharp OnMouseDown: fold clickCount > 3 to 1.
+        let count = if count > 3 { 1 } else { count };
         let input_pending = self.input.borrow().pending();
         if input_pending {
             // The capture listener already marked this down as overflow.
@@ -2414,14 +2998,15 @@ impl CefBrowser {
         let Some(button) = input_button(event.button) else {
             return;
         };
-        if !self.input.borrow().owns_button(button) && !self.input.borrow().pending() {
+        let owned = self.input.borrow().owns_button(button);
+        if !owned && !self.input.borrow().pending() {
             return;
         }
         if self
             .check_window(window)
             .and_then(|_| self.check_live())
             .is_err()
-            || !window.is_window_active()
+            || (!owned && !crate::native_view::is_window_effectively_active(window))
         {
             self.reset_input(InputResetReason::FocusLost);
             return;
@@ -2438,6 +3023,7 @@ impl CefBrowser {
             self.reset_input(InputResetReason::Rejected);
             return;
         }
+        let count = if count > 3 { 1 } else { count };
         let complete = if button == InputButton::Left {
             let bounds = self.paint.borrow().surface_bounds;
             self.click
@@ -2471,34 +3057,73 @@ impl CefBrowser {
 
     fn pointer_move(&mut self, event: &MouseMoveEvent, window: &Window, owned_only: bool) {
         let held = self.input.borrow().held_button();
-        if held != owned_only || !window.is_window_active() {
+        if held != owned_only {
             return;
         }
-        if held && event.pressed_button.is_none() {
-            // A mouse move no longer reporting a pressed button cannot extend
-            // an owned drag; revoke it instead of leaving CEF pressed.
+        if self
+            .check_window(window)
+            .and_then(|_| self.check_live())
+            .is_err()
+        {
+            return;
+        }
+        if !self.attachment.handle().is_fast_input_ready() {
+            return;
+        }
+        if held && event.pressed_button.is_none() && !os_any_mouse_button_down() {
+            // A mouse move no longer reporting a pressed button (neither in
+            // GPUI's event nor physically pressed — guarding against Win32
+            // WM_NCMOUSEMOVE which clears pressed_button mid-drag) cannot
+            // extend an owned drag; revoke it instead of leaving CEF pressed.
             self.reset_input(InputResetReason::FocusLost);
             return;
         }
         let Some((x, y)) = self.point(event.position, held) else {
             return;
         };
-        let _ = self.send_input(
-            InputKind::MouseMove {
-                x,
-                y,
-                leaving: false,
-                modifiers: mouse_modifiers(event.modifiers),
-            },
+        if !held {
+            if !self.pointer_over_surface {
+                self.pointer_over_surface = true;
+                crate::native_view::set_surface_cursor_hover(
+                    window,
+                    surface_cursor_key(self.browser),
+                    true,
+                );
+            }
+            let (sx, sy, _, _) = self.paint.borrow().surface_bounds;
+            self.last_hover_dip = Some((
+                f32::from(event.position.x) - sx,
+                f32::from(event.position.y) - sy,
+            ));
+        } else {
+            self.last_hover_dip = None;
+        }
+        let _ = self.input.borrow_mut().submit_mouse_move_fast(
+            self.attachment.handle(),
+            x,
+            y,
             false,
-            window,
+            mouse_modifiers(event.modifiers),
         );
     }
 
     fn pointer_leave(&mut self, window: &Window) {
-        if !window.is_window_active() || self.input.borrow().held_button() {
+        if self.input.borrow().held_button()
+            || self
+                .check_window(window)
+                .and_then(|_| self.check_live())
+                .is_err()
+        {
             return;
         }
+        let snapshot = self.attachment.handle().snapshot();
+        if snapshot.state != SessionState::Alive
+            || snapshot.renderer.state == RendererState::Terminated
+        {
+            return;
+        }
+        self.last_hover_dip = None;
+        self.ux.tooltip.clear();
         let (x, y, w, h) = self.paint.borrow().surface_bounds;
         if w > 0. && h > 0. && [x, y, w, h].into_iter().all(f32::is_finite) {
             let _ = self.send_input(
@@ -2514,29 +3139,68 @@ impl CefBrowser {
         }
     }
 
-    fn pointer_scroll(&mut self, event: &ScrollEvent, window: &Window) {
-        if !window.is_window_active() {
+    fn pointer_scroll(&mut self, event: &ScrollEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self
+            .check_window(window)
+            .and_then(|_| self.check_live())
+            .is_err()
+        {
+            return;
+        }
+        if !self.attachment.handle().is_fast_input_ready() {
             return;
         }
         let Some((x, y)) = self.point(event.position, false) else {
             return;
         };
-        let (delta_x, delta_y) = match event.delta {
-            ScrollDelta::Lines(delta) => keymap::wheel_units((delta.x, delta.y)),
-            ScrollDelta::Pixels(delta) => {
-                keymap::wheel_units_from_pixels((f32::from(delta.x), f32::from(delta.y)))
+        if matches!(event.touch_phase, TouchPhase::Ended | TouchPhase::Cancelled) {
+            self.scroll_accumulator.reset();
+        }
+        if self.ctrl_wheel_zoom_enabled && event.modifiers.control {
+            let notch_delta = match event.delta {
+                ScrollDelta::Lines(delta) => delta.y / keymap::DEFAULT_WHEEL_SCROLL_LINES,
+                ScrollDelta::Pixels(delta) => f32::from(delta.y) / 100.0,
+            };
+            if notch_delta.is_finite() && notch_delta != 0.0 {
+                let now = Instant::now();
+                let expired = self
+                    .ctrl_wheel_last_at
+                    .is_some_and(|t| now.saturating_duration_since(t) > Duration::from_millis(400));
+                let reversed = (self.ctrl_wheel_zoom_notches > 0.0 && notch_delta < 0.0)
+                    || (self.ctrl_wheel_zoom_notches < 0.0 && notch_delta > 0.0);
+                if expired || reversed {
+                    self.ctrl_wheel_zoom_notches = 0.0;
+                }
+                self.ctrl_wheel_last_at = Some(now);
+                self.ctrl_wheel_zoom_notches += notch_delta;
+                let whole_steps = self.ctrl_wheel_zoom_notches.trunc() as i32;
+                if whole_steps != 0 {
+                    self.ctrl_wheel_zoom_notches -= whole_steps as f32;
+                    self.step_zoom(whole_steps, window, cx);
+                }
             }
+            return;
+        }
+        let (mut delta_x, mut delta_y) = match event.delta {
+            ScrollDelta::Lines(delta) => self.scroll_accumulator.accumulate_lines((delta.x, delta.y)),
+            ScrollDelta::Pixels(delta) => self
+                .scroll_accumulator
+                .accumulate_pixels((f32::from(delta.x), f32::from(delta.y))),
         };
-        let _ = self.send_input(
-            InputKind::MouseWheel {
-                x,
-                y,
-                delta_x,
-                delta_y,
-                modifiers: mouse_modifiers(event.modifiers),
-            },
-            false,
-            window,
+        if event.modifiers.shift && delta_x == 0 && delta_y != 0 {
+            delta_x = delta_y;
+            delta_y = 0;
+        }
+        if delta_x == 0 && delta_y == 0 {
+            return;
+        }
+        let _ = self.input.borrow_mut().submit_mouse_wheel_fast(
+            self.attachment.handle(),
+            x,
+            y,
+            delta_x,
+            delta_y,
+            mouse_modifiers(event.modifiers),
         );
     }
 
@@ -2695,6 +3359,8 @@ impl Drop for CefBrowser {
         // direct native CEF or an event-loop pump. Dropping the ordinary
         // subscriber fields unregisters them without App-lifetime detachment.
         self.cancel_outbound_drags();
+        self.zoom_timeout_task = None;
+        self.zoom_gate.clear_in_flight();
         self.ax_snapshot = None;
         self.attachment.ax_tree().clear();
         self.reset_input(InputResetReason::Closing);
@@ -2973,17 +3639,23 @@ impl Render for CefBrowser {
             return div().size_full().into_any_element();
         }
 
+        let backdrop_rgb = self
+            .image
+            .as_ref()
+            .map_or(0xffffff, |slot| slot.backdrop_rgb);
         let paint_frame = self.image.as_ref().map(|slot| PaintFrame {
-            image: slot.image.clone(),
+            content: slot.content.clone(),
             sequence: slot.sequence,
             generation: slot.generation,
+            captured_scale: slot.captured_scale,
             stamp,
         });
         let popup_frame = if self.popup_visible && !self.popup_invalid {
             self.popup_image.as_ref().map(|slot| PaintFrame {
-                image: slot.image.clone(),
+                content: slot.content.clone(),
                 sequence: slot.sequence,
                 generation: slot.generation,
+                captured_scale: None,
                 stamp,
             })
         } else {
@@ -2998,8 +3670,13 @@ impl Render for CefBrowser {
         let token_prepaint = self.token.clone();
         let token_paint = self.token.clone();
         let expected_window = actual;
+        let browser_key = surface_cursor_key(self.browser);
         let handle = self.attachment.handle().clone();
         let sent_viewport = self.sent_viewport.clone();
+        let in_flight_viewport = self.in_flight_viewport.clone();
+        let sent_screen_origin = self.sent_screen_origin.clone();
+        let minimized_hidden = self.minimized_hidden.clone();
+        let drop_surface_geometry = self.drop_surface_geometry.clone();
 
         self.sync_focus(window, cx);
         let focus = self.focus.clone();
@@ -3012,7 +3689,9 @@ impl Render for CefBrowser {
         let global_down = weak_down.clone();
         let root_div = div()
             .id(("cef-browser-input", cx.entity_id()))
+            .relative()
             .size_full()
+            .bg(gpui::rgb(backdrop_rgb))
             .role(Role::WebView)
             .cursor(cursor_style_for(self.ux.cursor))
             .track_focus(&focus)
@@ -3035,12 +3714,18 @@ impl Render for CefBrowser {
                 }
             }))
             .on_hover(cx.listener(|view, hovered: &bool, window, cx| {
+                view.pointer_over_surface = *hovered;
+                crate::native_view::set_surface_cursor_hover(
+                    window,
+                    surface_cursor_key(view.browser),
+                    *hovered,
+                );
                 if !*hovered && !cx.has_active_drag() {
                     view.pointer_leave(window);
                 }
             }))
-            .on_scroll(cx.listener(|view, event: &ScrollEvent, window, _| {
-                view.pointer_scroll(event, window);
+            .on_scroll(cx.listener(|view, event: &ScrollEvent, window, cx| {
+                view.pointer_scroll(event, window, cx);
             }))
             .on_key_down(cx.listener(|view, event: &KeyDownEvent, window, _| {
                 view.key_down(event, window);
@@ -3048,8 +3733,8 @@ impl Render for CefBrowser {
             .on_key_up(cx.listener(|view, event: &KeyUpEvent, window, _| {
                 view.key_up(event, window);
             }))
-            .on_pinch(cx.listener(|view, event: &PinchEvent, window, _| {
-                view.pointer_pinch(event, window);
+            .on_pinch(cx.listener(|view, event: &PinchEvent, window, cx| {
+                view.pointer_pinch(event, window, cx);
             }));
         let root_div = if let Some(snapshot) = ax_snapshot {
             root_div.a11y_synthetic_children(move |builder| {
@@ -3067,7 +3752,7 @@ impl Render for CefBrowser {
         root_div
             .child(
                 canvas(
-                    move |bounds, window, app| {
+                    move |bounds, window, app| -> Option<PaintStamp> {
                         file_hitbox.borrow_mut().take();
                         let actual = window_identity(window);
                         if actual != expected_window || !token_prepaint.permits(stamp, actual) {
@@ -3078,18 +3763,18 @@ impl Render for CefBrowser {
                                 expected_window,
                                 "SetViewport",
                             );
-                            return;
+                            return None;
                         }
                         let scale = window.scale_factor();
                         let next = match viewport_for(bounds, scale) {
                             Ok(next) => next,
                             Err(error) => {
                                 diag_prepaint.borrow_mut().last_error = Some(error.to_string());
-                                return;
+                                return None;
                             }
                         };
                         let Some(entity) = weak_context.upgrade() else {
-                            return;
+                            return None;
                         };
                         let stamp = match entity.update(app, |view, cx| {
                             view.reconcile_popup_context(next, bounds, window, cx)
@@ -3097,17 +3782,26 @@ impl Render for CefBrowser {
                             Ok(stamp) => stamp,
                             Err(error) => {
                                 diag_prepaint.borrow_mut().last_error = Some(error.to_string());
-                                return;
+                                return None;
                             }
                         };
                         {
                             let mut diag = diag_prepaint.borrow_mut();
-                            diag.surface_bounds = bounds_dip(bounds);
+                            let rect = bounds_dip(bounds);
+                            diag.surface_bounds = rect;
                             diag.scale_factor = scale;
+                            drop_surface_geometry.set((rect.0, rect.1, rect.2, rect.3, scale));
+                            crate::native_view::update_surface_cursor_bounds(
+                                window,
+                                browser_key,
+                                surface_bounds_to_px(rect, scale),
+                            );
                         }
                         entity.update(app, |view, cx| view.refresh_ime(window, cx));
-                        if handle.snapshot().state != SessionState::Alive {
-                            return;
+                        if !handle.is_fast_input_ready()
+                            && handle.snapshot().state != SessionState::Alive
+                        {
+                            return Some(stamp);
                         }
                         // Public GPUI hitbox belongs to this actual prepaint frame.
                         // Capture drag_move bounds alone do not exclude host overlays.
@@ -3115,8 +3809,54 @@ impl Render for CefBrowser {
                             let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
                             *file_hitbox.borrow_mut() = Some((stamp, hitbox));
                         }
-                        if sent_viewport.get() == Some(next) {
-                            return;
+                        let minimized = crate::native_view::is_gpui_window_minimized(window);
+                        if minimized != minimized_hidden.get()
+                            && handle
+                                .submit(BrowserCommand::SetVisible(!minimized))
+                                .is_ok()
+                        {
+                            minimized_hidden.set(minimized);
+                        }
+                        let in_sizemove = crate::native_view::is_window_in_sizemove(window);
+                        if !in_sizemove || minimized {
+                            in_flight_viewport.set(None);
+                        }
+                        if !in_sizemove
+                            && !minimized
+                            && let Some((cx_px, cy_px)) =
+                                crate::native_view::window_client_screen_origin(window)
+                        {
+                            let ox =
+                                cx_px.saturating_add(
+                                    (f32::from(bounds.origin.x) * scale).round() as i32
+                                );
+                            let oy =
+                                cy_px.saturating_add(
+                                    (f32::from(bounds.origin.y) * scale).round() as i32
+                                );
+                            let screen_origin = (ox, oy);
+                            if sent_screen_origin.get() != Some(screen_origin)
+                                && handle
+                                    .submit(BrowserCommand::SetScreenOrigin {
+                                        x_px: screen_origin.0,
+                                        y_px: screen_origin.1,
+                                    })
+                                    .is_ok()
+                            {
+                                sent_screen_origin.set(Some(screen_origin));
+                            }
+                        }
+                        if minimized || sent_viewport.get() == Some(next) {
+                            return Some(stamp);
+                        }
+                        const IN_FLIGHT_VIEWPORT_TIMEOUT: std::time::Duration =
+                            std::time::Duration::from_millis(180);
+                        if in_sizemove
+                            && let Some((inflight_vp, sent_at)) = in_flight_viewport.get()
+                            && inflight_vp.scale == next.scale
+                            && sent_at.elapsed() < IN_FLIGHT_VIEWPORT_TIMEOUT
+                        {
+                            return Some(stamp);
                         }
                         // Re-check immediately before handing the command to the
                         // Runtime: a retirement/replacement between render and
@@ -3126,20 +3866,28 @@ impl Render for CefBrowser {
                             diag.rejected_paints = diag.rejected_paints.saturating_add(1);
                             diag.last_error =
                                 Some("SetViewport skipped: paint stamp was invalidated".to_owned());
-                            return;
+                            return None;
                         }
                         // Owned command to the Runtime; no CEF object is touched here
                         // or in paint. Accepted values are remembered so a stable
                         // layout does not resubmit the same viewport every frame.
                         match handle.submit(BrowserCommand::SetViewport(next)) {
-                            Ok(_) => sent_viewport.set(Some(next)),
+                            Ok(_) => {
+                                sent_viewport.set(Some(next));
+                                if in_sizemove {
+                                    in_flight_viewport.set(Some((next, std::time::Instant::now())));
+                                } else {
+                                    in_flight_viewport.set(None);
+                                }
+                            }
                             Err(error) => {
                                 diag_prepaint.borrow_mut().last_error =
                                     Some(format!("SetViewport rejected: {error:?}"));
                             }
                         }
+                        Some(stamp)
                     },
-                    move |bounds, _prepaint: (), window, app| {
+                    move |bounds, prepaint_stamp: Option<PaintStamp>, window, app| {
                         // A paint-phase attempt is not confirmation GPUI installed a
                         // platform handler or delivered WM_CHAR to this entity.
                         if focus.is_focused(window) {
@@ -3174,7 +3922,8 @@ impl Render for CefBrowser {
                                             }
                                         }
                                         view.click.borrow_mut().cancel();
-                                        if !window.is_window_active() {
+                                        if !crate::native_view::is_window_effectively_active(window)
+                                        {
                                             view.reset_input(InputResetReason::FocusLost);
                                         }
                                         let _ = event;
@@ -3222,8 +3971,12 @@ impl Render for CefBrowser {
                             }
                         });
                         let moving = weak_move.clone();
+                        let input_move = input_paint.clone();
                         window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, app| {
-                            if phase == DispatchPhase::Capture && !app.has_active_drag() {
+                            if phase == DispatchPhase::Capture
+                                && input_move.borrow().held_button()
+                                && !app.has_active_drag()
+                            {
                                 if let Some(entity) = moving.upgrade() {
                                     entity.update(app, |view, _| {
                                         view.pointer_move(event, window, true)
@@ -3231,38 +3984,55 @@ impl Render for CefBrowser {
                                 }
                             }
                         });
+                        let Some(prepaint_stamp) = prepaint_stamp else {
+                            return;
+                        };
                         for (frame, is_popup) in [(paint_frame, false), (popup_frame, true)] {
                             let Some(frame) = frame else {
                                 continue;
+                            };
+                            let check_stamp = if is_popup {
+                                frame.stamp
+                            } else {
+                                prepaint_stamp
                             };
                             // Re-check before reading the image or importing it into the
                             // atlas. An already-alive image Arc is not proof of liveness.
                             let actual = window_identity(window);
                             if actual != expected_window
-                                || !token_paint.permits(frame.stamp, actual)
+                                || !token_paint.permits(check_stamp, actual)
                             {
                                 diag_paint.borrow_mut().reject_stamp(
                                     &token_paint,
-                                    frame.stamp,
+                                    check_stamp,
                                     actual,
                                     expected_window,
                                     "paint_image",
                                 );
+                                if is_popup {
+                                    continue;
+                                }
                                 return;
                             }
                             let scale = window.scale_factor();
-                            let image_size = frame.image.size(0);
-                            let origin = if is_popup {
-                                popup_origin(bounds.origin, popup_bounds)
+                            let (frame_w, frame_h) = frame.content.size_px();
+                            let target = if is_popup {
+                                frame_target(
+                                    popup_origin(bounds.origin, popup_bounds),
+                                    frame_w,
+                                    frame_h,
+                                    scale,
+                                )
                             } else {
-                                bounds.origin
+                                align_view_frame_target(
+                                    bounds,
+                                    frame_w,
+                                    frame_h,
+                                    scale,
+                                    frame.captured_scale,
+                                )
                             };
-                            let target = match frame_target(
-                                origin,
-                                u32::from(image_size.width),
-                                u32::from(image_size.height),
-                                scale,
-                            ) {
+                            let target = match target {
                                 Ok(target) => target,
                                 Err(error) => {
                                     diag_paint.borrow_mut().last_error = Some(error.to_string());
@@ -3275,10 +4045,10 @@ impl Render for CefBrowser {
                             {
                                 continue;
                             }
-                            if !token_paint.permits(frame.stamp, window_identity(window)) {
+                            if !token_paint.permits(check_stamp, window_identity(window)) {
                                 diag_paint.borrow_mut().reject_stamp(
                                     &token_paint,
-                                    frame.stamp,
+                                    check_stamp,
                                     window_identity(window),
                                     expected_window,
                                     "paint_image",
@@ -3288,14 +4058,58 @@ impl Render for CefBrowser {
                             // `bounds` clips; `target` keeps the frame at its captured
                             // device-pixel size divided by the window scale, anchored at
                             // the surface origin. No stretching of a stale image.
-                            match window.paint_image(
-                                bounds,
-                                target,
-                                Corners::default(),
-                                frame.image.clone(),
-                                0,
-                                false,
-                            ) {
+                            let paint_result = match &frame.content {
+                                PresentedContent::CpuImage(image) => window.paint_image(
+                                    bounds,
+                                    target,
+                                    Corners::default(),
+                                    image.clone(),
+                                    0,
+                                    false,
+                                ),
+                                PresentedContent::GpuTexture(owned) => {
+                                    #[cfg(target_os = "windows")]
+                                    {
+                                        if let Some(gpu) = owned.gpu_texture() {
+                                            window.paint_shared_texture(
+                                                bounds,
+                                                target,
+                                                gpui::WindowsSharedTexture {
+                                                    pool_id: gpu.pool_id,
+                                                    slot_index: gpu.slot_index,
+                                                    generation: gpu.generation,
+                                                    shared_handle: gpu.shared_handle as usize,
+                                                    is_nt_handle: gpu.is_nt_handle,
+                                                    keyed_mutex_key: gpu.keyed_mutex_key,
+                                                    width: gpu.width,
+                                                    height: gpu.height,
+                                                    src_origin: gpui::point(
+                                                        gpui::DevicePixels(0),
+                                                        gpui::DevicePixels(0),
+                                                    ),
+                                                    src_size: gpui::size(
+                                                        gpui::DevicePixels(gpu.width as i32),
+                                                        gpui::DevicePixels(gpu.height as i32),
+                                                    ),
+                                                    resource_keepalive: gpu
+                                                        .resource_keepalive
+                                                        .clone(),
+                                                    handle_guard: Some(Arc::clone(
+                                                        &gpu.handle_owner,
+                                                    )),
+                                                },
+                                            );
+                                        }
+                                        Ok(())
+                                    }
+                                    #[cfg(not(target_os = "windows"))]
+                                    {
+                                        let _ = owned;
+                                        Ok(())
+                                    }
+                                }
+                            };
+                            match paint_result {
                                 Ok(()) => {
                                     let mut diag = diag_paint.borrow_mut();
                                     if is_popup {
@@ -3320,8 +4134,8 @@ impl Render for CefBrowser {
                                                 window: actual,
                                                 generation: frame.generation,
                                                 sequence: frame.sequence,
-                                                width: u32::from(image_size.width),
-                                                height: u32::from(image_size.height),
+                                                width: frame_w,
+                                                height: frame_h,
                                                 paint_finished_at: std::time::Instant::now(),
                                             });
                                         }
@@ -3337,6 +4151,36 @@ impl Render for CefBrowser {
                     },
                 )
                 .size_full(),
+            )
+            .when(
+                !self.ux.tooltip.is_empty()
+                    && !self.popup_visible
+                    && !self.input.borrow().held_button()
+                    && self.last_hover_dip.is_some(),
+                |el| {
+                    let (hx, hy) = self.last_hover_dip.unwrap_or((16.0, 16.0));
+                    let (_, _, sw, sh) = self.paint.borrow().surface_bounds;
+                    let max_x = if sw > 260.0 { sw - 260.0 } else { 4.0 };
+                    let max_y = if sh > 36.0 { sh - 36.0 } else { 4.0 };
+                    let left = (hx + 12.0).clamp(4.0, max_x.max(4.0));
+                    let top = (hy + 20.0).clamp(4.0, max_y.max(4.0));
+                    el.child(
+                        div()
+                            .absolute()
+                            .left(px(left))
+                            .top(px(top))
+                            .max_w(px(420.0))
+                            .px_2()
+                            .py_1()
+                            .rounded(px(4.0))
+                            .bg(rgb(0x1e222a))
+                            .border_1()
+                            .border_color(rgb(0x3e4452))
+                            .text_xs()
+                            .text_color(rgb(0xf0f3f8))
+                            .child(self.ux.tooltip.clone()),
+                    )
+                },
             )
             .into_any_element()
     }
@@ -3403,12 +4247,29 @@ fn translate_point(
     keymap::to_view_point(position, (x, y), (width, height))
 }
 
+fn os_any_mouse_button_down() -> bool {
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn GetKeyState(nVirtKey: i32) -> i16;
+    }
+    // VK_LBUTTON (0x01), VK_RBUTTON (0x02), VK_MBUTTON (0x04),
+    // VK_XBUTTON1 (0x05), VK_XBUTTON2 (0x06)
+    unsafe {
+        GetKeyState(0x01) < 0
+            || GetKeyState(0x02) < 0
+            || GetKeyState(0x04) < 0
+            || GetKeyState(0x05) < 0
+            || GetKeyState(0x06) < 0
+    }
+}
+
 fn input_button(button: MouseButton) -> Option<InputButton> {
     match button {
         MouseButton::Left => Some(InputButton::Left),
         MouseButton::Middle => Some(InputButton::Middle),
         MouseButton::Right => Some(InputButton::Right),
-        _ => None,
+        MouseButton::Navigate(gpui::NavigationDirection::Back) => Some(InputButton::Back),
+        MouseButton::Navigate(gpui::NavigationDirection::Forward) => Some(InputButton::Forward),
     }
 }
 
@@ -3428,6 +4289,65 @@ pub(crate) fn compute_pinch_zoom(current_level: f64, delta: f32) -> Option<f64> 
     let factor = (1.0 + f64::from(delta)).max(0.05);
     let next = current_level + factor.ln() / 1.2_f64.ln();
     Some(next.clamp(MIN_ZOOM_LEVEL, MAX_ZOOM_LEVEL))
+}
+
+pub(crate) fn align_view_frame_target(
+    bounds: Bounds<Pixels>,
+    frame_w: u32,
+    frame_h: u32,
+    window_scale: f32,
+    captured_scale: Option<f32>,
+) -> Result<Bounds<Pixels>, ViewError> {
+    let window_scale = checked_scale(window_scale)?;
+    let raw = frame_target(bounds.origin, frame_w, frame_h, window_scale)?;
+    let bw = f32::from(bounds.size.width);
+    let bh = f32::from(bounds.size.height);
+    if bw.is_finite() && bh.is_finite() && bw > 0.0 && bh > 0.0 {
+        // Transitional frame captured at a previous monitor DPI: if it filled the
+        // container at its capture scale, fill the container bounds instead of
+        // shrinking into the top-left corner until the next DPI frame arrives.
+        if let Some(cap) = captured_scale
+            && cap.is_finite()
+            && cap > 0.0
+            && (cap - window_scale).abs() > 1e-3
+        {
+            let cap_w = frame_w as f32 / cap;
+            let cap_h = frame_h as f32 / cap;
+            if (cap_w - bw).abs() <= 2.0 && (cap_h - bh).abs() <= 2.0 {
+                return Ok(bounds);
+            }
+        }
+        // Same-DPI ceil/subpixel rounding tolerance (e.g. 1.25 / 1.5 / 1.75 DPI).
+        if (f32::from(raw.size.width) - bw).abs() <= 1.5
+            && (f32::from(raw.size.height) - bh).abs() <= 1.5
+        {
+            return Ok(bounds);
+        }
+    }
+    Ok(raw)
+}
+
+fn reconcile_zoom_from_snapshot(
+    nav_zoom_milli: i32,
+    now: Instant,
+    ux: &mut ViewUxState,
+    pending_zoom: &mut Option<PendingZoom>,
+) {
+    if let Some(pending) = *pending_zoom {
+        if (nav_zoom_milli - pending.target_milli).abs() <= 2 {
+            ux.zoom_level_milli = nav_zoom_milli;
+            *pending_zoom = None;
+            return;
+        }
+        if now.saturating_duration_since(pending.submitted_at) >= Duration::from_millis(500) {
+            ux.zoom_level_milli = nav_zoom_milli;
+            *pending_zoom = None;
+            return;
+        }
+        ux.zoom_level_milli = pending.target_milli;
+        return;
+    }
+    ux.zoom_level_milli = nav_zoom_milli;
 }
 
 /// One snapshot/update read used by `consume`.
@@ -3463,12 +4383,26 @@ fn commit_image_change(
     candidate: Option<ImageSlot>,
     mut drop_old: impl FnMut(Arc<RenderImage>) -> Result<(), String>,
 ) -> Result<bool, String> {
+    let mark_candidate_presenting = |cand: &Option<ImageSlot>| {
+        if let Some(next) = cand
+            && let PresentedContent::GpuTexture(frame) = &next.content
+            && let Some(gpu) = frame.gpu_texture()
+        {
+            gpu.lease.tracker().mark_presenting(gpu.slot_index);
+        }
+    };
     let Some(old) = slot.take() else {
+        mark_candidate_presenting(&candidate);
         *slot = candidate;
         return Ok(false);
     };
-    match drop_old(old.image.clone()) {
+    let drop_res = match &old.content {
+        PresentedContent::CpuImage(image) => drop_old(image.clone()),
+        PresentedContent::GpuTexture(_) => Ok(()),
+    };
+    match drop_res {
         Ok(()) => {
+            mark_candidate_presenting(&candidate);
             *slot = candidate;
             Ok(true)
         }
@@ -3492,6 +4426,7 @@ fn drop_atlas_image(window: &mut Window, image: Arc<RenderImage>) -> Result<(), 
 /// reference, so the allocation is refunded only after the last `RenderImage`
 /// Arc is actually destroyed. This mirrors the verified root UI adapter and
 /// adds no parallel frame format or zero-copy assumption.
+#[cfg(test)]
 fn render_image_from_frame(frame: &OwnedFrame) -> Result<Arc<RenderImage>, FrameError> {
     render_image_from_surface(frame, SurfaceKind::View)
 }
@@ -3511,23 +4446,82 @@ fn render_image_from_surface(
         .checked_mul(info.height as usize)
         .and_then(|pixels| pixels.checked_mul(4))
         .ok_or(FrameError::InvalidDimensions)?;
-    if frame.pixels.len() != expected {
+    let pixels = frame.cpu_pixels().ok_or(FrameError::WrongIdentity)?;
+    if pixels.len() != expected {
         return Err(FrameError::InvalidDimensions);
     }
     let (width, height) = (info.width, info.height);
-    frame.pixels.copy_buffer()?.try_into_owner(|pixels| {
+    pixels.copy_buffer()?.try_into_owner(|pixels| {
         let buffer = ImageBuffer::<Rgba<u8>, Vec<u8>>::from_raw(width, height, pixels)
             .ok_or(FrameError::InvalidDimensions)?;
         Ok::<_, FrameError>(Arc::new(RenderImage::new(smallvec![Frame::new(buffer)])))
     })
 }
 
-fn image_slot_from_frame(frame: &OwnedFrame) -> Result<ImageSlot, FrameError> {
-    image_slot_with_image(frame, render_image_from_frame(frame)?)
+fn image_slot_from_frame(frame: &Arc<OwnedFrame>) -> Result<ImageSlot, FrameError> {
+    image_slot_from_surface(frame, SurfaceKind::View)
 }
 
-fn image_slot_from_surface(frame: &OwnedFrame, kind: SurfaceKind) -> Result<ImageSlot, FrameError> {
-    image_slot_with_image(frame, render_image_from_surface(frame, kind)?)
+fn image_slot_from_surface(
+    frame: &Arc<OwnedFrame>,
+    kind: SurfaceKind,
+) -> Result<ImageSlot, FrameError> {
+    match &frame.payload {
+        FramePayload::CpuBgra { .. } => {
+            image_slot_with_image(frame, render_image_from_surface(frame, kind)?)
+        }
+        FramePayload::GpuSharedTexture(gpu) => {
+            let info = frame.info;
+            if info.surface != kind || info.format != PixelFormat::PremultipliedBgra8 {
+                return Err(FrameError::WrongIdentity);
+            }
+            if info.width == 0
+                || info.height == 0
+                || info.sequence == 0
+                || gpu.width != info.width
+                || gpu.height != info.height
+                || gpu.shared_handle == 0
+            {
+                return Err(FrameError::InvalidDimensions);
+            }
+            Ok(ImageSlot {
+                content: PresentedContent::GpuTexture(Arc::clone(frame)),
+                sequence: info.sequence,
+                generation: info.surface_generation,
+                width: info.width,
+                height: info.height,
+                captured_scale: None,
+                backdrop_rgb: 0xffffff,
+            })
+        }
+    }
+}
+
+fn sample_frame_backdrop_rgb(frame: &OwnedFrame) -> u32 {
+    let w = frame.info.width as usize;
+    let h = frame.info.height as usize;
+    let Some(bytes) = frame.cpu_pixels().map(|buffer| buffer.as_slice()) else {
+        return 0xffffff;
+    };
+    if w == 0 || h == 0 || bytes.len() < w.saturating_mul(h).saturating_mul(4) {
+        return 0xffffff;
+    }
+    let read_px = |x: usize, y: usize| -> u32 {
+        let idx = (y * w + x) * 4;
+        let (b, g, r, a) = (bytes[idx], bytes[idx + 1], bytes[idx + 2], bytes[idx + 3]);
+        if a == 0 {
+            return 0xffffff;
+        }
+        if a == 255 {
+            return ((r as u32) << 16) | ((g as u32) << 8) | (b as u32);
+        }
+        let unprem = |c: u8| ((c as u32 * 255 + (a as u32 / 2)) / a as u32).min(255);
+        (unprem(r) << 16) | (unprem(g) << 8) | unprem(b)
+    };
+    let c0 = read_px(w - 1, h / 2);
+    let c1 = read_px(w / 2, h - 1);
+    let c2 = read_px(w - 1, h - 1);
+    if c0 == c1 || c0 == c2 { c0 } else { c1 }
 }
 
 fn image_slot_with_image(
@@ -3535,11 +4529,13 @@ fn image_slot_with_image(
     image: Arc<RenderImage>,
 ) -> Result<ImageSlot, FrameError> {
     Ok(ImageSlot {
-        image,
+        content: PresentedContent::CpuImage(image),
         sequence: frame.info.sequence,
         generation: frame.info.surface_generation,
         width: frame.info.width,
         height: frame.info.height,
+        captured_scale: None,
+        backdrop_rgb: sample_frame_backdrop_rgb(frame),
     })
 }
 
@@ -3649,6 +4645,23 @@ pub(crate) fn bounds_dip(bounds: Bounds<Pixels>) -> (f32, f32, f32, f32) {
         f32::from(bounds.size.width),
         f32::from(bounds.size.height),
     )
+}
+
+fn surface_cursor_key(browser: BrowserId) -> u64 {
+    browser.runtime().value().rotate_left(32) ^ browser.local()
+}
+
+fn surface_bounds_to_px(bounds: (f32, f32, f32, f32), scale: f32) -> (i32, i32, i32, i32) {
+    let (x, y, w, h) = bounds;
+    if ![x, y, w, h, scale].into_iter().all(f32::is_finite) || scale <= 0.0 || w <= 0.0 || h <= 0.0
+    {
+        return (0, 0, 0, 0);
+    }
+    let left = (x * scale).floor() as i32;
+    let top = (y * scale).floor() as i32;
+    let right = ((x + w) * scale).ceil() as i32;
+    let bottom = ((y + h) * scale).ceil() as i32;
+    (left, top, right, bottom)
 }
 
 #[cfg(test)]
@@ -3875,10 +4888,7 @@ mod tests {
         let pixels = budget.allocate(4).unwrap();
         let mut identity = info(browser(3), 4, 1, 1);
         identity.surface = SurfaceKind::Popup;
-        let frame = OwnedFrame {
-            info: identity,
-            pixels: pixels.freeze(),
-        };
+        let frame = OwnedFrame::from_cpu_pixels(identity, pixels.freeze());
         let image = render_image_from_surface(&frame, SurfaceKind::Popup).unwrap();
         assert_eq!(budget.stats().used, 8);
         assert!(matches!(
@@ -3897,10 +4907,7 @@ mod tests {
         let budget = FrameBudget::new(32);
         let mut pixels = budget.allocate(16).unwrap();
         pixels.as_mut_slice().fill(123);
-        let frame = OwnedFrame {
-            info: info(browser(3), 4, 2, 2),
-            pixels: pixels.freeze(),
-        };
+        let frame = OwnedFrame::from_cpu_pixels(info(browser(3), 4, 2, 2), pixels.freeze());
         let image = render_image_from_frame(&frame).unwrap();
         assert_eq!(budget.stats().used, 32);
         // A second consumer copy must be refused; it cannot escape this ledger.
@@ -3908,7 +4915,7 @@ mod tests {
             render_image_from_frame(&frame),
             Err(FrameError::BudgetExceeded)
         ));
-        assert_eq!(frame.pixels.as_slice(), &[123; 16]);
+        assert_eq!(frame.cpu_pixels().unwrap().as_slice(), &[123; 16]);
         drop(frame);
         assert_eq!(budget.stats().used, 16);
         let retained = image.clone();
@@ -3995,18 +5002,22 @@ mod tests {
         let old_image = test_image(2, 2);
         let candidate_image = test_image(2, 2);
         let mut slot = Some(ImageSlot {
-            image: old_image.clone(),
+            content: PresentedContent::CpuImage(old_image.clone()),
             sequence: 9,
             generation: 4,
             width: 2,
             height: 2,
+            captured_scale: None,
+            backdrop_rgb: 0xffffff,
         });
         let candidate = ImageSlot {
-            image: candidate_image.clone(),
+            content: PresentedContent::CpuImage(candidate_image.clone()),
             sequence: 10,
             generation: 4,
             width: 2,
             height: 2,
+            captured_scale: None,
+            backdrop_rgb: 0xffffff,
         };
 
         let error = commit_image_change(&mut slot, Some(candidate), |_| {
@@ -4018,7 +5029,10 @@ mod tests {
         let kept = slot.as_ref().expect("old image is restored");
         assert_eq!((kept.sequence, kept.generation), (9, 4));
         assert_eq!((kept.width, kept.height), (2, 2));
-        assert!(Arc::ptr_eq(&kept.image, &old_image));
+        assert!(matches!(
+            &kept.content,
+            PresentedContent::CpuImage(img) if Arc::ptr_eq(img, &old_image)
+        ));
         assert_eq!(
             Arc::strong_count(&candidate_image),
             1,
@@ -4035,7 +5049,10 @@ mod tests {
         assert_eq!(error, "drop_image failed");
         let kept = slot.as_ref().expect("old image survives a failed clear");
         assert_eq!((kept.sequence, kept.generation), (9, 4));
-        assert!(Arc::ptr_eq(&kept.image, &old_image));
+        assert!(matches!(
+            &kept.content,
+            PresentedContent::CpuImage(img) if Arc::ptr_eq(img, &old_image)
+        ));
     }
 
     #[test]
@@ -4045,17 +5062,19 @@ mod tests {
         let budget = FrameBudget::new(8);
         let mut pixels = budget.allocate(4).unwrap();
         pixels.as_mut_slice().fill(7);
-        let frame = OwnedFrame {
-            info: info(browser(3), 4, 1, 1),
-            pixels: pixels.freeze(),
-        };
+        let frame = Arc::new(OwnedFrame::from_cpu_pixels(
+            info(browser(3), 4, 1, 1),
+            pixels.freeze(),
+        ));
         let old_image = test_image(1, 1);
         let mut slot = Some(ImageSlot {
-            image: old_image.clone(),
+            content: PresentedContent::CpuImage(old_image.clone()),
             sequence: 3,
             generation: 2,
             width: 1,
             height: 1,
+            captured_scale: None,
+            backdrop_rgb: 0xffffff,
         });
 
         let first = image_slot_from_frame(&frame).expect("first conversion fits");
@@ -4068,12 +5087,62 @@ mod tests {
         // are still the current presentation.
         let kept = slot.as_ref().expect("old slot remains");
         assert_eq!((kept.sequence, kept.generation), (3, 2));
-        assert!(Arc::ptr_eq(&kept.image, &old_image));
+        assert!(matches!(
+            &kept.content,
+            PresentedContent::CpuImage(img) if Arc::ptr_eq(img, &old_image)
+        ));
         // A later successful transaction can still replace it.
         let replacement = commit_image_change(&mut slot, Some(first), |_| Ok(()))
             .expect("old atlas entry is removed");
         assert!(replacement);
         assert_eq!(slot.as_ref().map(|slot| slot.sequence), Some(9));
+    }
+
+    #[test]
+    fn gpu_shared_texture_slot_marks_presenting_without_atlas_or_budget() {
+        use rust_cef_core::ports::{
+            GpuSharedTextureFrame, SharedTextureSlotTracker, TextureFormat,
+        };
+
+        let tracker = Arc::new(SharedTextureSlotTracker::new());
+        let keepalive = Arc::new(());
+        let s0 = tracker.acquire_write_slot().unwrap();
+        let f0 = Arc::new(OwnedFrame {
+            info: info(browser(5), 2, 128, 72),
+            payload: FramePayload::GpuSharedTexture(GpuSharedTextureFrame {
+                pool_id: 1,
+                shared_handle: 0x1000,
+                is_nt_handle: true,
+                keyed_mutex_key: Some(0),
+                width: 128,
+                height: 72,
+                format: TextureFormat::Bgra8888,
+                frame_seq: 1,
+                slot_index: s0,
+                generation: 1,
+                resource_keepalive: Arc::downgrade(&keepalive),
+                handle_owner: Arc::new(()),
+                lease: tracker.lease(s0),
+            }),
+        });
+        let slot0 = image_slot_from_frame(&f0).expect("valid gpu frame");
+        let mut active: Option<ImageSlot> = None;
+        let removed = commit_image_change(&mut active, Some(slot0), |_| {
+            panic!("GpuTexture replacement must not invoke drop_atlas_image")
+        })
+        .unwrap();
+        assert!(!removed);
+        assert_eq!(tracker.presenting_slot(), Some(s0));
+        assert_eq!(tracker.consumer_ref_count(s0), 1);
+
+        let cleared = commit_image_change(&mut active, None, |_| {
+            panic!("GpuTexture clear must not invoke drop_atlas_image")
+        })
+        .unwrap();
+        assert!(cleared);
+        drop(f0);
+        assert_eq!(tracker.presenting_slot(), None);
+        assert_eq!(tracker.consumer_ref_count(s0), 0);
     }
 
     #[test]
@@ -4317,5 +5386,251 @@ mod tests {
             compute_pinch_zoom(MIN_ZOOM_LEVEL, -0.99),
             Some(MIN_ZOOM_LEVEL)
         );
+    }
+
+    #[test]
+    fn align_view_frame_target_fills_bounds_across_dpi_and_subpixel_rounding_without_stretching_resize()
+    {
+        let bounds = Bounds {
+            origin: Point {
+                x: px(10.0),
+                y: px(20.0),
+            },
+            size: size(px(1200.0), px(800.0)),
+        };
+
+        // Exact same-DPI match fills container bounds.
+        assert_eq!(
+            align_view_frame_target(bounds, 1200, 800, 1.0, Some(1.0)).unwrap(),
+            bounds
+        );
+
+        // Fractional DPI (1.25 -> 1500x1000, or ceil rounding by 1px) snaps to bounds.
+        assert_eq!(
+            align_view_frame_target(bounds, 1501, 1001, 1.25, Some(1.25)).unwrap(),
+            bounds
+        );
+
+        // Cross-monitor DPI transition: 1.0x frame (1200x800 px) displayed on 2.0x window
+        // fills bounds instead of shrinking to 600x400 in the top-left corner.
+        assert_eq!(
+            align_view_frame_target(bounds, 1200, 800, 2.0, Some(1.0)).unwrap(),
+            bounds
+        );
+
+        // Same-DPI mid-drag interactive resize stays unstretched 1:1 to avoid distortion.
+        let resized = align_view_frame_target(bounds, 800, 600, 1.0, Some(1.0)).unwrap();
+        assert_eq!(resized.origin, bounds.origin);
+        assert_eq!(resized.size, size(px(800.0), px(600.0)));
+    }
+
+    #[test]
+    fn reconcile_zoom_prevents_stale_snapshot_snapback_and_clears_on_confirm_or_timeout() {
+        let t0 = Instant::now();
+        let mut ux = ViewUxState {
+            zoom_level_milli: 523,
+            ..ViewUxState::default()
+        };
+        let mut pending = Some(PendingZoom {
+            target_milli: 523,
+            submitted_at: t0,
+        });
+
+        // Stale snapshot 0 while target 523 is in flight must not revert ux.zoom_level_milli.
+        reconcile_zoom_from_snapshot(0, t0 + Duration::from_millis(16), &mut ux, &mut pending);
+        assert_eq!(ux.zoom_level_milli, 523);
+        assert!(pending.is_some());
+
+        // Matching snapshot confirms and clears pending immediately.
+        reconcile_zoom_from_snapshot(523, t0 + Duration::from_millis(20), &mut ux, &mut pending);
+        assert!(pending.is_none());
+        assert_eq!(ux.zoom_level_milli, 523);
+
+        // Timeout fallback after 500ms if CEF never reached target.
+        let mut pending_timeout = Some(PendingZoom {
+            target_milli: 1000,
+            submitted_at: t0,
+        });
+        ux.zoom_level_milli = 1000;
+        reconcile_zoom_from_snapshot(
+            523,
+            t0 + Duration::from_millis(520),
+            &mut ux,
+            &mut pending_timeout,
+        );
+        assert_eq!(ux.zoom_level_milli, 523);
+        assert!(pending_timeout.is_none());
+    }
+
+    #[test]
+    fn sample_frame_backdrop_rgb_picks_edge_background_and_unpremultiplies() {
+        let budget = FrameBudget::new(4096);
+        let mut buf = budget.allocate(2 * 2 * 4).unwrap();
+        // Fill 2x2 with premultiplied BGRA dark slate (#1e293b -> B=0x3b, G=0x29, R=0x1e, A=0xff).
+        for px in buf.as_mut_slice().chunks_exact_mut(4) {
+            px.copy_from_slice(&[0x3b, 0x29, 0x1e, 0xff]);
+        }
+        let dark_frame = OwnedFrame::from_cpu_pixels(info(browser(1), 1, 2, 2), buf.freeze());
+        assert_eq!(sample_frame_backdrop_rgb(&dark_frame), 0x1e293b);
+
+        let mut half_alpha = budget.allocate(4).unwrap();
+        half_alpha
+            .as_mut_slice()
+            .copy_from_slice(&[0x40, 0x80, 0x80, 0x80]);
+        let prem_frame =
+            OwnedFrame::from_cpu_pixels(info(browser(1), 2, 1, 1), half_alpha.freeze());
+        let sampled = sample_frame_backdrop_rgb(&prem_frame);
+        assert_eq!(sampled >> 16, 0xff);
+    }
+
+    #[test]
+    fn zoom_gate_allows_first_then_coalesces_burst_until_frame_ack_and_flushes_final_once() {
+        let mut gate = ZoomGate::default();
+        let t0 = Instant::now();
+        let seq = 10;
+
+        let z1 = step_canonical_zoom_level(0.0, 1);
+        assert_eq!(gate.plan_request(z1, seq, t0), Some(z1));
+        gate.commit_sent(z1, seq, t0, None);
+
+        let mut target = z1;
+        for i in 2..=15 {
+            target = step_canonical_zoom_level(target, 1);
+            let t = t0 + Duration::from_millis(i * 4);
+            assert_eq!(gate.plan_request(target, seq, t), None);
+        }
+
+        assert_eq!(gate.stats().requests, 15);
+        assert_eq!(gate.stats().dispatched, 1);
+        assert_eq!(gate.stats().coalesced, 14);
+        assert!(gate.has_deferred_tail());
+        assert!((gate.desired_zoom_level() - target).abs() < 1e-9);
+
+        // No new frame at +65ms: remain gated cleanly.
+        assert_eq!(
+            gate.poll_flush(seq, t0 + Duration::from_millis(65)),
+            ZoomFlushAction::Idle
+        );
+
+        // New committed frame (seq 11) unlocks and flushes ONLY final desired level.
+        let t_ack = t0 + Duration::from_millis(70);
+        assert_eq!(
+            gate.poll_flush(seq + 1, t_ack),
+            ZoomFlushAction::Dispatch {
+                level: target,
+                via_timeout: false,
+            }
+        );
+        gate.commit_sent(target, seq + 1, t_ack, Some(false));
+        assert_eq!(gate.stats().dispatched, 2);
+        assert_eq!(gate.stats().frame_ack_flushes, 1);
+        assert!(!gate.has_deferred_tail());
+
+        // Second frame ack completes the cycle cleanly with zero extra sends.
+        assert_eq!(
+            gate.poll_flush(seq + 2, t0 + Duration::from_millis(140)),
+            ZoomFlushAction::UnlockedNoTail
+        );
+        assert!(!gate.is_busy());
+        assert_eq!(gate.stats().dispatched, 2);
+    }
+
+    #[test]
+    fn zoom_gate_fallback_timeout_at_120ms_unlocks_and_flushes_latest_without_frame_ack() {
+        let mut gate = ZoomGate::default();
+        let t0 = Instant::now();
+        let seq = 5;
+
+        let z1 = step_canonical_zoom_level(0.0, 1);
+        assert_eq!(gate.plan_request(z1, seq, t0), Some(z1));
+        gate.commit_sent(z1, seq, t0, None);
+
+        let mut target = z1;
+        for step in 1..=5 {
+            target = step_canonical_zoom_level(target, 1);
+            assert_eq!(
+                gate.plan_request(target, seq, t0 + Duration::from_millis(step * 15)),
+                None
+            );
+        }
+
+        // At exactly 120ms, still within in-flight window.
+        assert_eq!(
+            gate.poll_flush(seq, t0 + Duration::from_millis(120)),
+            ZoomFlushAction::Idle
+        );
+
+        // Past 120ms with no new frame, fallback timeout unlocks and flushes latest.
+        let t_timeout = t0 + Duration::from_millis(121);
+        assert_eq!(
+            gate.poll_flush(seq, t_timeout),
+            ZoomFlushAction::Dispatch {
+                level: target,
+                via_timeout: true,
+            }
+        );
+        gate.commit_sent(target, seq, t_timeout, Some(true));
+        assert_eq!(gate.stats().timeout_flushes, 1);
+        assert_eq!(gate.stats().dispatched, 2);
+    }
+
+    #[test]
+    fn zoom_gate_noops_when_burst_returns_to_last_sent_level() {
+        let mut gate = ZoomGate::default();
+        let t0 = Instant::now();
+        let seq = 20;
+
+        let z1 = step_canonical_zoom_level(0.0, 1);
+        assert_eq!(gate.plan_request(z1, seq, t0), Some(z1));
+        gate.commit_sent(z1, seq, t0, None);
+
+        let z2 = step_canonical_zoom_level(z1, 1);
+        let z3 = step_canonical_zoom_level(z2, 1);
+        assert_eq!(
+            gate.plan_request(z2, seq, t0 + Duration::from_millis(5)),
+            None
+        );
+        assert_eq!(
+            gate.plan_request(z3, seq, t0 + Duration::from_millis(10)),
+            None
+        );
+        // User scrolls back to z1 before frame ack arrives.
+        assert_eq!(
+            gate.plan_request(z1, seq, t0 + Duration::from_millis(15)),
+            None
+        );
+        assert!(!gate.has_deferred_tail());
+
+        // Frame ack unlocks cleanly with no redundant dispatch.
+        assert_eq!(
+            gate.poll_flush(seq + 1, t0 + Duration::from_millis(50)),
+            ZoomFlushAction::UnlockedNoTail
+        );
+        assert!(!gate.is_busy());
+        assert_eq!(gate.stats().dispatched, 1);
+    }
+
+    #[test]
+    fn zoom_gate_sync_external_blocked_while_busy_and_applies_when_idle() {
+        let mut gate = ZoomGate::default();
+        let t0 = Instant::now();
+
+        let z1 = step_canonical_zoom_level(0.0, 1);
+        assert_eq!(gate.plan_request(z1, 1, t0), Some(z1));
+        gate.commit_sent(z1, 1, t0, None);
+
+        // Busy while in flight: external sync must be ignored.
+        gate.sync_external(1.5);
+        assert!((gate.desired_zoom_level() - z1).abs() < 1e-9);
+
+        // Ack clears in-flight; now external sync updates both desired & last_sent.
+        assert_eq!(
+            gate.poll_flush(2, t0 + Duration::from_millis(30)),
+            ZoomFlushAction::UnlockedNoTail
+        );
+        assert!(!gate.is_busy());
+        gate.sync_external(1.5);
+        assert!((gate.desired_zoom_level() - 1.5).abs() < 1e-9);
+        assert!(!gate.is_busy());
     }
 }

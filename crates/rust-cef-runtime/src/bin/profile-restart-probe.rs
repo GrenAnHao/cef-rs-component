@@ -203,7 +203,10 @@ mod windows {
             let center = (120 * 320 + 160) * 4;
             if frame.info.width == 320
                 && frame.info.height == 240
-                && frame.pixels.get(center..center + 4) == Some(&[126, 76, 26, 255])
+                && frame
+                    .cpu_pixels()
+                    .and_then(|px| px.get(center..center + 4))
+                    == Some(&[126, 76, 26, 255])
             {
                 self.frames.lock().unwrap().insert(frame.info.browser);
             }

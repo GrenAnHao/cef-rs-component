@@ -14,6 +14,10 @@ pub const MAX_DRAG_HTML_BYTES: usize = 256 * 1024;
 pub const MAX_DRAG_URL_BYTES: usize = 8 * 1024;
 pub const MAX_DRAG_FILE_PATHS: usize = 32;
 pub const MAX_DRAG_FILE_PATH_BYTES: usize = 4 * 1024;
+pub const MAX_DRAG_FILE_NAME_UTF16: usize = 240;
+pub const MAX_DRAG_FILE_CONTENTS_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_DRAG_IMAGE_DIMENSION: u32 = 1024;
+pub const MAX_DRAG_IMAGE_BYTES: usize = 4 * 1024 * 1024;
 
 pub const DRAG_OP_NONE: u32 = 0;
 pub const DRAG_OP_COPY: u32 = 1;
@@ -40,6 +44,7 @@ impl DragOperationMask {
     pub const COPY: Self = Self(DRAG_OP_COPY);
     pub const LINK: Self = Self(DRAG_OP_LINK);
     pub const MOVE: Self = Self(DRAG_OP_MOVE);
+    pub const EVERY: Self = Self(DRAG_OP_EVERY);
 
     pub const fn bits(self) -> u32 {
         self.0
@@ -56,6 +61,248 @@ pub struct DragSessionId {
     pub sequence: u64,
 }
 
+/// Bounded top-down 32-bit unpremultiplied BGRA drag preview image captured from
+/// `CefDragData::GetImage()` + `GetImageHotspot()` for Win32 `SHDRAGIMAGE`.
+#[derive(Clone, PartialEq, Eq)]
+pub struct DragImage {
+    pub width: u32,
+    pub height: u32,
+    pub hotspot_x: i32,
+    pub hotspot_y: i32,
+    pub bgra: Vec<u8>,
+}
+
+impl DragImage {
+    pub fn bounded(
+        width: u32,
+        height: u32,
+        hotspot_x: i32,
+        hotspot_y: i32,
+        bgra: Vec<u8>,
+    ) -> Option<Self> {
+        if width == 0
+            || height == 0
+            || width > MAX_DRAG_IMAGE_DIMENSION
+            || height > MAX_DRAG_IMAGE_DIMENSION
+        {
+            return None;
+        }
+        let expected = (width as usize)
+            .checked_mul(height as usize)?
+            .checked_mul(4)?;
+        if expected == 0 || expected > MAX_DRAG_IMAGE_BYTES || bgra.len() != expected {
+            return None;
+        }
+        Some(Self {
+            width,
+            height,
+            hotspot_x: hotspot_x.clamp(0, width as i32),
+            hotspot_y: hotspot_y.clamp(0, height as i32),
+            bgra,
+        })
+    }
+
+    pub fn validate(&self) -> Result<(), EngineError> {
+        if self.width == 0
+            || self.height == 0
+            || self.width > MAX_DRAG_IMAGE_DIMENSION
+            || self.height > MAX_DRAG_IMAGE_DIMENSION
+        {
+            return Err(EngineError::InvalidRequest);
+        }
+        let expected = (self.width as usize)
+            .checked_mul(self.height as usize)
+            .and_then(|n| n.checked_mul(4))
+            .ok_or(EngineError::InvalidRequest)?;
+        if expected == 0 || expected > MAX_DRAG_IMAGE_BYTES || self.bgra.len() != expected {
+            return Err(EngineError::InvalidRequest);
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for DragImage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DragImage")
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .field("hotspot_x", &self.hotspot_x)
+            .field("hotspot_y", &self.hotspot_y)
+            .field("bgra_bytes", &self.bgra.len())
+            .finish()
+    }
+}
+
+/// Bounded virtual file (e.g., an `<img>` dragged out of a web page) extracted
+/// from `CefDragData::GetFileName()` + `GetFileContents()` for Windows
+/// `CFSTR_FILEDESCRIPTORW` + `CFSTR_FILECONTENTS`.
+#[derive(Clone, PartialEq, Eq)]
+pub struct DraggedFileContents {
+    pub file_name: String,
+    pub bytes: Vec<u8>,
+}
+
+fn infer_image_extension(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1A\n") {
+        Some("png")
+    } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        Some("jpg")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("gif")
+    } else if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        Some("webp")
+    } else if bytes.starts_with(b"BM") {
+        Some("bmp")
+    } else if bytes.len() >= 12 && &bytes[4..8] == b"ftyp" && &bytes[8..12] == b"avif" {
+        Some("avif")
+    } else {
+        let trimmed = bytes
+            .iter()
+            .position(|b| !b.is_ascii_whitespace())
+            .map_or(&[][..], |i| &bytes[i..]);
+        if trimmed.starts_with(b"<svg") || trimmed.starts_with(b"<?xml") {
+            Some("svg")
+        } else {
+            None
+        }
+    }
+}
+
+fn is_windows_reserved_stem(stem: &str) -> bool {
+    let upper = stem.to_ascii_uppercase();
+    matches!(
+        upper.as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+    )
+}
+
+fn sanitize_virtual_file_name(suggested: Option<&str>, bytes: &[u8]) -> String {
+    let leaf = suggested
+        .and_then(|s| s.rsplit(['/', '\\']).find(|seg| !seg.is_empty()))
+        .unwrap_or("");
+    let mut cleaned = String::with_capacity(leaf.len());
+    for ch in leaf.chars() {
+        if ch <= '\u{1F}'
+            || ch == '\u{7F}'
+            || matches!(ch, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*')
+        {
+            cleaned.push('_');
+        } else {
+            cleaned.push(ch);
+        }
+    }
+    let trimmed = cleaned.trim_matches(|c: char| c == ' ' || c == '.');
+    let inferred_ext = infer_image_extension(bytes);
+
+    let (raw_stem, raw_ext) = match trimmed.rsplit_once('.') {
+        Some((s, e)) if !s.is_empty() && !e.is_empty() && e.len() <= 16 && e.is_ascii() => {
+            (s, Some(e))
+        }
+        _ => (trimmed, None),
+    };
+
+    let mut stem = if raw_stem.is_empty() || raw_stem == "." || raw_stem == ".." {
+        if inferred_ext.is_some() {
+            "image".to_string()
+        } else {
+            "download".to_string()
+        }
+    } else {
+        raw_stem
+            .trim_matches(|c: char| c == ' ' || c == '.')
+            .to_string()
+    };
+    if stem.is_empty() || is_windows_reserved_stem(&stem) {
+        stem = format!("_{stem}");
+        if stem == "_" {
+            stem = "image".to_string();
+        }
+    }
+
+    let ext = raw_ext.or(inferred_ext);
+    let ext_units = ext.map_or(0, |e| 1 + e.encode_utf16().count());
+    let max_stem_units = MAX_DRAG_FILE_NAME_UTF16.saturating_sub(ext_units).max(1);
+    let mut kept_stem = String::new();
+    let mut units = 0usize;
+    for ch in stem.chars() {
+        let len = ch.len_utf16();
+        if units + len > max_stem_units {
+            break;
+        }
+        kept_stem.push(ch);
+        units += len;
+    }
+    let kept_stem = kept_stem.trim_end_matches([' ', '.']);
+    let kept_stem = if kept_stem.is_empty() {
+        "image"
+    } else {
+        kept_stem
+    };
+    match ext {
+        Some(e) => format!("{kept_stem}.{e}"),
+        None => kept_stem.to_string(),
+    }
+}
+
+impl DraggedFileContents {
+    pub fn bounded(suggested_name: Option<&str>, bytes: Vec<u8>) -> Option<Self> {
+        if bytes.is_empty() || bytes.len() > MAX_DRAG_FILE_CONTENTS_BYTES {
+            return None;
+        }
+        let file_name = sanitize_virtual_file_name(suggested_name, &bytes);
+        Some(Self { file_name, bytes })
+    }
+
+    pub fn validate(&self) -> Result<(), EngineError> {
+        if self.bytes.is_empty() || self.bytes.len() > MAX_DRAG_FILE_CONTENTS_BYTES {
+            return Err(EngineError::InvalidRequest);
+        }
+        if self.file_name.is_empty()
+            || self.file_name == "."
+            || self.file_name == ".."
+            || self.file_name.encode_utf16().count() > MAX_DRAG_FILE_NAME_UTF16
+            || self.file_name.chars().any(|c| {
+                c <= '\u{1F}'
+                    || c == '\u{7F}'
+                    || matches!(c, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*')
+            })
+        {
+            return Err(EngineError::InvalidRequest);
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for DraggedFileContents {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DraggedFileContents")
+            .field("file_name_bytes", &self.file_name.len())
+            .field("content_bytes", &self.bytes.len())
+            .finish()
+    }
+}
+
 /// Owned, bounded snapshot extracted inside `RenderHandler::start_dragging`.
 /// `Debug` redacts all dragged contents to byte counts and file entry count.
 #[derive(Clone, Default, PartialEq, Eq)]
@@ -64,6 +311,8 @@ pub struct DraggedPayload {
     pub html: Option<String>,
     pub url: Option<String>,
     pub file_paths: Vec<String>,
+    pub file_contents: Option<DraggedFileContents>,
+    pub image: Option<DragImage>,
 }
 
 impl DraggedPayload {
@@ -105,7 +354,19 @@ impl DraggedPayload {
             html: bound_opt(html, MAX_DRAG_HTML_BYTES, false),
             url: bound_opt(url, MAX_DRAG_URL_BYTES, true),
             file_paths: sanitized_paths,
+            file_contents: None,
+            image: None,
         }
+    }
+
+    pub fn with_file_contents(mut self, file_contents: Option<DraggedFileContents>) -> Self {
+        self.file_contents = file_contents;
+        self
+    }
+
+    pub fn with_image(mut self, image: Option<DragImage>) -> Self {
+        self.image = image;
+        self
     }
 
     pub fn is_empty(&self) -> bool {
@@ -113,6 +374,7 @@ impl DraggedPayload {
             && self.html.as_deref().is_none_or(str::is_empty)
             && self.url.as_deref().is_none_or(str::is_empty)
             && self.file_paths.is_empty()
+            && self.file_contents.is_none()
     }
 
     pub fn validate(&self) -> Result<(), EngineError> {
@@ -145,6 +407,12 @@ impl DraggedPayload {
                 return Err(EngineError::InvalidRequest);
             }
         }
+        if let Some(file_contents) = &self.file_contents {
+            file_contents.validate()?;
+        }
+        if let Some(image) = &self.image {
+            image.validate()?;
+        }
         Ok(())
     }
 }
@@ -156,6 +424,11 @@ impl fmt::Debug for DraggedPayload {
             .field("html_bytes", &self.html.as_ref().map_or(0, String::len))
             .field("url_bytes", &self.url.as_ref().map_or(0, String::len))
             .field("file_count", &self.file_paths.len())
+            .field(
+                "file_contents_bytes",
+                &self.file_contents.as_ref().map_or(0, |fc| fc.bytes.len()),
+            )
+            .field("has_image", &self.image.is_some())
             .finish()
     }
 }
@@ -343,6 +616,11 @@ mod tests {
             html: Some("<p>TOP_SECRET_HTML_456</p>".into()),
             url: Some("https://secret.example.invalid/token=999".into()),
             file_paths: vec![r"C:\Users\secret\vault.txt".into()],
+            file_contents: DraggedFileContents::bounded(
+                Some("SECRET_IMAGE_NAME.png"),
+                b"\x89PNG\r\n\x1A\nsecret_bytes".to_vec(),
+            ),
+            image: None,
         };
         let start = OutboundDragStart {
             drag_id: DragSessionId {
@@ -358,8 +636,11 @@ mod tests {
         assert!(!dbg.contains("TOP_SECRET"));
         assert!(!dbg.contains("secret.example"));
         assert!(!dbg.contains("vault.txt"));
+        assert!(!dbg.contains("SECRET_IMAGE_NAME"));
+        assert!(!dbg.contains("secret_bytes"));
         assert!(dbg.contains("text_bytes: 19"));
         assert!(dbg.contains("file_count: 1"));
+        assert!(dbg.contains("file_contents_bytes: 20"));
     }
 
     #[test]
@@ -425,5 +706,42 @@ mod tests {
         assert_eq!(cancelled.y, 84);
         assert_eq!(cancelled.operation, DragOperationMask::NONE);
         assert!(!ledger.is_active());
+    }
+
+    #[test]
+    fn drag_image_bounds_and_validation() {
+        assert!(DragImage::bounded(0, 10, 0, 0, vec![]).is_none());
+        assert!(DragImage::bounded(MAX_DRAG_IMAGE_DIMENSION + 1, 1, 0, 0, vec![]).is_none());
+        assert!(DragImage::bounded(2, 2, 0, 0, vec![0; 12]).is_none());
+        let img = DragImage::bounded(4, 2, -5, 99, vec![0xAA; 4 * 2 * 4]).unwrap();
+        assert_eq!(img.hotspot_x, 0);
+        assert_eq!(img.hotspot_y, 2);
+        assert_eq!(img.validate(), Ok(()));
+        let debug = format!("{img:?}");
+        assert!(debug.contains("bgra_bytes: 32"));
+        assert!(!debug.contains("170"));
+    }
+
+    #[test]
+    fn dragged_file_contents_sanitizes_names_and_infers_image_extensions() {
+        assert!(DraggedFileContents::bounded(Some("a.png"), vec![]).is_none());
+        let png = b"\x89PNG\r\n\x1A\n1234".to_vec();
+        let fc = DraggedFileContents::bounded(Some(r"..\..\evil:name?.png"), png.clone()).unwrap();
+        assert_eq!(fc.file_name, "evil_name_.png");
+        assert_eq!(fc.validate(), Ok(()));
+
+        let unnamed = DraggedFileContents::bounded(None, png).unwrap();
+        assert_eq!(unnamed.file_name, "image.png");
+        assert_eq!(unnamed.validate(), Ok(()));
+
+        let reserved =
+            DraggedFileContents::bounded(Some("CON"), vec![0xFF, 0xD8, 0xFF, 0xE0]).unwrap();
+        assert_eq!(reserved.file_name, "_CON.jpg");
+        assert_eq!(reserved.validate(), Ok(()));
+
+        let only_contents = DraggedPayload::bounded(None, None, None, Vec::new())
+            .with_file_contents(Some(reserved));
+        assert!(!only_contents.is_empty());
+        assert_eq!(only_contents.validate(), Ok(()));
     }
 }

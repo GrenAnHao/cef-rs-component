@@ -12,5 +12,8 @@ fn main() {
             "cargo:rustc-link-arg-bin=rust-cef-helper=/MANIFESTINPUT:{}",
             manifest.display()
         );
+        // Match CefSharp.BrowserSubprocess.csproj:45 (/STACK:8388608): V8/Blink + DevTools
+        // inspector easily exceeds Windows' 1 MiB default exe stack.
+        println!("cargo:rustc-link-arg-bin=rust-cef-helper=/STACK:8388608");
     }
 }

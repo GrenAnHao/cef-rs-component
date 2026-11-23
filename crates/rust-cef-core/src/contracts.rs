@@ -20,6 +20,7 @@ pub const MAX_SWITCH_NAME_BYTES: usize = 64;
 pub const MAX_SWITCH_VALUE_BYTES: usize = 256;
 pub const MAX_SETTING_TEXT_BYTES: usize = 512;
 pub const MAX_ENCODING_BYTES: usize = 64;
+pub const DEFAULT_WINDOWLESS_FRAME_RATE: u16 = 120;
 pub const MIN_WINDOWLESS_FRAME_RATE: u16 = 1;
 pub const MAX_WINDOWLESS_FRAME_RATE: u16 = 240;
 pub const MIN_ZOOM_LEVEL: f64 = -9.0;
@@ -72,6 +73,56 @@ pub fn truncate_utf8_bytes(input: &str, max_bytes: usize) -> String {
         end -= 1;
     }
     input[..end].to_owned()
+}
+
+pub const CANONICAL_ZOOM_PERCENTS: &[f64] = &[
+    25.0, 33.0, 50.0, 67.0, 75.0, 80.0, 90.0, 100.0, 110.0, 125.0, 150.0, 175.0, 200.0, 250.0,
+    300.0, 400.0, 500.0,
+];
+
+pub fn zoom_percent_to_level(percent: f64) -> f64 {
+    if !percent.is_finite() || percent <= 0.0 {
+        return 0.0;
+    }
+    if (percent - 100.0).abs() < f64::EPSILON {
+        return 0.0;
+    }
+    (percent / 100.0).ln() / 1.2_f64.ln()
+}
+
+pub fn zoom_level_to_percent(level: f64) -> f64 {
+    if !level.is_finite() {
+        return 100.0;
+    }
+    1.2_f64.powf(level) * 100.0
+}
+
+pub fn step_canonical_zoom_level(current_level: f64, steps: i32) -> f64 {
+    let base = if current_level.is_finite() {
+        current_level
+    } else {
+        0.0
+    };
+    if steps == 0 {
+        return base.clamp(MIN_ZOOM_LEVEL, MAX_ZOOM_LEVEL);
+    }
+    let cur_pct = zoom_level_to_percent(base);
+    let idx = if steps > 0 {
+        let first = CANONICAL_ZOOM_PERCENTS
+            .iter()
+            .position(|&p| p > cur_pct + 0.5)
+            .unwrap_or(CANONICAL_ZOOM_PERCENTS.len() - 1);
+        first
+            .saturating_add((steps - 1) as usize)
+            .min(CANONICAL_ZOOM_PERCENTS.len() - 1)
+    } else {
+        let last = CANONICAL_ZOOM_PERCENTS
+            .iter()
+            .rposition(|&p| p < cur_pct - 0.5)
+            .unwrap_or(0);
+        last.saturating_sub((-steps - 1) as usize)
+    };
+    zoom_percent_to_level(CANONICAL_ZOOM_PERCENTS[idx]).clamp(MIN_ZOOM_LEVEL, MAX_ZOOM_LEVEL)
 }
 
 pub fn zoom_level_to_milli(level: f64) -> Result<i32, crate::ports::EngineError> {
@@ -405,11 +456,24 @@ pub struct ProfileConfig {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TrustedContentPolicy {
-    /// Exact canonical HTTP(S) origins, not host suffixes or URL prefixes.
+    /// Exact canonical HTTP(S) origins, or `"http://*"` / `"https://*"` to opt into
+    /// all valid HTTP/HTTPS origins for general web browsing.
     pub allowed_origins: Vec<String>,
     /// Host approval of complete data URI content, local to each Browser's
     /// lifetime. Identical approved content may be revisited; no network bypass.
     pub allow_embedded_data: bool,
+}
+
+impl TrustedContentPolicy {
+    /// Opt-in general HTTP/HTTPS web browsing policy (`"https://*"` and `"http://*"`).
+    /// Still enforces canonical HTTP(S) URL validation (`javascript:`, `file:`, `ftp:`,
+    /// credentials, control characters, and backslashes remain rejected).
+    pub fn allow_all_http_https(allow_embedded_data: bool) -> Self {
+        Self {
+            allowed_origins: vec!["https://*".into(), "http://*".into()],
+            allow_embedded_data,
+        }
+    }
 }
 
 /// Complete host choices. Native paths and capabilities are checked by the adapter.
@@ -704,7 +768,7 @@ impl BrowserSurfaceMode {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BrowserOptions {
     pub windowless_frame_rate: Option<u16>,
     pub background_color: Option<u32>,
@@ -718,6 +782,29 @@ pub struct BrowserOptions {
     pub outbound_drag_policy: crate::outbound_drag::OutboundDragPolicy,
     pub accessibility_state: CefFeatureState,
     pub surface_mode: BrowserSurfaceMode,
+    /// Enable hardware shared texture OSR (`CefRenderHandler::on_accelerated_paint` + D3D11).
+    /// Defaults to `true` on Windows (`false` on other platforms).
+    pub accelerated_osr: bool,
+}
+
+impl Default for BrowserOptions {
+    fn default() -> Self {
+        Self {
+            windowless_frame_rate: None,
+            background_color: None,
+            default_encoding: None,
+            enable_tooltip_events: false,
+            console_policy: ConsolePolicy::default(),
+            shortcut_filter: ShortcutFilter::default(),
+            feature_states: BrowserFeatureStates::default(),
+            js_bridge: JsBridgeConfig::default(),
+            headless_cdp_enabled: false,
+            outbound_drag_policy: crate::outbound_drag::OutboundDragPolicy::default(),
+            accessibility_state: CefFeatureState::default(),
+            surface_mode: BrowserSurfaceMode::default(),
+            accelerated_osr: cfg!(target_os = "windows"),
+        }
+    }
 }
 
 impl BrowserOptions {
@@ -782,6 +869,17 @@ impl BrowserOptions {
     pub fn with_surface_mode(mut self, mode: BrowserSurfaceMode) -> Self {
         self.surface_mode = mode;
         self
+    }
+
+    pub fn with_accelerated_osr(mut self, enabled: bool) -> Self {
+        self.accelerated_osr = enabled;
+        self
+    }
+
+    #[must_use]
+    pub fn effective_frame_rate(&self) -> u16 {
+        self.windowless_frame_rate
+            .unwrap_or(DEFAULT_WINDOWLESS_FRAME_RATE)
     }
 
     pub fn validate(&self) -> Result<(), CreateError> {
@@ -927,4 +1025,27 @@ pub enum RuntimeState {
 pub enum InitializeOutcome {
     Accepted,
     ProcessExitRequired { exit_code: Option<i32> },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn canonical_zoom_ladder_steps_cleanly_and_clamps() {
+        let l110 = step_canonical_zoom_level(0.0, 1);
+        assert!((zoom_level_to_percent(l110) - 110.0).abs() < 0.01);
+        let l125 = step_canonical_zoom_level(l110, 1);
+        assert!((zoom_level_to_percent(l125) - 125.0).abs() < 0.01);
+        // Stepping back down from 110% returns exact 0.0 (100%).
+        assert_eq!(step_canonical_zoom_level(l110, -1), 0.0);
+        let l90 = step_canonical_zoom_level(0.0, -1);
+        assert!((zoom_level_to_percent(l90) - 90.0).abs() < 0.01);
+
+        let max_level = step_canonical_zoom_level(MAX_ZOOM_LEVEL, 5);
+        assert!(max_level <= MAX_ZOOM_LEVEL);
+        assert!((zoom_level_to_percent(max_level) - 500.0).abs() < 0.1 || max_level == MAX_ZOOM_LEVEL);
+        let min_level = step_canonical_zoom_level(MIN_ZOOM_LEVEL, -5);
+        assert!(min_level >= MIN_ZOOM_LEVEL);
+    }
 }

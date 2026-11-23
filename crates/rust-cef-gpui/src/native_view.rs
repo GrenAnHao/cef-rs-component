@@ -12,8 +12,10 @@
 
 use std::{
     cell::{Cell, RefCell},
+    ffi::c_void,
     num::NonZeroUsize,
     rc::Rc,
+    sync::OnceLock,
 };
 
 use gpui::{
@@ -26,6 +28,7 @@ use rust_cef_core::{
     contracts::{
         BrowserCursor, BrowserId, BrowserSurfaceMode, NavigationSnapshot, PixelRect, ShortcutId,
     },
+    cursor::{NativeCursorData, StandardCursor},
     js_bridge::{EvalOutcome, EvalRequestId, JsFrameScope},
     ports::{BrowserCommand, BrowserEvent, BrowserHandle, CloseMode, CommandId},
 };
@@ -36,10 +39,823 @@ use crate::{
     view::{ViewError, ViewUxState, bounds_dip, checked_scale, window_identity},
 };
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Win32Point {
+    x: i32,
+    y: i32,
+}
+
+type SubclassProc = unsafe extern "system" fn(isize, u32, usize, isize, usize, usize) -> isize;
+
+#[repr(C)]
+struct CursorIconInfo {
+    f_icon: i32,
+    x_hotspot: u32,
+    y_hotspot: u32,
+    hbm_mask: isize,
+    hbm_color: isize,
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct CursorBitmapInfoHeader {
+    bi_size: u32,
+    bi_width: i32,
+    bi_height: i32,
+    bi_planes: u16,
+    bi_bit_count: u16,
+    bi_compression: u32,
+    bi_size_image: u32,
+    bi_x_pels_per_meter: i32,
+    bi_y_pels_per_meter: i32,
+    bi_clr_used: u32,
+    bi_clr_important: u32,
+}
+
 #[allow(clashing_extern_declarations)]
 #[link(name = "user32")]
 unsafe extern "system" {
     fn IsIconic(hwnd: isize) -> i32;
+    fn IsWindow(hwnd: isize) -> i32;
+    fn IsWindowVisible(hwnd: isize) -> i32;
+    fn IsWindowEnabled(hwnd: isize) -> i32;
+    fn GetActiveWindow() -> isize;
+    fn GetForegroundWindow() -> isize;
+    fn ClientToScreen(hwnd: isize, point: *mut Win32Point) -> i32;
+    fn ScreenToClient(hwnd: isize, point: *mut Win32Point) -> i32;
+    fn GetCursorPos(point: *mut Win32Point) -> i32;
+    fn WindowFromPoint(point: Win32Point) -> isize;
+    fn InvalidateRect(hwnd: isize, rect: *const u8, erase: i32) -> i32;
+    fn RedrawWindow(hwnd: isize, lprc_update: *const u8, hrgn_update: isize, flags: u32) -> i32;
+    fn PostMessageW(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> i32;
+    fn SendMessageW(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> isize;
+    fn SetTimer(hwnd: isize, id_event: usize, elapse_ms: u32, timer_func: *const u8) -> usize;
+    fn KillTimer(hwnd: isize, id_event: usize) -> i32;
+    fn LoadImageW(h_inst: isize, name: usize, type_: u32, cx: i32, cy: i32, fu_load: u32) -> isize;
+    fn SetCursor(h_cursor: isize) -> isize;
+    fn GetCursor() -> isize;
+    fn GetDC(hwnd: isize) -> isize;
+    fn ReleaseDC(hwnd: isize, hdc: isize) -> i32;
+    fn CreateIconIndirect(piconinfo: *const CursorIconInfo) -> isize;
+    fn DestroyIcon(h_icon: isize) -> i32;
+}
+
+#[allow(clashing_extern_declarations)]
+#[link(name = "gdi32")]
+unsafe extern "system" {
+    fn GetDeviceCaps(hdc: isize, index: i32) -> i32;
+    fn CreateBitmap(
+        n_width: i32,
+        n_height: i32,
+        n_planes: u32,
+        n_bit_count: u32,
+        lp_bits: *const c_void,
+    ) -> isize;
+    fn CreateDIBSection(
+        hdc: isize,
+        pbmi: *const CursorBitmapInfoHeader,
+        usage: u32,
+        ppv_bits: *mut *mut c_void,
+        h_section: isize,
+        offset: u32,
+    ) -> isize;
+    fn DeleteObject(ho: isize) -> i32;
+}
+
+#[link(name = "comctl32")]
+unsafe extern "system" {
+    fn SetWindowSubclass(
+        hwnd: isize,
+        pfn_subclass: SubclassProc,
+        u_id_subclass: usize,
+        dw_ref_data: usize,
+    ) -> i32;
+    fn DefSubclassProc(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> isize;
+    fn RemoveWindowSubclass(hwnd: isize, pfn_subclass: SubclassProc, u_id_subclass: usize) -> i32;
+}
+
+const SMOOTH_RESIZE_SUBCLASS_ID: usize = 0x4345_465F_5253_5A31;
+const SMOOTH_RESIZE_TIMER_ID: usize = 0x4345_4652;
+const WM_CEF_SIZEMOVE_PRESENT: u32 = 0x8043;
+const MOVE_COALESCE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(32);
+const SIZE_COALESCE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(4);
+
+/// Returns an OSR `windowless_frame_rate` aligned to the primary display's
+/// native refresh rate within `120..=240` Hz (falling back to 120 Hz on
+/// 60 Hz panels or unknown queries to minimize phase beat against DWM VSync).
+pub fn recommended_windowless_frame_rate() -> u16 {
+    use rust_cef_core::contracts::{DEFAULT_WINDOWLESS_FRAME_RATE, MAX_WINDOWLESS_FRAME_RATE};
+    const VREFRESH: i32 = 116;
+    let hz = unsafe {
+        let hdc = GetDC(0);
+        if hdc == 0 {
+            0
+        } else {
+            let v = GetDeviceCaps(hdc, VREFRESH);
+            let _ = ReleaseDC(0, hdc);
+            v
+        }
+    };
+    if hz >= 30 {
+        (hz as u16).clamp(DEFAULT_WINDOWLESS_FRAME_RATE, MAX_WINDOWLESS_FRAME_RATE)
+    } else {
+        DEFAULT_WINDOWLESS_FRAME_RATE
+    }
+}
+
+struct OwnedGdiHandle(isize);
+
+impl Drop for OwnedGdiHandle {
+    fn drop(&mut self) {
+        if self.0 != 0 {
+            let _ = unsafe { DeleteObject(self.0) };
+        }
+    }
+}
+
+enum OwnedWinCursor {
+    Standard(isize),
+    Hidden,
+    Custom(std::num::NonZeroIsize),
+}
+
+impl OwnedWinCursor {
+    fn raw(&self) -> isize {
+        match *self {
+            Self::Standard(h) => h,
+            Self::Hidden => 0,
+            Self::Custom(h) => h.get(),
+        }
+    }
+}
+
+impl Drop for OwnedWinCursor {
+    fn drop(&mut self) {
+        if let Self::Custom(h) = *self {
+            let _ = unsafe { DestroyIcon(h.get()) };
+        }
+    }
+}
+
+fn standard_hcursor(kind: StandardCursor) -> isize {
+    const IMAGE_CURSOR: u32 = 2;
+    const LR_DEFAULTSIZE: u32 = 0x0040;
+    const LR_SHARED: u32 = 0x8000;
+    const IDC_ARROW: usize = 32512;
+    const IDC_IBEAM: usize = 32513;
+    const IDC_WAIT: usize = 32514;
+    const IDC_CROSS: usize = 32515;
+    const IDC_SIZENWSE: usize = 32642;
+    const IDC_SIZENESW: usize = 32643;
+    const IDC_SIZEWE: usize = 32644;
+    const IDC_SIZENS: usize = 32645;
+    const IDC_SIZEALL: usize = 32646;
+    const IDC_NO: usize = 32648;
+    const IDC_HAND: usize = 32649;
+    const IDC_APPSTARTING: usize = 32650;
+    const IDC_HELP: usize = 32651;
+
+    static CACHE: [OnceLock<isize>; 13] = [const { OnceLock::new() }; 13];
+    let (idx, idc) = match kind {
+        StandardCursor::Arrow => (0, IDC_ARROW),
+        StandardCursor::IBeam => (1, IDC_IBEAM),
+        StandardCursor::Wait => (2, IDC_WAIT),
+        StandardCursor::Cross => (3, IDC_CROSS),
+        StandardCursor::SizeNwse => (4, IDC_SIZENWSE),
+        StandardCursor::SizeNesw => (5, IDC_SIZENESW),
+        StandardCursor::SizeWe => (6, IDC_SIZEWE),
+        StandardCursor::SizeNs => (7, IDC_SIZENS),
+        StandardCursor::SizeAll => (8, IDC_SIZEALL),
+        StandardCursor::No => (9, IDC_NO),
+        StandardCursor::Hand => (10, IDC_HAND),
+        StandardCursor::AppStarting => (11, IDC_APPSTARTING),
+        StandardCursor::Help => (12, IDC_HELP),
+    };
+    *CACHE[idx].get_or_init(|| unsafe {
+        LoadImageW(0, idc, IMAGE_CURSOR, 0, 0, LR_DEFAULTSIZE | LR_SHARED)
+    })
+}
+
+fn build_win32_hcursor(data: &NativeCursorData) -> OwnedWinCursor {
+    match data {
+        NativeCursorData::Standard(kind) => OwnedWinCursor::Standard(standard_hcursor(*kind)),
+        NativeCursorData::Hidden => OwnedWinCursor::Hidden,
+        NativeCursorData::BgraBitmap {
+            width,
+            height,
+            hotspot_x,
+            hotspot_y,
+            pixels,
+        } => {
+            let bih = CursorBitmapInfoHeader {
+                bi_size: std::mem::size_of::<CursorBitmapInfoHeader>() as u32,
+                bi_width: *width as i32,
+                bi_height: -(*height as i32),
+                bi_planes: 1,
+                bi_bit_count: 32,
+                bi_compression: 0,
+                ..Default::default()
+            };
+            let mut bits: *mut c_void = std::ptr::null_mut();
+            let color = OwnedGdiHandle(unsafe { CreateDIBSection(0, &bih, 0, &mut bits, 0, 0) });
+            if color.0 == 0 || bits.is_null() {
+                return OwnedWinCursor::Standard(standard_hcursor(StandardCursor::Arrow));
+            }
+            unsafe {
+                std::ptr::copy_nonoverlapping(pixels.as_ptr(), bits.cast(), pixels.len());
+            }
+            let w = *width as usize;
+            let h = *height as usize;
+            let mask_stride = ((w + 15) / 16) * 2;
+            let mut mask_bits = vec![0u8; mask_stride * h];
+            for y in 0..h {
+                for x in 0..w {
+                    if pixels[(y * w + x) * 4 + 3] == 0 {
+                        mask_bits[y * mask_stride + (x >> 3)] |= 0x80 >> (x & 7);
+                    }
+                }
+            }
+            let mask = OwnedGdiHandle(unsafe {
+                CreateBitmap(
+                    *width as i32,
+                    *height as i32,
+                    1,
+                    1,
+                    mask_bits.as_ptr().cast(),
+                )
+            });
+            if mask.0 == 0 {
+                return OwnedWinCursor::Standard(standard_hcursor(StandardCursor::Arrow));
+            }
+            let icon = unsafe {
+                CreateIconIndirect(&CursorIconInfo {
+                    f_icon: 0,
+                    x_hotspot: *hotspot_x as u32,
+                    y_hotspot: *hotspot_y as u32,
+                    hbm_mask: mask.0,
+                    hbm_color: color.0,
+                })
+            };
+            std::num::NonZeroIsize::new(icon).map_or_else(
+                || OwnedWinCursor::Standard(standard_hcursor(StandardCursor::Arrow)),
+                OwnedWinCursor::Custom,
+            )
+        }
+        NativeCursorData::MonochromeMask {
+            width,
+            height,
+            hotspot_x,
+            hotspot_y,
+            and_mask,
+            xor_mask,
+        } => {
+            let mut combined = Vec::with_capacity(and_mask.len() + xor_mask.len());
+            combined.extend_from_slice(and_mask);
+            combined.extend_from_slice(xor_mask);
+            let mask = OwnedGdiHandle(unsafe {
+                CreateBitmap(
+                    *width as i32,
+                    (*height * 2) as i32,
+                    1,
+                    1,
+                    combined.as_ptr().cast(),
+                )
+            });
+            if mask.0 == 0 {
+                return OwnedWinCursor::Standard(standard_hcursor(StandardCursor::Arrow));
+            }
+            let icon = unsafe {
+                CreateIconIndirect(&CursorIconInfo {
+                    f_icon: 0,
+                    x_hotspot: *hotspot_x as u32,
+                    y_hotspot: *hotspot_y as u32,
+                    hbm_mask: mask.0,
+                    hbm_color: 0,
+                })
+            };
+            std::num::NonZeroIsize::new(icon).map_or_else(
+                || OwnedWinCursor::Standard(standard_hcursor(StandardCursor::Arrow)),
+                OwnedWinCursor::Custom,
+            )
+        }
+    }
+}
+
+struct SurfaceCursorEntry {
+    browser_key: u64,
+    rect_px: (i32, i32, i32, i32),
+    hovered: bool,
+    cursor: OwnedWinCursor,
+}
+
+fn point_in_rect_px(pt: Win32Point, rect: (i32, i32, i32, i32)) -> bool {
+    rect.2 > rect.0
+        && rect.3 > rect.1
+        && pt.x >= rect.0
+        && pt.x < rect.2
+        && pt.y >= rect.1
+        && pt.y < rect.3
+}
+
+unsafe fn apply_cursor_if_over_surface(hwnd: isize, rect_px: (i32, i32, i32, i32), hcursor: isize) {
+    if unsafe { IsWindowVisible(hwnd) == 0 || IsWindowEnabled(hwnd) == 0 } {
+        return;
+    }
+    let mut screen_pt = Win32Point { x: 0, y: 0 };
+    if unsafe { GetCursorPos(&mut screen_pt) } == 0 {
+        return;
+    }
+    if unsafe { WindowFromPoint(screen_pt) } != hwnd {
+        return;
+    }
+    let mut client_pt = screen_pt;
+    if unsafe { ScreenToClient(hwnd, &mut client_pt) } == 0 {
+        return;
+    }
+    if point_in_rect_px(client_pt, rect_px) {
+        let _ = unsafe { SetCursor(hcursor) };
+    }
+}
+
+#[derive(Default)]
+struct SmoothResizeState {
+    in_sizemove: bool,
+    sync_painting: bool,
+    present_queued: bool,
+    last_move_commit: Option<std::time::Instant>,
+    pending_move_lparam: Option<isize>,
+    last_size_commit: Option<std::time::Instant>,
+    pending_size: Option<(usize, isize)>,
+    surface_cursors: Vec<SurfaceCursorEntry>,
+}
+
+std::thread_local! {
+    static SIZEMOVE_STATE: RefCell<std::collections::BTreeMap<isize, SmoothResizeState>> =
+        const { RefCell::new(std::collections::BTreeMap::new()) };
+}
+
+unsafe fn commit_resize_and_paint(
+    hwnd: isize,
+    wparam: usize,
+    lparam: isize,
+    sync_paint: bool,
+) -> isize {
+    const WM_SIZE: u32 = 0x0005;
+    const RDW_INVALIDATE: u32 = 0x0001;
+    const RDW_UPDATENOW: u32 = 0x0100;
+
+    SIZEMOVE_STATE.with(|m| {
+        let mut map = m.borrow_mut();
+        let st = map.entry(hwnd).or_default();
+        st.last_size_commit = Some(std::time::Instant::now());
+        st.pending_size = None;
+    });
+    let res = unsafe { DefSubclassProc(hwnd, WM_SIZE, wparam, lparam) };
+    if sync_paint {
+        let entered = SIZEMOVE_STATE.with(|m| {
+            let mut map = m.borrow_mut();
+            let st = map.entry(hwnd).or_default();
+            if st.sync_painting {
+                false
+            } else {
+                st.sync_painting = true;
+                true
+            }
+        });
+        if entered {
+            if unsafe { IsWindowVisible(hwnd) != 0 } {
+                let _ = unsafe {
+                    RedrawWindow(hwnd, std::ptr::null(), 0, RDW_INVALIDATE | RDW_UPDATENOW)
+                };
+            }
+            SIZEMOVE_STATE.with(|m| {
+                if let Some(st) = m.borrow_mut().get_mut(&hwnd) {
+                    st.sync_painting = false;
+                    st.present_queued = false;
+                }
+            });
+        }
+    }
+    res
+}
+
+unsafe extern "system" fn smooth_resize_subclass_proc(
+    hwnd: isize,
+    msg: u32,
+    wparam: usize,
+    lparam: isize,
+    uid: usize,
+    _ref_data: usize,
+) -> isize {
+    const WM_MOVE: u32 = 0x0003;
+    const WM_SIZE: u32 = 0x0005;
+    const WM_ERASEBKGND: u32 = 0x0014;
+    const WM_SETCURSOR: u32 = 0x0020;
+    const WM_NCDESTROY: u32 = 0x0082;
+    const WM_TIMER: u32 = 0x0113;
+    const WM_ENTERSIZEMOVE: u32 = 0x0231;
+    const WM_EXITSIZEMOVE: u32 = 0x0232;
+    const HTCLIENT: usize = 1;
+    const SIZE_MINIMIZED: usize = 1;
+    const SIZE_MAXIMIZED: usize = 2;
+    const RDW_INVALIDATE: u32 = 0x0001;
+    const RDW_UPDATENOW: u32 = 0x0100;
+
+    match msg {
+        WM_ERASEBKGND => 1,
+        WM_SETCURSOR => {
+            let hit_code = (lparam as usize) & 0xFFFF;
+            if hit_code == HTCLIENT && unsafe { IsWindowEnabled(hwnd) != 0 } {
+                let mut pt = Win32Point { x: 0, y: 0 };
+                if unsafe { GetCursorPos(&mut pt) != 0 && ScreenToClient(hwnd, &mut pt) != 0 } {
+                    let matched = SIZEMOVE_STATE.with(|m| {
+                        let map = m.borrow();
+                        let st = map.get(&hwnd)?;
+                        st.surface_cursors
+                            .iter()
+                            .rev()
+                            .find(|e| e.hovered && point_in_rect_px(pt, e.rect_px))
+                            .map(|e| e.cursor.raw())
+                    });
+                    if let Some(hcursor) = matched {
+                        let _ = unsafe { SetCursor(hcursor) };
+                        return 1;
+                    }
+                }
+            }
+            unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }
+        }
+        WM_ENTERSIZEMOVE => {
+            SIZEMOVE_STATE.with(|m| {
+                let mut map = m.borrow_mut();
+                let st = map.entry(hwnd).or_default();
+                st.in_sizemove = true;
+                st.present_queued = false;
+                st.last_move_commit = None;
+                st.pending_move_lparam = None;
+                st.last_size_commit = None;
+                st.pending_size = None;
+            });
+            unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }
+        }
+        WM_EXITSIZEMOVE => {
+            let _ = unsafe { KillTimer(hwnd, SMOOTH_RESIZE_TIMER_ID) };
+            let (pending_move, pending_size) = SIZEMOVE_STATE.with(|m| {
+                let mut map = m.borrow_mut();
+                let st = map.entry(hwnd).or_default();
+                st.in_sizemove = false;
+                st.present_queued = false;
+                st.last_move_commit = None;
+                st.last_size_commit = None;
+                (st.pending_move_lparam.take(), st.pending_size.take())
+            });
+            if let Some(lp) = pending_move {
+                let _ = unsafe { DefSubclassProc(hwnd, WM_MOVE, 0, lp) };
+            }
+            if let Some((sw, sl)) = pending_size {
+                let _ = unsafe { commit_resize_and_paint(hwnd, sw, sl, true) };
+            }
+            if unsafe { IsWindowVisible(hwnd) != 0 } {
+                let _ = unsafe { InvalidateRect(hwnd, std::ptr::null(), 0) };
+            }
+            unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }
+        }
+        WM_MOVE => {
+            let defer = SIZEMOVE_STATE.with(|m| {
+                let mut map = m.borrow_mut();
+                let st = map.entry(hwnd).or_default();
+                if !st.in_sizemove {
+                    return false;
+                }
+                if st
+                    .last_move_commit
+                    .is_some_and(|t| t.elapsed() < MOVE_COALESCE_INTERVAL)
+                {
+                    st.pending_move_lparam = Some(lparam);
+                    true
+                } else {
+                    st.last_move_commit = Some(std::time::Instant::now());
+                    st.pending_move_lparam = None;
+                    false
+                }
+            });
+            if defer {
+                0
+            } else {
+                unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }
+            }
+        }
+        WM_SIZE if wparam == SIZE_MINIMIZED => {
+            let _ = unsafe { KillTimer(hwnd, SMOOTH_RESIZE_TIMER_ID) };
+            SIZEMOVE_STATE.with(|m| {
+                if let Some(st) = m.borrow_mut().get_mut(&hwnd) {
+                    st.pending_size = None;
+                }
+            });
+            unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }
+        }
+        WM_SIZE => {
+            enum SizeAction {
+                Defer,
+                CommitSync,
+                PassThrough,
+            }
+            let action = SIZEMOVE_STATE.with(|m| {
+                let mut map = m.borrow_mut();
+                let st = map.entry(hwnd).or_default();
+                if st.in_sizemove && !st.sync_painting {
+                    if st
+                        .last_size_commit
+                        .is_some_and(|t| t.elapsed() < SIZE_COALESCE_INTERVAL)
+                    {
+                        st.pending_size = Some((wparam, lparam));
+                        SizeAction::Defer
+                    } else {
+                        st.pending_size = None;
+                        SizeAction::CommitSync
+                    }
+                } else if wparam == SIZE_MAXIMIZED && !st.sync_painting {
+                    st.pending_size = None;
+                    SizeAction::CommitSync
+                } else {
+                    SizeAction::PassThrough
+                }
+            });
+            match action {
+                SizeAction::Defer => {
+                    let _ = unsafe { SetTimer(hwnd, SMOOTH_RESIZE_TIMER_ID, 4, std::ptr::null()) };
+                    0
+                }
+                SizeAction::CommitSync => {
+                    let _ = unsafe { KillTimer(hwnd, SMOOTH_RESIZE_TIMER_ID) };
+                    unsafe { commit_resize_and_paint(hwnd, wparam, lparam, true) }
+                }
+                SizeAction::PassThrough => unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) },
+            }
+        }
+        WM_TIMER if wparam == SMOOTH_RESIZE_TIMER_ID => {
+            let _ = unsafe { KillTimer(hwnd, SMOOTH_RESIZE_TIMER_ID) };
+            let pending = SIZEMOVE_STATE.with(|m| {
+                let mut map = m.borrow_mut();
+                let st = map.get_mut(&hwnd)?;
+                if st.in_sizemove && !st.sync_painting {
+                    st.pending_size.take()
+                } else {
+                    st.pending_size = None;
+                    None
+                }
+            });
+            if let Some((sw, sl)) = pending {
+                let _ = unsafe { commit_resize_and_paint(hwnd, sw, sl, true) };
+            }
+            0
+        }
+        WM_CEF_SIZEMOVE_PRESENT => {
+            enum PresentAction {
+                Skip,
+                CommitPendingSize(usize, isize),
+                RedrawNow,
+            }
+            let action = SIZEMOVE_STATE.with(|m| {
+                let mut map = m.borrow_mut();
+                let Some(st) = map.get_mut(&hwnd) else {
+                    return PresentAction::Skip;
+                };
+                let was_queued = std::mem::replace(&mut st.present_queued, false);
+                if !was_queued || !st.in_sizemove || st.sync_painting {
+                    return PresentAction::Skip;
+                }
+                if let Some((sw, sl)) = st.pending_size.take() {
+                    PresentAction::CommitPendingSize(sw, sl)
+                } else {
+                    st.sync_painting = true;
+                    PresentAction::RedrawNow
+                }
+            });
+            match action {
+                PresentAction::Skip => {}
+                PresentAction::CommitPendingSize(sw, sl) => {
+                    let _ = unsafe { KillTimer(hwnd, SMOOTH_RESIZE_TIMER_ID) };
+                    let _ = unsafe { commit_resize_and_paint(hwnd, sw, sl, true) };
+                }
+                PresentAction::RedrawNow => {
+                    if unsafe { IsWindowVisible(hwnd) != 0 } {
+                        let _ = unsafe {
+                            RedrawWindow(hwnd, std::ptr::null(), 0, RDW_INVALIDATE | RDW_UPDATENOW)
+                        };
+                    }
+                    SIZEMOVE_STATE.with(|m| {
+                        if let Some(st) = m.borrow_mut().get_mut(&hwnd) {
+                            st.sync_painting = false;
+                        }
+                    });
+                }
+            }
+            0
+        }
+        WM_NCDESTROY => {
+            let _ = unsafe { KillTimer(hwnd, SMOOTH_RESIZE_TIMER_ID) };
+            let removed = SIZEMOVE_STATE.with(|m| m.borrow_mut().remove(&hwnd));
+            if let Some(state) = removed {
+                let active = unsafe { GetCursor() };
+                if state
+                    .surface_cursors
+                    .iter()
+                    .any(|e| matches!(e.cursor, OwnedWinCursor::Custom(h) if h.get() == active))
+                {
+                    let _ = unsafe { SetCursor(standard_hcursor(StandardCursor::Arrow)) };
+                }
+            }
+            let _ = unsafe { RemoveWindowSubclass(hwnd, smooth_resize_subclass_proc, uid) };
+            unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }
+        }
+        _ => unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) },
+    }
+}
+
+pub(crate) fn update_surface_cursor(
+    window: &Window,
+    browser_key: u64,
+    data: &NativeCursorData,
+    rect_px: (i32, i32, i32, i32),
+    hovered: bool,
+) {
+    let Some(hwnd) = window_hwnd(window) else {
+        return;
+    };
+    let raw = hwnd.get() as isize;
+    if unsafe { IsWindow(raw) == 0 } {
+        return;
+    }
+    let new_cursor = build_win32_hcursor(data);
+    let new_raw = new_cursor.raw();
+    let old_cursor = SIZEMOVE_STATE.with(|m| {
+        let mut map = m.borrow_mut();
+        let st = map.entry(raw).or_default();
+        if let Some(entry) = st
+            .surface_cursors
+            .iter_mut()
+            .find(|e| e.browser_key == browser_key)
+        {
+            entry.rect_px = rect_px;
+            entry.hovered = hovered;
+            Some(std::mem::replace(&mut entry.cursor, new_cursor))
+        } else {
+            st.surface_cursors.push(SurfaceCursorEntry {
+                browser_key,
+                rect_px,
+                hovered,
+                cursor: new_cursor,
+            });
+            None
+        }
+    });
+    if hovered {
+        unsafe { apply_cursor_if_over_surface(raw, rect_px, new_raw) };
+    }
+    if let Some(old) = old_cursor {
+        if old.raw() != new_raw && unsafe { GetCursor() } == old.raw() {
+            let fallback = if hovered {
+                new_raw
+            } else {
+                standard_hcursor(StandardCursor::Arrow)
+            };
+            let _ = unsafe { SetCursor(fallback) };
+        }
+        drop(old);
+    }
+}
+
+pub(crate) fn update_surface_cursor_bounds(
+    window: &Window,
+    browser_key: u64,
+    rect_px: (i32, i32, i32, i32),
+) {
+    let Some(hwnd) = window_hwnd(window) else {
+        return;
+    };
+    let raw = hwnd.get() as isize;
+    SIZEMOVE_STATE.with(|m| {
+        if let Some(st) = m.borrow_mut().get_mut(&raw)
+            && let Some(entry) = st
+                .surface_cursors
+                .iter_mut()
+                .find(|e| e.browser_key == browser_key)
+        {
+            entry.rect_px = rect_px;
+        }
+    });
+}
+
+pub(crate) fn set_surface_cursor_hover(window: &Window, browser_key: u64, hovered: bool) {
+    let Some(hwnd) = window_hwnd(window) else {
+        return;
+    };
+    let raw = hwnd.get() as isize;
+    let info = SIZEMOVE_STATE.with(|m| {
+        let mut map = m.borrow_mut();
+        let st = map.get_mut(&raw)?;
+        let entry = st
+            .surface_cursors
+            .iter_mut()
+            .find(|e| e.browser_key == browser_key)?;
+        let changed = entry.hovered != hovered;
+        entry.hovered = hovered;
+        Some((changed, entry.rect_px, entry.cursor.raw()))
+    });
+    let Some((changed, rect_px, hcursor)) = info else {
+        return;
+    };
+    if hovered {
+        unsafe { apply_cursor_if_over_surface(raw, rect_px, hcursor) };
+    } else if changed && unsafe { IsWindowVisible(raw) != 0 && IsWindowEnabled(raw) != 0 } {
+        let mut screen_pt = Win32Point { x: 0, y: 0 };
+        if unsafe { GetCursorPos(&mut screen_pt) != 0 && WindowFromPoint(screen_pt) == raw } {
+            const WM_SETCURSOR: u32 = 0x0020;
+            const HTCLIENT: usize = 1;
+            const WM_MOUSEMOVE: usize = 0x0200;
+            let _ = unsafe {
+                SendMessageW(
+                    raw,
+                    WM_SETCURSOR,
+                    raw as usize,
+                    (HTCLIENT | (WM_MOUSEMOVE << 16)) as isize,
+                )
+            };
+        }
+    }
+}
+
+pub(crate) fn clear_surface_cursor(hwnd_raw: Option<isize>, browser_key: u64) {
+    let Some(raw) = hwnd_raw else {
+        return;
+    };
+    let removed = SIZEMOVE_STATE.with(|m| {
+        let mut map = m.borrow_mut();
+        let st = map.get_mut(&raw)?;
+        let pos = st
+            .surface_cursors
+            .iter()
+            .position(|e| e.browser_key == browser_key)?;
+        Some(st.surface_cursors.remove(pos))
+    });
+    if let Some(entry) = removed {
+        if matches!(entry.cursor, OwnedWinCursor::Custom(h) if h.get() == unsafe { GetCursor() }) {
+            let _ = unsafe { SetCursor(standard_hcursor(StandardCursor::Arrow)) };
+        }
+        drop(entry);
+    }
+}
+
+pub(crate) fn is_window_in_sizemove(window: &Window) -> bool {
+    let Some(hwnd) = window_hwnd(window) else {
+        return false;
+    };
+    let raw = hwnd.get() as isize;
+    SIZEMOVE_STATE.with(|m| m.borrow().get(&raw).is_some_and(|st| st.in_sizemove))
+}
+
+pub(crate) fn request_sizemove_present(window: &Window) {
+    let Some(hwnd) = window_hwnd(window) else {
+        return;
+    };
+    let raw = hwnd.get() as isize;
+    let should_post = SIZEMOVE_STATE.with(|m| {
+        let mut map = m.borrow_mut();
+        let Some(st) = map.get_mut(&raw) else {
+            return false;
+        };
+        if !st.in_sizemove || st.present_queued {
+            return false;
+        }
+        st.present_queued = true;
+        true
+    });
+    if should_post && unsafe { IsWindow(raw) != 0 } {
+        let _ = unsafe { PostMessageW(raw, WM_CEF_SIZEMOVE_PRESENT, 0, 0) };
+    }
+}
+
+/// Ensures interactive Win32 border drag (`WM_ENTERSIZEMOVE`..`WM_EXITSIZEMOVE`)
+/// and maximize transitions synchronously draw and `Present` right after GPUI's
+/// `swap_chain.ResizeBuffers(...)` inside `WM_SIZE`, preventing DWM from sampling
+/// an unpresented swapchain buffer.
+pub(crate) fn install_smooth_resize_hook(window: &Window) {
+    let Some(hwnd) = window_hwnd(window) else {
+        return;
+    };
+    let raw = hwnd.get() as isize;
+    if unsafe { IsWindow(raw) != 0 } {
+        let _ = unsafe {
+            SetWindowSubclass(
+                raw,
+                smooth_resize_subclass_proc,
+                SMOOTH_RESIZE_SUBCLASS_ID,
+                0,
+            )
+        };
+    }
 }
 
 /// Extract the Win32 `HWND` for a GPUI `Window`, if backed by Win32.
@@ -49,6 +865,41 @@ pub fn window_hwnd(window: &Window) -> Option<NonZeroUsize> {
         RawWindowHandle::Win32(handle) => NonZeroUsize::new(handle.hwnd.get() as usize),
         _ => None,
     }
+}
+
+/// Check GPUI activation or immediate Win32 `WM_ACTIVATE(WA_CLICKACTIVE)` state.
+/// GPUI updates `is_window_active()` asynchronously after `WM_ACTIVATE`, so the
+/// first `WM_LBUTTONDOWN` arriving from another window (e.g. DevTools) still
+/// sees `window.is_window_active() == false` even though Win32 already activated it.
+pub(crate) fn is_window_effectively_active(window: &Window) -> bool {
+    if window.is_window_active() {
+        return true;
+    }
+    let Some(hwnd) = window_hwnd(window) else {
+        return false;
+    };
+    let raw = hwnd.get() as isize;
+    unsafe { IsWindow(raw) != 0 && (GetActiveWindow() == raw || GetForegroundWindow() == raw) }
+}
+
+pub(crate) fn is_gpui_window_minimized(window: &Window) -> bool {
+    let Some(hwnd) = window_hwnd(window) else {
+        return false;
+    };
+    is_window_minimized(hwnd)
+}
+
+pub(crate) fn window_client_screen_origin(window: &Window) -> Option<(i32, i32)> {
+    let hwnd = window_hwnd(window)?;
+    let raw = hwnd.get() as isize;
+    if unsafe { IsWindow(raw) == 0 || IsIconic(raw) != 0 } {
+        return None;
+    }
+    let mut pt = Win32Point { x: 0, y: 0 };
+    if unsafe { ClientToScreen(raw, &mut pt) } == 0 {
+        return None;
+    }
+    Some((pt.x, pt.y))
 }
 
 /// Compute physical-pixel `PixelRect` for a GPUI layout slot (`origin * scale_factor`).
@@ -707,5 +1558,79 @@ mod tests {
         let rendered = err.to_string();
         assert!(rendered.contains("0x1234"));
         assert!(rendered.contains("0x5678"));
+    }
+
+    #[test]
+    fn builds_win32_hcursors_for_standard_hidden_bgra_and_monochrome() {
+        #[allow(clashing_extern_declarations)]
+        #[link(name = "user32")]
+        unsafe extern "system" {
+            fn GetIconInfo(h_icon: isize, piconinfo: *mut CursorIconInfo) -> i32;
+        }
+
+        for kind in [
+            StandardCursor::Arrow,
+            StandardCursor::IBeam,
+            StandardCursor::Wait,
+            StandardCursor::Cross,
+            StandardCursor::SizeNwse,
+            StandardCursor::SizeNesw,
+            StandardCursor::SizeWe,
+            StandardCursor::SizeNs,
+            StandardCursor::SizeAll,
+            StandardCursor::No,
+            StandardCursor::Hand,
+            StandardCursor::AppStarting,
+            StandardCursor::Help,
+        ] {
+            let cur = build_win32_hcursor(&NativeCursorData::Standard(kind));
+            assert_ne!(cur.raw(), 0, "missing standard Win32 cursor for {kind:?}");
+        }
+
+        let hidden = build_win32_hcursor(&NativeCursorData::Hidden);
+        assert_eq!(hidden.raw(), 0);
+
+        let bgra = NativeCursorData::from_bgra(4, 4, 2, 3, vec![0xFFu8; 4 * 4 * 4]).unwrap();
+        let custom_bgra = build_win32_hcursor(&bgra);
+        assert_ne!(custom_bgra.raw(), 0);
+        let mut info = CursorIconInfo {
+            f_icon: 1,
+            x_hotspot: 0,
+            y_hotspot: 0,
+            hbm_mask: 0,
+            hbm_color: 0,
+        };
+        assert_ne!(unsafe { GetIconInfo(custom_bgra.raw(), &mut info) }, 0);
+        assert_eq!((info.f_icon, info.x_hotspot, info.y_hotspot), (0, 2, 3));
+        assert_ne!(info.hbm_color, 0);
+        let _mask_guard = OwnedGdiHandle(info.hbm_mask);
+        let _color_guard = OwnedGdiHandle(info.hbm_color);
+
+        let mono = NativeCursorData::from_monochrome(
+            2,
+            2,
+            1,
+            1,
+            vec![0xC0, 0x00, 0x40, 0x00],
+            vec![0x80, 0x00, 0x00, 0x00],
+        )
+        .unwrap();
+        let custom_mono = build_win32_hcursor(&mono);
+        assert_ne!(custom_mono.raw(), 0);
+        let mut mono_info = CursorIconInfo {
+            f_icon: 1,
+            x_hotspot: 0,
+            y_hotspot: 0,
+            hbm_mask: 0,
+            hbm_color: 0,
+        };
+        assert_ne!(unsafe { GetIconInfo(custom_mono.raw(), &mut mono_info) }, 0);
+        assert_eq!(
+            (mono_info.f_icon, mono_info.x_hotspot, mono_info.y_hotspot),
+            (0, 1, 1)
+        );
+        assert_ne!(mono_info.hbm_mask, 0);
+        assert_eq!(mono_info.hbm_color, 0);
+        let _mono_mask = OwnedGdiHandle(mono_info.hbm_mask);
     }
 }

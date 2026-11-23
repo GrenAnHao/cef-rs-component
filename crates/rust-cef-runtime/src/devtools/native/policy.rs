@@ -143,6 +143,26 @@ pub(crate) fn is_devtools_initiator(initiator: Option<&CefString>) -> bool {
     initiator.is_some_and(|s| s.to_string() == "devtools://devtools")
 }
 
+/// Top-level DevTools navigations in CEF 156 Chrome runtime arrive at
+/// `RequestContextHandler::GetResourceRequestHandler` with `browser == None`
+/// and an opaque (`"null"`) or absent browser-process initiator, whereas
+/// subresources/workers carry `"devtools://devtools"`.
+pub(crate) fn allows_context_devtools_request(
+    initiator: Option<&CefString>,
+    is_navigation: bool,
+) -> bool {
+    if is_devtools_initiator(initiator) {
+        return true;
+    }
+    if !is_navigation {
+        return false;
+    }
+    initiator.is_none_or(|s| {
+        let text = s.to_string();
+        text.is_empty() || text == "null"
+    })
+}
+
 pub(crate) fn auxiliary_resource_handler() -> ResourceRequestHandler {
     AuxiliaryResourcePolicy::new()
 }
@@ -576,6 +596,27 @@ mod tests {
             "https://example.com"
         ))));
         assert!(!is_devtools_initiator(None));
+
+        // Top-level DevTools navigation in CEF 156 Chrome runtime carries an
+        // opaque "null" or absent initiator; subresources require devtools://devtools.
+        assert!(allows_context_devtools_request(
+            Some(&CefString::from("null")),
+            true
+        ));
+        assert!(allows_context_devtools_request(None, true));
+        assert!(!allows_context_devtools_request(
+            Some(&CefString::from("null")),
+            false
+        ));
+        assert!(!allows_context_devtools_request(None, false));
+        assert!(allows_context_devtools_request(
+            Some(&CefString::from("devtools://devtools")),
+            false
+        ));
+        assert!(!allows_context_devtools_request(
+            Some(&CefString::from("https://example.com")),
+            true
+        ));
 
         // ResourceRequestHandler is invoked and dropped on the CEF IO thread, so
         // it must stay stateless and never pin Life or fault the UI ledger.

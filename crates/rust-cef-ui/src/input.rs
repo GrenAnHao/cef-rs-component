@@ -117,7 +117,7 @@ pub struct InputLane {
     last_error: Option<EngineError>,
     accepted_clicks: u64,
     rejected_clicks: u64,
-    buttons: [bool; 3],
+    buttons: [bool; 5],
     reset_armed: bool,
     callbacks: InputCallbackDiagnostics,
 }
@@ -132,7 +132,7 @@ impl Default for InputLane {
             last_error: None,
             accepted_clicks: 0,
             rejected_clicks: 0,
-            buttons: [false; 3],
+            buttons: [false; 5],
             reset_armed: true,
             callbacks: InputCallbackDiagnostics::default(),
         }
@@ -203,7 +203,7 @@ impl InputLane {
         self.rejected = self.rejected.saturating_add(1);
         self.last_error = Some(error);
         if cleanup_in_progress {
-            self.buttons = [false; 3];
+            self.buttons = [false; 5];
             self.reset_armed = false;
         } else {
             self.abandon(handle, InputResetReason::Rejected);
@@ -215,6 +215,9 @@ impl InputLane {
     pub fn owns_button(&self, button: rust_cef_core::input::MouseButton) -> bool {
         self.buttons[button_index(button)]
     }
+    pub fn clear_held_buttons(&mut self) {
+        self.buttons = [false; 5];
+    }
     pub fn abandon(&mut self, handle: &BrowserHandle, reason: InputResetReason) {
         if self
             .pending
@@ -223,7 +226,7 @@ impl InputLane {
         {
             self.rejected_clicks = self.rejected_clicks.saturating_add(1);
         }
-        self.buttons = [false; 3];
+        self.buttons = [false; 5];
         if !self.reset_armed {
             return;
         }
@@ -245,7 +248,11 @@ impl InputLane {
         if accepted_click {
             self.accepted_clicks = self.accepted_clicks.saturating_add(1);
         }
-        self.reset_armed = true;
+        // Passive hover/wheel samples do not create held native button/key/IME
+        // state, so they must not arm spurious ResetInput commands on inactive windows.
+        if !is_transient_pointer_input(&event.kind) {
+            self.reset_armed = true;
+        }
         self.last_error = None;
     }
     pub fn submit(
@@ -258,6 +265,79 @@ impl InputLane {
     ) -> Result<InputAdmission, EngineError> {
         self.submit_with_epoch(handle, window, kind, accepted_click, mirror, None)
             .map(|(admission, _)| admission)
+    }
+    /// High-rate `MouseMove` fast path bypassing `input_snapshot()` and `Session`
+    /// command-queue capacity while preserving causal order before discrete events.
+    pub fn submit_mouse_move_fast(
+        &mut self,
+        handle: &BrowserHandle,
+        x: i32,
+        y: i32,
+        leaving: bool,
+        modifiers: MouseModifiers,
+    ) -> Result<(), EngineError> {
+        if self.pending.is_some() {
+            self.last_error = Some(EngineError::Backpressure);
+            return Err(EngineError::Backpressure);
+        }
+        match handle.submit_mouse_move_fast(x, y, leaving, modifiers) {
+            Ok(()) => {
+                self.last_error = None;
+                Ok(())
+            }
+            Err(EngineError::Backpressure) => {
+                self.last_error = Some(EngineError::Backpressure);
+                Err(EngineError::Backpressure)
+            }
+            Err(error) => {
+                if matches!(
+                    error,
+                    EngineError::NotReady | EngineError::Closing | EngineError::Closed
+                ) {
+                    self.last_error = Some(error.clone());
+                    Err(error)
+                } else {
+                    Err(self.reject(handle, error))
+                }
+            }
+        }
+    }
+    /// High-rate `MouseWheel` fast path bypassing `input_snapshot()` and `Session`
+    /// command-queue capacity while preserving causal order before discrete events.
+    pub fn submit_mouse_wheel_fast(
+        &mut self,
+        handle: &BrowserHandle,
+        x: i32,
+        y: i32,
+        delta_x: i32,
+        delta_y: i32,
+        modifiers: MouseModifiers,
+    ) -> Result<(), EngineError> {
+        if self.pending.is_some() {
+            self.last_error = Some(EngineError::Backpressure);
+            return Err(EngineError::Backpressure);
+        }
+        match handle.submit_mouse_wheel_fast(x, y, delta_x, delta_y, modifiers) {
+            Ok(()) => {
+                self.last_error = None;
+                Ok(())
+            }
+            Err(EngineError::Backpressure) => {
+                self.last_error = Some(EngineError::Backpressure);
+                Err(EngineError::Backpressure)
+            }
+            Err(error) => {
+                if matches!(
+                    error,
+                    EngineError::NotReady | EngineError::Closing | EngineError::Closed
+                ) {
+                    self.last_error = Some(error.clone());
+                    Err(error)
+                } else {
+                    Err(self.reject(handle, error))
+                }
+            }
+        }
     }
     /// Returns the epoch of the exact owned event, not a later snapshot that a
     /// concurrent reset could already have advanced. This adds no pending slot.
@@ -279,7 +359,14 @@ impl InputLane {
         }
         // No later discrete event may overtake the original event. Preserve
         // its one host-selected retry opportunity even when later input arrives.
+        // Transient pointer streams (`MouseMove` / `MouseWheel`) simply drop the
+        // redundant sample on backpressure so they never poison a held drag or
+        // pending discrete event.
         if self.pending.is_some() {
+            if is_transient_pointer_input(&kind) {
+                self.last_error = Some(EngineError::Backpressure);
+                return Err(EngineError::Backpressure);
+            }
             self.note_overflow();
             return Err(EngineError::Backpressure);
         }
@@ -289,10 +376,14 @@ impl InputLane {
         if expected_epoch.is_some_and(|epoch| epoch != snapshot.epoch) {
             return Err(self.reject_old_epoch());
         }
-        if snapshot.cleanup_pending
-            || snapshot.cleanup_failed
-            || (text_input(&kind) && !snapshot.accepts_text)
-        {
+        if snapshot.cleanup_pending || snapshot.cleanup_failed {
+            if snapshot.cleanup_pending
+                && !snapshot.cleanup_failed
+                && is_transient_pointer_input(&kind)
+            {
+                self.last_error = Some(EngineError::Backpressure);
+                return Err(EngineError::Backpressure);
+            }
             return Err(self.reject(handle, EngineError::NotReady));
         }
         let event = InputEvent {
@@ -306,6 +397,10 @@ impl InputLane {
             Ok(_) => {
                 self.admitted(&event, accepted_click);
                 Ok((InputAdmission::Admitted(mirror), event.epoch))
+            }
+            Err(EngineError::Backpressure) if is_transient_pointer_input(&event.kind) => {
+                self.last_error = Some(EngineError::Backpressure);
+                Err(EngineError::Backpressure)
             }
             Err(EngineError::Backpressure) if file_drag_input(&event.kind) => {
                 // Platform file sessions cannot be replayed after Drop/Exited.
@@ -370,7 +465,6 @@ impl InputLane {
             || snapshot.epoch != pending.event.epoch
             || snapshot.cleanup_pending
             || snapshot.cleanup_failed
-            || (text_input(&pending.event.kind) && !snapshot.accepts_text)
         {
             if pending.accepted_click {
                 self.rejected_clicks = self.rejected_clicks.saturating_add(1);
@@ -413,14 +507,13 @@ fn file_drag_input(kind: &InputKind) -> bool {
     )
 }
 
-fn text_input(kind: &InputKind) -> bool {
+/// High-frequency pointer motion (excluding pointer leave) and wheel events can
+/// drop an individual backpressured sample without invalidating a held drag or
+/// latching the discrete retry slot.
+pub fn is_transient_pointer_input(kind: &InputKind) -> bool {
     matches!(
         kind,
-        InputKind::Text(_)
-            | InputKind::ReplaceText { .. }
-            | InputKind::ImeSet { .. }
-            | InputKind::ImeFinish { .. }
-            | InputKind::ImeCancel
+        InputKind::MouseMove { leaving: false, .. } | InputKind::MouseWheel { .. }
     )
 }
 
@@ -429,6 +522,8 @@ fn button_index(button: rust_cef_core::input::MouseButton) -> usize {
         rust_cef_core::input::MouseButton::Left => 0,
         rust_cef_core::input::MouseButton::Middle => 1,
         rust_cef_core::input::MouseButton::Right => 2,
+        rust_cef_core::input::MouseButton::Back => 3,
+        rust_cef_core::input::MouseButton::Forward => 4,
     }
 }
 
@@ -1094,5 +1189,163 @@ mod tests {
                 [BrowserCommand::ResetInput(InputResetReason::Rejected)]
             ));
         }
+    }
+
+    #[test]
+    fn transient_pointer_backpressure_drops_sample_without_poisoning_drag_or_pending() {
+        let control = FakeControl::new(Vec::new());
+        let handle = BrowserHandle::new(control.clone());
+        let mut lane = InputLane::default();
+
+        // 1. Start a left drag (`MouseDown`).
+        assert_eq!(
+            lane.submit(&handle, 7, button(false), false, None),
+            Ok(InputAdmission::Admitted(None))
+        );
+        assert!(lane.held_button());
+
+        // 2. Next `MouseMove` hits queue backpressure: drop the redundant sample,
+        //    keep `held_button()` intact, do NOT latch `pending`, do NOT emit ResetInput.
+        control
+            .0
+            .lock()
+            .unwrap()
+            .failures
+            .push(EngineError::Backpressure);
+        let move_event = InputKind::MouseMove {
+            x: 42,
+            y: 42,
+            leaving: false,
+            modifiers: MouseModifiers::default(),
+        };
+        assert_eq!(
+            lane.submit(&handle, 7, move_event, false, None),
+            Err(EngineError::Backpressure)
+        );
+        assert!(!lane.pending());
+        assert!(lane.held_button());
+
+        // 3. Subsequent move + release succeed without an intervening ResetInput.
+        assert_eq!(
+            lane.submit(
+                &handle,
+                7,
+                InputKind::MouseMove {
+                    x: 120,
+                    y: 42,
+                    leaving: false,
+                    modifiers: MouseModifiers::default(),
+                },
+                false,
+                None
+            ),
+            Ok(InputAdmission::Admitted(None))
+        );
+        assert_eq!(
+            lane.submit(&handle, 7, button(true), true, None),
+            Ok(InputAdmission::Admitted(None))
+        );
+        assert!(!lane.held_button());
+        assert!(
+            !control
+                .0
+                .lock()
+                .unwrap()
+                .commands
+                .iter()
+                .any(|c| matches!(c, BrowserCommand::ResetInput(_)))
+        );
+
+        // 4. While a discrete event is pending retry, transient pointer/wheel samples
+        //    must not mark `overflow = true`.
+        control
+            .0
+            .lock()
+            .unwrap()
+            .failures
+            .push(EngineError::Backpressure);
+        assert_eq!(
+            lane.submit(&handle, 7, InputKind::Text("a".into()), false, None),
+            Ok(InputAdmission::Deferred)
+        );
+        assert_eq!(
+            lane.submit(
+                &handle,
+                7,
+                InputKind::MouseWheel {
+                    x: 10,
+                    y: 10,
+                    delta_x: 0,
+                    delta_y: -120,
+                    modifiers: MouseModifiers::default(),
+                },
+                false,
+                None,
+            ),
+            Err(EngineError::Backpressure)
+        );
+        assert_eq!(lane.retry(&handle, 7), Ok(InputAdmission::Admitted(None)));
+    }
+
+    #[test]
+    fn transient_pointer_does_not_arm_reset_and_drops_cleanly_while_cleanup_pending() {
+        let control = FakeControl::new(Vec::new());
+        let handle = BrowserHandle::new(control.clone());
+        let mut lane = InputLane::default();
+        // Consume the initial construction arming, then verify passive hover
+        // does not re-arm ResetInput on later FocusLost.
+        lane.abandon(&handle, InputResetReason::FocusLost);
+        control.0.lock().unwrap().commands.clear();
+
+        // Hover/wheel does not arm ResetInput.
+        assert_eq!(
+            lane.submit(
+                &handle,
+                7,
+                InputKind::MouseMove {
+                    x: 10,
+                    y: 20,
+                    leaving: false,
+                    modifiers: MouseModifiers::default(),
+                },
+                false,
+                None,
+            ),
+            Ok(InputAdmission::Admitted(None))
+        );
+        lane.abandon(&handle, InputResetReason::FocusLost);
+        assert!(
+            !control
+                .0
+                .lock()
+                .unwrap()
+                .commands
+                .iter()
+                .any(|c| matches!(c, BrowserCommand::ResetInput(_)))
+        );
+
+        // During cleanup_pending, transient pointer drops cleanly without incrementing rejected.
+        {
+            let mut inner = control.0.lock().unwrap();
+            inner.cleanup_pending = true;
+            inner.commands.clear();
+        }
+        assert_eq!(
+            lane.submit(
+                &handle,
+                7,
+                InputKind::MouseMove {
+                    x: 15,
+                    y: 25,
+                    leaving: false,
+                    modifiers: MouseModifiers::default(),
+                },
+                false,
+                None,
+            ),
+            Err(EngineError::Backpressure)
+        );
+        assert_eq!(lane.diagnostics(&handle).rejected, 0);
+        assert!(control.0.lock().unwrap().commands.is_empty());
     }
 }

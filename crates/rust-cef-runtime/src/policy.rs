@@ -22,10 +22,13 @@ pub enum PolicyConfigError {
 pub(crate) struct CompiledPolicy {
     allowed_origins: BTreeSet<String>,
     custom_schemes: BTreeSet<String>,
+    allow_any_http: bool,
+    allow_any_https: bool,
     allow_embedded_data: bool,
 }
 
 impl CompiledPolicy {
+    #[cfg(test)]
     pub(crate) fn compile(config: &TrustedContentPolicy) -> Result<Self, PolicyConfigError> {
         Self::compile_with_custom_schemes(config, &[])
     }
@@ -39,12 +42,24 @@ impl CompiledPolicy {
             .map(|c| c.scheme.to_ascii_lowercase())
             .collect();
         let mut allowed_origins = BTreeSet::new();
+        let mut allow_any_http = false;
+        let mut allow_any_https = false;
         for origin in &config.allowed_origins {
+            if origin.trim() == origin && origin.eq_ignore_ascii_case("http://*") {
+                allow_any_http = true;
+                continue;
+            }
+            if origin.trim() == origin && origin.eq_ignore_ascii_case("https://*") {
+                allow_any_https = true;
+                continue;
+            }
             allowed_origins.insert(compile_origin_with_schemes(origin, &custom_schemes)?);
         }
         Ok(Self {
             allowed_origins,
             custom_schemes,
+            allow_any_http,
+            allow_any_https,
             allow_embedded_data: config.allow_embedded_data,
         })
     }
@@ -57,8 +72,21 @@ impl CompiledPolicy {
         canonical_origin(url, &self.custom_schemes)
     }
 
+    fn matches_compiled_origin(&self, canonical: &str) -> bool {
+        self.allowed_origins.contains(canonical)
+            || (self.allow_any_https && canonical.starts_with("https://"))
+            || (self.allow_any_http && canonical.starts_with("http://"))
+    }
+
     pub(crate) fn allows_canonical_origin(&self, origin: &str) -> bool {
-        self.allowed_origins.contains(origin)
+        if self.allowed_origins.contains(origin) {
+            return true;
+        }
+        if !(self.allow_any_https || self.allow_any_http) {
+            return false;
+        }
+        canonical_origin(origin, &self.custom_schemes).as_deref() == Some(origin)
+            && self.matches_compiled_origin(origin)
     }
 
     /// Subresource/network request: exact allowed HTTP(S) or custom scheme origin only.
@@ -95,7 +123,7 @@ impl CompiledPolicy {
 
     fn allows_target(&self, url: &str) -> bool {
         canonical_origin(url, &self.custom_schemes)
-            .is_some_and(|origin| self.allowed_origins.contains(&origin))
+            .is_some_and(|origin| self.matches_compiled_origin(&origin))
     }
 }
 
@@ -157,7 +185,11 @@ fn compile_origin_with_schemes(
         return Err(PolicyConfigError::MalformedOrigin);
     }
     let parsed = Url::parse(raw).map_err(|_| PolicyConfigError::MalformedOrigin)?;
-    if parsed.cannot_be_a_base() || parsed.host_str().is_none_or(|h| h.is_empty()) {
+    if parsed.cannot_be_a_base()
+        || parsed
+            .host_str()
+            .is_none_or(|h| h.is_empty() || h.contains('*'))
+    {
         return Err(PolicyConfigError::MalformedOrigin);
     }
     if has_credentials(raw, &parsed) {
@@ -410,5 +442,53 @@ mod tests {
             p.canonical_origin_for("app://LOCAL/index.html"),
             Some("app://local".into())
         );
+    }
+
+    #[test]
+    fn allow_all_http_https_permits_valid_web_origins_and_keeps_fail_closed_guards() {
+        let p = CompiledPolicy::compile(&TrustedContentPolicy::allow_all_http_https(true)).unwrap();
+        for ok_url in [
+            "https://cn.bing.com/search?q=test",
+            "https://tse1-mm.cn.bing.net/th?id=OIP.123",
+            "https://www.zhihu.com/question/1",
+            "http://example.com:8080/a",
+        ] {
+            assert!(p.allows_network(ok_url), "{ok_url}");
+            assert!(p.allows_page_navigation(ok_url), "{ok_url}");
+            assert!(p.allows_host_navigation(ok_url), "{ok_url}");
+            let origin = p.canonical_origin_for(ok_url).unwrap();
+            assert!(p.allows_canonical_origin(&origin), "{origin}");
+        }
+        assert!(p.allows_host_navigation("data:text/html,ok"));
+        assert!(!p.allows_page_navigation("data:text/html,ok"));
+
+        for blocked in [
+            "javascript:alert(1)",
+            "file:///C:/Windows/win.ini",
+            "ftp://example.com/",
+            "https://user:pass@example.com/",
+            "https://example.com\\path",
+            "https://example.com\n",
+            "",
+        ] {
+            assert!(!p.allows_network(blocked), "{blocked:?}");
+            assert!(!p.allows_page_navigation(blocked), "{blocked:?}");
+            assert!(!p.allows_canonical_origin(blocked), "{blocked:?}");
+        }
+        assert!(!p.allows_canonical_origin("https://evil.com/path"));
+
+        for bad_wildcard in [
+            "https://*.bing.com",
+            "*://*",
+            "https://*/foo",
+            " https://*",
+            "ftp://*",
+        ] {
+            let cfg = TrustedContentPolicy {
+                allowed_origins: vec![bad_wildcard.to_string()],
+                allow_embedded_data: false,
+            };
+            assert!(CompiledPolicy::compile(&cfg).is_err(), "{bad_wildcard:?}");
+        }
     }
 }

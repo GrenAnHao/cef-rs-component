@@ -129,6 +129,8 @@ pub enum MouseButton {
     Left,
     Middle,
     Right,
+    Back,
+    Forward,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

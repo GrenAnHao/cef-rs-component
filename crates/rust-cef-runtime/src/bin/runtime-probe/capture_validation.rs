@@ -161,10 +161,13 @@ pub(super) fn valid_frame(frame: &OwnedFrame) -> bool {
     else {
         return false;
     };
-    if frame.pixels.len() != expected_len {
+    let Some(pixels) = frame.cpu_pixels() else {
+        return false;
+    };
+    if pixels.len() != expected_len {
         return false;
     }
-    let bgra = frame.pixels.as_slice();
+    let bgra = pixels.as_slice();
     let stride = width as usize * 4;
     for y in 0..height {
         for x in 0..width {
@@ -216,7 +219,7 @@ fn samples_match(bgra: &[u8], width: u32, height: u32) -> bool {
 
 fn sample_points(frame: &OwnedFrame) -> Vec<Value> {
     let (width, height) = (frame.info.width, frame.info.height);
-    let bgra = frame.pixels.as_slice();
+    let bgra = frame.cpu_pixels().map_or(&[][..], |px| px.as_slice());
     sample_positions(width, height)
         .map(|(x, y)| {
             let offset = (y as usize * width as usize + x as usize) * 4;
@@ -285,7 +288,10 @@ fn snapshot_frame(source: &Arc<dyn FrameSource>) -> Result<SavedFrame, String> {
         .frame
         .as_ref()
         .ok_or_else(|| "no retained VIEW frame".to_string())?;
-    let bytes = frame.pixels.as_slice();
+    let bytes = frame
+        .cpu_pixels()
+        .ok_or_else(|| "retained VIEW frame is not CPU pixels".to_string())?
+        .as_slice();
     Ok(SavedFrame {
         sequence: frame.info.sequence,
         generation: frame.info.surface_generation,
@@ -356,7 +362,7 @@ fn save_abnormal(source: &Arc<dyn FrameSource>, directory: &Path, label: &str) -
         "frame-{label}-abnormal-seq{}-gen{}-{}x{}.bgra",
         info.sequence, info.surface_generation, info.width, info.height
     ));
-    std::fs::write(&path, frame.pixels.as_slice()).ok()?;
+    std::fs::write(&path, frame.cpu_pixels()?.as_slice()).ok()?;
     Some(path.display().to_string())
 }
 
@@ -457,7 +463,10 @@ fn capture_stage(
             info.width, info.height
         ));
     }
-    let bytes = frame.pixels.as_slice();
+    let bytes = frame
+        .cpu_pixels()
+        .ok_or_else(|| "retained VIEW frame is not CPU pixels".to_string())?
+        .as_slice();
     let fingerprint =
         fingerprint_bytes(bytes).ok_or_else(|| format!("{id}: legacy fingerprint unavailable"))?;
     let sha256 = sha256_hex(bytes);

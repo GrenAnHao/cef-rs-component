@@ -33,7 +33,8 @@ use rust_cef_gpui::{
         BrowserConfig, BrowserId, BrowserOptions, BrowserSurfaceMode, CefFeatureState,
         NativeChildHwndConfig, NavigationSnapshot, PixelRect, ProfileStorage, RuntimeConfig,
         RuntimeFiles, RuntimeSettings, RuntimeState, SessionState, ShortcutFilter, ShortcutId,
-        ShortcutRule, ThreadMode, TrustedContentPolicy, Viewport,
+        ShortcutRule, ThreadMode, TrustedContentPolicy, Viewport, step_canonical_zoom_level,
+        zoom_level_to_milli, zoom_level_to_percent,
     },
     custom_schemes::{CustomSchemeConfig, CustomSchemeOptions, MemoryAsset, SchemeAssetSource},
     dispatcher::{self, UiWakeReceiver, UiWakeSender},
@@ -289,7 +290,7 @@ pub(super) enum ShellAction {
     Forward,
     Reload,
     StopLoading,
-    ZoomDelta(f64),
+    ZoomSteps(i32),
     ZoomReset,
     ToggleMute,
     ToggleFind,
@@ -371,24 +372,27 @@ impl ShellView {
         }
     }
 
-    fn adjust_zoom(&self, delta: f64, cx: &mut App) {
+    fn zoom_level_milli(&self, cx: &App) -> Option<i32> {
+        let level = match self {
+            Self::Osr(view) => view.read(cx).zoom_level(),
+            Self::Native(view) => view.read(cx).zoom_level(),
+        };
+        zoom_level_to_milli(level).ok()
+    }
+
+    fn step_zoom(&self, steps: i32, window: &mut Window, cx: &mut App) {
         match self {
-            Self::Osr(view) => view.update(cx, |v, _| {
-                let next = (v.zoom_level() + delta).clamp(-5.0, 5.0);
-                let _ = v.set_zoom_level(next);
-            }),
+            Self::Osr(view) => view.update(cx, |v, cx| v.step_zoom(steps, window, cx)),
             Self::Native(view) => view.update(cx, |v, _| {
-                let next = (v.zoom_level() + delta).clamp(-5.0, 5.0);
+                let next = step_canonical_zoom_level(v.zoom_level(), steps);
                 let _ = v.set_zoom_level(next);
             }),
         }
     }
 
-    fn reset_zoom(&self, cx: &mut App) {
+    fn reset_zoom(&self, window: &mut Window, cx: &mut App) {
         match self {
-            Self::Osr(view) => view.update(cx, |v, _| {
-                let _ = v.set_zoom_level(0.0);
-            }),
+            Self::Osr(view) => view.update(cx, |v, cx| v.reset_zoom(window, cx)),
             Self::Native(view) => view.update(cx, |v, _| {
                 let _ = v.set_zoom_level(0.0);
             }),
@@ -697,9 +701,13 @@ impl Render for ShellRoot {
         let progress = active_meta
             .as_ref()
             .map_or(0, |m| m.loading_progress_per_mille);
-        let zoom_pct = active_meta.as_ref().map_or(100, |m| {
-            (1.2_f64.powf(f64::from(m.zoom_level_milli) / 1000.0) * 100.0).round() as i32
-        });
+        let zoom_pct = if let Some(ShellView::Osr(v)) = &active_view {
+            zoom_level_to_percent(v.read(cx).zoom_level()).round() as i32
+        } else {
+            active_meta.as_ref().map_or(100, |m| {
+                zoom_level_to_percent(f64::from(m.zoom_level_milli) / 1000.0).round() as i32
+            })
+        };
         let muted = active_meta.as_ref().is_some_and(|m| m.audio_muted);
         let devtools_open = active_meta.as_ref().is_some_and(|m| m.devtools_open);
 
@@ -816,7 +824,7 @@ impl Render for ShellRoot {
                 "shell-zoom-out",
                 "-",
                 0x374151,
-                |this, _, _| this.emit(ShellAction::ZoomDelta(-0.5)),
+                |this, _, _| this.emit(ShellAction::ZoomSteps(-1)),
                 cx,
             ))
             .child(Self::pill(
@@ -830,7 +838,7 @@ impl Render for ShellRoot {
                 "shell-zoom-in",
                 "+",
                 0x374151,
-                |this, _, _| this.emit(ShellAction::ZoomDelta(0.5)),
+                |this, _, _| this.emit(ShellAction::ZoomSteps(1)),
                 cx,
             ))
             .child(Self::pill(
@@ -1414,8 +1422,8 @@ fn plan_shell_shortcut(
     audio_muted: bool,
 ) -> Option<ShellShortcutOp> {
     match id.0 {
-        1 => Some(ShellShortcutOp::Zoom((zoom_level + 0.5).clamp(-5.0, 5.0))),
-        2 => Some(ShellShortcutOp::Zoom((zoom_level - 0.5).clamp(-5.0, 5.0))),
+        1 => Some(ShellShortcutOp::Zoom(step_canonical_zoom_level(zoom_level, 1))),
+        2 => Some(ShellShortcutOp::Zoom(step_canonical_zoom_level(zoom_level, -1))),
         3 => Some(ShellShortcutOp::Zoom(0.0)),
         4 => Some(ShellShortcutOp::Mute(!audio_muted)),
         _ => None,
@@ -1480,6 +1488,7 @@ fn spawn_tab(
         scale,
     };
     let mut options = BrowserOptions::default()
+        .with_frame_rate(rust_cef_gpui::recommended_windowless_frame_rate())
         .with_tooltip_events(true)
         .with_shortcut_filter(shell_shortcut_filter())
         .with_headless_cdp(config.host_capabilities)
@@ -1537,6 +1546,7 @@ fn spawn_tab(
                     let rt_pump = rt_cell.clone();
                     let _ = view.update(cx, |v, _| {
                         v.set_pinch_zoom_enabled(true);
+                        v.set_ctrl_wheel_zoom_enabled(true);
                         if mode == ThreadMode::Integrated {
                             v.set_outbound_drag_pump(Some(Rc::new(move || {
                                 if let Ok(mut guard) = rt_pump.try_borrow_mut()
@@ -1546,15 +1556,15 @@ fn spawn_tab(
                                 }
                             })));
                         }
-                        v.set_on_shortcut(Some(Box::new(|id, view, _, cx| {
-                            match plan_shell_shortcut(id, view.zoom_level(), view.audio_muted()) {
-                                Some(ShellShortcutOp::Zoom(next)) => {
-                                    let _ = view.set_zoom_level(next);
+                        v.set_on_shortcut(Some(Box::new(|id, view, window, cx| {
+                            match id.0 {
+                                1 => view.step_zoom(1, window, cx),
+                                2 => view.step_zoom(-1, window, cx),
+                                3 => view.reset_zoom(window, cx),
+                                4 => {
+                                    let _ = view.set_audio_muted(!view.audio_muted());
                                 }
-                                Some(ShellShortcutOp::Mute(muted)) => {
-                                    let _ = view.set_audio_muted(muted);
-                                }
-                                None => {}
+                                _ => {}
                             }
                             cx.notify();
                         })));
@@ -2141,28 +2151,33 @@ async fn drive_shell(
                         let _ = tab.handle.submit(BrowserCommand::StopLoading);
                     }
                 }
-                ShellAction::ZoomDelta(delta) => {
-                    let _ = root.update(cx, |root, _, cx| {
-                        if let Some(view) = root
-                            .model
-                            .active_tab
-                            .and_then(|id| root.views.get(&id))
-                            .cloned()
+                ShellAction::ZoomSteps(steps) => {
+                    let _ = root.update(cx, |root, window, cx| {
+                        if let Some(active_id) = root.model.active_tab
+                            && let Some(view) = root.views.get(&active_id).cloned()
                         {
-                            view.adjust_zoom(delta, cx);
+                            view.step_zoom(steps, window, cx);
+                            if let Some(milli) = view.zoom_level_milli(cx)
+                                && let Some(meta) =
+                                    root.model.tabs.iter_mut().find(|t| t.id == active_id)
+                            {
+                                meta.zoom_level_milli = milli;
+                            }
                         }
                         cx.notify();
                     });
                 }
                 ShellAction::ZoomReset => {
-                    let _ = root.update(cx, |root, _, cx| {
-                        if let Some(view) = root
-                            .model
-                            .active_tab
-                            .and_then(|id| root.views.get(&id))
-                            .cloned()
+                    let _ = root.update(cx, |root, window, cx| {
+                        if let Some(active_id) = root.model.active_tab
+                            && let Some(view) = root.views.get(&active_id).cloned()
                         {
-                            view.reset_zoom(cx);
+                            view.reset_zoom(window, cx);
+                            if let Some(meta) =
+                                root.model.tabs.iter_mut().find(|t| t.id == active_id)
+                            {
+                                meta.zoom_level_milli = 0;
+                            }
                         }
                         cx.notify();
                     });
@@ -2363,6 +2378,12 @@ async fn drive_shell(
             let _ = root.update(cx, |root, _, cx| {
                 root.model
                     .apply_nav_snapshot(tab_id, &tab.handle.snapshot().navigation);
+                if let Some(ShellView::Osr(v)) = root.views.get(&tab_id)
+                    && let Ok(milli) = zoom_level_to_milli(v.read(cx).zoom_level())
+                    && let Some(meta) = root.model.tabs.iter_mut().find(|t| t.id == tab_id)
+                {
+                    meta.zoom_level_milli = milli;
+                }
                 cx.notify();
             });
         }

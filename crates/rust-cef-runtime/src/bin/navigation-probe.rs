@@ -703,7 +703,25 @@ mod windows {
                     state.record_error("unexpected Unresponsive event");
                     None
                 }
-                BrowserEvent::RenderViewReady | BrowserEvent::Responsive => None,
+                BrowserEvent::RenderViewReady
+                | BrowserEvent::Responsive
+                | BrowserEvent::CursorChanged(_)
+                | BrowserEvent::TooltipChanged(_)
+                | BrowserEvent::StatusMessageChanged(_)
+                | BrowserEvent::FaviconUrlsChanged(_)
+                | BrowserEvent::FullscreenModeChanged(_)
+                | BrowserEvent::LoadingProgressChanged(_)
+                | BrowserEvent::ConsoleMessage { .. }
+                | BrowserEvent::ZoomLevelChanged(_)
+                | BrowserEvent::AudioMutedChanged(_)
+                | BrowserEvent::FocusTaken { .. }
+                | BrowserEvent::GotFocus
+                | BrowserEvent::HostShortcutTriggered { .. }
+                | BrowserEvent::JsMessageReceived { .. }
+                | BrowserEvent::EvalCompleted { .. }
+                | BrowserEvent::StartOutboundDrag(_)
+                | BrowserEvent::OutboundDragCursorChanged(_)
+                | BrowserEvent::AccessibilityTreeUpdated { .. } => None,
                 BrowserEvent::CloseCancelled => {
                     state.record_error("unexpected CloseCancelled event");
                     None
@@ -743,7 +761,10 @@ mod windows {
             let center = ((height as usize / 2) * width as usize + width as usize / 2) * 4;
             if width == FRAME_WIDTH_U32
                 && height == FRAME_HEIGHT_U32
-                && frame.pixels.get(center..center + 4) == Some(&CENTER_BGRA)
+                && frame
+                    .cpu_pixels()
+                    .and_then(|px| px.get(center..center + 4))
+                    == Some(&CENTER_BGRA)
             {
                 let mut valid = lock(&self.valid_browser);
                 match *valid {

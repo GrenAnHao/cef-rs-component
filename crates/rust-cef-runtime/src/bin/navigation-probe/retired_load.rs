@@ -183,8 +183,8 @@ fn valid_view(source: &dyn FrameSource, browser: BrowserId) -> bool {
             && f.info.height == FRAME_HEIGHT_U32
             && f.info.sequence > 0
             && f.info.surface_generation > 0
-            && f.pixels
-                .get(((120 * 320 + 160) * 4)..((120 * 320 + 160) * 4 + 4))
+            && f.cpu_pixels()
+                .and_then(|px| px.get(((120 * 320 + 160) * 4)..((120 * 320 + 160) * 4 + 4)))
                 == Some(&CENTER_BGRA)
     })
 }

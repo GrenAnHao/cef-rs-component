@@ -9,6 +9,7 @@ use std::sync::Arc;
 use rust_cef_core::{
     accessibility::AxTreeSlot,
     contracts::{BrowserId, BrowserSurfaceMode},
+    cursor::CursorSlot,
     ports::{BrowserHandle, CloseMode, EngineError, FrameSource},
 };
 
@@ -35,6 +36,7 @@ pub struct BrowserAttachment {
     handle: BrowserHandle,
     source: Arc<dyn FrameSource>,
     ax_tree: AxTreeSlot,
+    cursor_slot: CursorSlot,
     surface_mode: BrowserSurfaceMode,
 }
 
@@ -49,12 +51,18 @@ impl BrowserAttachment {
             handle,
             source,
             ax_tree: AxTreeSlot::new(),
+            cursor_slot: CursorSlot::new(),
             surface_mode: BrowserSurfaceMode::Offscreen,
         }
     }
 
     pub(crate) fn with_ax_tree(mut self, ax_tree: AxTreeSlot) -> Self {
         self.ax_tree = ax_tree;
+        self
+    }
+
+    pub(crate) fn with_cursor_slot(mut self, cursor_slot: CursorSlot) -> Self {
+        self.cursor_slot = cursor_slot;
         self
     }
 
@@ -77,6 +85,10 @@ impl BrowserAttachment {
 
     pub fn ax_tree(&self) -> &AxTreeSlot {
         &self.ax_tree
+    }
+
+    pub fn cursor_slot(&self) -> &CursorSlot {
+        &self.cursor_slot
     }
 
     pub fn surface_mode(&self) -> BrowserSurfaceMode {

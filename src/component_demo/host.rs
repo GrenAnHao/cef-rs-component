@@ -13,7 +13,8 @@ use rust_cef_gpui::{
         BrowserConfig, BrowserCursor, BrowserId, BrowserOptions, BrowserSurfaceMode,
         NativeChildHwndConfig, PixelRect, ProfileStorage, RuntimeConfig, RuntimeFiles,
         RuntimeSettings, RuntimeState, SessionState, ShortcutFilter, ShortcutId, ShortcutRule,
-        ThreadMode, TrustedContentPolicy, Viewport,
+        ThreadMode, TrustedContentPolicy, Viewport, step_canonical_zoom_level,
+        zoom_level_to_percent,
     },
     custom_schemes::{CustomSchemeConfig, CustomSchemeOptions, MemoryAsset, SchemeAssetSource},
     dispatcher::{self, UiWakeReceiver, UiWakeSender},
@@ -263,20 +264,23 @@ impl DemoView {
         }
     }
 
-    fn zoom_level(&self, cx: &App) -> f64 {
+    fn step_zoom(&self, steps: i32, window: &mut Window, cx: &mut App) {
         match self {
-            Self::Osr(v) => v.read(cx).zoom_level(),
-            Self::Native(v) => v.read(cx).zoom_level(),
+            Self::Osr(v) => v.update(cx, |b, cx| b.step_zoom(steps, window, cx)),
+            Self::Native(v) => {
+                let _ = v.update(cx, |b, _| {
+                    let next = step_canonical_zoom_level(b.zoom_level(), steps);
+                    b.set_zoom_level(next)
+                });
+            }
         }
     }
 
-    fn set_zoom_level(&self, cx: &mut App, level: f64) {
+    fn reset_zoom(&self, window: &mut Window, cx: &mut App) {
         match self {
-            Self::Osr(v) => {
-                let _ = v.update(cx, |b, _| b.set_zoom_level(level));
-            }
+            Self::Osr(v) => v.update(cx, |b, cx| b.reset_zoom(window, cx)),
             Self::Native(v) => {
-                let _ = v.update(cx, |b, _| b.set_zoom_level(level));
+                let _ = v.update(cx, |b, _| b.set_zoom_level(0.0));
             }
         }
     }
@@ -332,6 +336,7 @@ impl Render for Root {
             && let Some(view) = self.browser.as_ref()
         {
             let (cursor, zoom, muted, tooltip, status) = view.ux_summary(cx);
+            let zoom_pct = zoom_level_to_percent(zoom).round() as i32;
             let minus_view = view.clone();
             let reset_view = view.clone();
             let plus_view = view.clone();
@@ -354,9 +359,8 @@ impl Render for Root {
                         .bg(rgb(0x374151))
                         .on_mouse_down(
                             MouseButton::Left,
-                            cx.listener(move |_this, _, _, cx| {
-                                let next = (minus_view.zoom_level(cx) - 0.5).clamp(-5.0, 5.0);
-                                minus_view.set_zoom_level(cx, next);
+                            cx.listener(move |_this, _, window, cx| {
+                                minus_view.step_zoom(-1, window, cx);
                                 cx.notify();
                             }),
                         )
@@ -369,12 +373,12 @@ impl Render for Root {
                         .bg(rgb(0x374151))
                         .on_mouse_down(
                             MouseButton::Left,
-                            cx.listener(move |_this, _, _, cx| {
-                                reset_view.set_zoom_level(cx, 0.0);
+                            cx.listener(move |_this, _, window, cx| {
+                                reset_view.reset_zoom(window, cx);
                                 cx.notify();
                             }),
                         )
-                        .child(format!("Zoom {zoom:.2}")),
+                        .child(format!("Zoom {zoom_pct}%")),
                 )
                 .child(
                     div()
@@ -383,9 +387,8 @@ impl Render for Root {
                         .bg(rgb(0x374151))
                         .on_mouse_down(
                             MouseButton::Left,
-                            cx.listener(move |_this, _, _, cx| {
-                                let next = (plus_view.zoom_level(cx) + 0.5).clamp(-5.0, 5.0);
-                                plus_view.set_zoom_level(cx, next);
+                            cx.listener(move |_this, _, window, cx| {
+                                plus_view.step_zoom(1, window, cx);
                                 cx.notify();
                             }),
                         )
@@ -538,8 +541,8 @@ fn native_diagnostics(
 
 fn apply_demo_shortcut(zoom: f64, muted: bool, id: ShortcutId) -> (Option<f64>, Option<bool>) {
     match id.0 {
-        1 => (Some((zoom + 0.5).clamp(-5.0, 5.0)), None),
-        2 => (Some((zoom - 0.5).clamp(-5.0, 5.0)), None),
+        1 => (Some(step_canonical_zoom_level(zoom, 1)), None),
+        2 => (Some(step_canonical_zoom_level(zoom, -1)), None),
         3 => (Some(0.0), None),
         4 => (None, Some(!muted)),
         _ => (None, None),
@@ -586,7 +589,9 @@ async fn live(
         f32::from(available.width).round(),
         f32::from(available.height).round(),
     );
-    if [width, height]
+    let top_dip = if config.ux_controls { 28.0 } else { 0.0 };
+    let browser_height = (height - top_dip).max(1.0);
+    if [width, browser_height]
         .into_iter()
         .any(|v| !v.is_finite() || v < 1.0 || v >= i32::MAX as f32)
         || !scale.is_finite()
@@ -596,7 +601,7 @@ async fn live(
     }
     let viewport = Viewport {
         width: width as i32,
-        height: height as i32,
+        height: browser_height as i32,
         scale,
     };
     println!(
@@ -633,7 +638,8 @@ async fn live(
     } else {
         gpui_cef_poc::demo_url()
     };
-    let mut options = BrowserOptions::default();
+    let mut options =
+        BrowserOptions::default().with_frame_rate(rust_cef_gpui::recommended_windowless_frame_rate());
     if config.ux_controls {
         options = options
             .with_tooltip_events(true)
@@ -708,43 +714,44 @@ async fn live(
         let demo_view = match config.host_mode {
             HostMode::Osr => {
                 let view = CefBrowser::new(attachment, window, cx).map_err(|e| e.to_string())?;
-                if config.ux_controls || config.js_bridge_page {
-                    let _ = view.update(cx, |view, _| {
-                        if config.ux_controls {
-                            view.set_on_shortcut(Some(Box::new(|id, view, _, cx| {
-                                let (z, m) =
-                                    apply_demo_shortcut(view.zoom_level(), view.audio_muted(), id);
-                                if let Some(next) = z {
-                                    let _ = view.set_zoom_level(next);
+                let _ = view.update(cx, |view, _| {
+                    view.set_pinch_zoom_enabled(true);
+                    view.set_ctrl_wheel_zoom_enabled(true);
+                    if config.ux_controls {
+                        view.set_on_shortcut(Some(Box::new(|id, view, window, cx| {
+                            match id.0 {
+                                1 => view.step_zoom(1, window, cx),
+                                2 => view.step_zoom(-1, window, cx),
+                                3 => view.reset_zoom(window, cx),
+                                4 => {
+                                    let _ = view.set_audio_muted(!view.audio_muted());
                                 }
-                                if let Some(muted) = m {
-                                    let _ = view.set_audio_muted(muted);
-                                }
-                                cx.notify();
-                            })));
-                        }
-                        if config.js_bridge_page {
-                            view.set_on_js_message(Some(Box::new(
-                                |origin, payload, view, _, _| {
-                                    println!(
-                                        "COMPONENT_DEMO_JS_MSG origin={origin} bytes={}",
-                                        payload.len()
-                                    );
-                                    let _ = view.post_js_message(r#"{"from":"host","ack":true}"#);
-                                    let _ = view.evaluate_script(
-                                        "document.title",
-                                        JsFrameScope::MainFrame,
-                                        2000,
-                                    );
-                                },
-                            )));
-                            view.set_on_eval_completed(Some(Box::new(|id, outcome, _, _, _| {
-                                let ok = matches!(outcome, EvalOutcome::Value(_));
-                                println!("COMPONENT_DEMO_EVAL id={} ok={ok}", id.sequence);
-                            })));
-                        }
-                    });
-                }
+                                _ => {}
+                            }
+                            cx.notify();
+                        })));
+                    }
+                    if config.js_bridge_page {
+                        view.set_on_js_message(Some(Box::new(
+                            |origin, payload, view, _, _| {
+                                println!(
+                                    "COMPONENT_DEMO_JS_MSG origin={origin} bytes={}",
+                                    payload.len()
+                                );
+                                let _ = view.post_js_message(r#"{"from":"host","ack":true}"#);
+                                let _ = view.evaluate_script(
+                                    "document.title",
+                                    JsFrameScope::MainFrame,
+                                    2000,
+                                );
+                            },
+                        )));
+                        view.set_on_eval_completed(Some(Box::new(|id, outcome, _, _, _| {
+                            let ok = matches!(outcome, EvalOutcome::Value(_));
+                            println!("COMPONENT_DEMO_EVAL id={} ok={ok}", id.sequence);
+                        })));
+                    }
+                });
                 DemoView::Osr(view)
             }
             HostMode::NativeHwnd => {
@@ -969,8 +976,18 @@ async fn live(
             .update(cx, |root, _, _| Ok::<_, String>(root.browser.clone()))
             .map_err(|e| e.to_string())??;
         if let Some(view) = view {
-            root.update(cx, |_root, window, cx| view.consume(window, cx))
-                .map_err(|e| e.to_string())??;
+            root.update(cx, |_root, window, cx| {
+                let res = view.consume(window, cx);
+                if let DemoView::Osr(v) = &view {
+                    let _ = v.update(cx, |b, cx| {
+                        if b.diagnostics().input.pending {
+                            let _ = b.retry_input(window, cx);
+                        }
+                    });
+                }
+                res
+            })
+            .map_err(|e| e.to_string())??;
         }
         // Feed every pending menu update into the component presenter before
         // writing the receipt so the receipt reflects the current turn.
@@ -1462,6 +1479,20 @@ async fn drive(
             "component demo termination evidence incomplete: {d:?}, created={created}, closed={closed}, budget={budget}, images={images:?}"
         );
         return 1;
+    }
+    if let Some(released) = life.released.as_ref()
+        && released.zoom_gate.requests > 0
+    {
+        let stats = released.zoom_gate;
+        println!(
+            "COMPONENT_DEMO_ZOOM_GATE requests={} dispatched={} coalesced={} frame_ack_flushes={} timeout_flushes={} final_zoom_pct={}",
+            stats.requests,
+            stats.dispatched,
+            stats.coalesced,
+            stats.frame_ack_flushes,
+            stats.timeout_flushes,
+            zoom_level_to_percent(f64::from(released.zoom_level_milli) / 1000.0).round() as i32,
+        );
     }
     println!(
         "COMPONENT_DEMO_STOP mode={:?} backend={:?} main={} ui={} shutdown_thread={} pump={} created={created} closed={closed} tasks={} images={} final_cpu={budget} shutdown={} native_after={}",

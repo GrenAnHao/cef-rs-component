@@ -64,7 +64,9 @@ mod windows {
             let center = ((240 / 2) * 320 + 320 / 2) * 4;
             if f.info.width == 320
                 && f.info.height == 240
-                && f.pixels.get(center..center + 4) == Some(&[126, 76, 26, 255])
+                && f.cpu_pixels()
+                    .and_then(|px| px.get(center..center + 4))
+                    == Some(&[126, 76, 26, 255])
             {
                 self.blue.store(true, Ordering::Release);
             }

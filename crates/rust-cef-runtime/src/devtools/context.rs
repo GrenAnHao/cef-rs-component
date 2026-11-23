@@ -2,7 +2,9 @@
 //! Rust Arc checkouts never AddRef CEF. Last original-UI Drop releases the wrapper
 //! BEFORE its book gate; client/native/window gates cannot retire across it.
 use super::{AuxiliaryId, DevToolsLedger};
-use crate::{menu_bridge::Scope, registry::UiRegistry};
+#[cfg(feature = "test-support")]
+use crate::menu_bridge::Scope;
+use crate::registry::UiRegistry;
 use cef::*;
 use rust_cef_core::ports::EngineError;
 use std::sync::{
@@ -53,6 +55,7 @@ impl<T> Drop for ExpectedContext<T> {
     }
 }
 impl ExpectedContext {
+    #[cfg(feature = "test-support")]
     pub fn capture(
         registry: &Arc<UiRegistry>,
         id: AuxiliaryId,

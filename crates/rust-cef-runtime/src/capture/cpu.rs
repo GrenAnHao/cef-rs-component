@@ -69,10 +69,7 @@ impl FrameCapture for CpuCapture {
             .ok_or_else(|| frame_error(FrameError::InvalidDimensions))?;
         let mut output = self.budget.allocate(len).map_err(frame_error)?;
         input.copy_bgra(output.as_mut_slice())?;
-        Ok(OwnedFrame {
-            info,
-            pixels: output.freeze(),
-        })
+        Ok(OwnedFrame::from_cpu_pixels(info, output.freeze()))
     }
 }
 
@@ -126,7 +123,10 @@ mod tests {
         .unwrap();
         pixels.fill(0);
         assert_eq!(budget.stats().used, 8);
-        assert_eq!(frame.pixels.as_slice(), &[1, 2, 3, 127, 4, 5, 6, 255]);
+        assert_eq!(
+            frame.cpu_pixels().unwrap().as_slice(),
+            &[1, 2, 3, 127, 4, 5, 6, 255]
+        );
         mailbox.publish(frame).unwrap();
         assert_eq!(
             mailbox.latest(SurfaceKind::View).unwrap().info,

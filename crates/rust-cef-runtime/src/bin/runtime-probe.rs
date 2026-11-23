@@ -410,7 +410,10 @@ mod windows {
             } else {
                 width == 320
                     && height == 240
-                    && frame.pixels.get(center..center + 4) == Some(&[126, 76, 26, 255])
+                    && frame
+                        .cpu_pixels()
+                        .and_then(|px| px.get(center..center + 4))
+                        == Some(&[126, 76, 26, 255])
             };
             if valid {
                 if self
@@ -460,6 +463,9 @@ mod windows {
                 .take_update()
                 .ok_or("first frame source update missing")?;
             let frame = update.view.frame.as_ref().ok_or("source VIEW slot empty")?;
+            let pixels = frame
+                .cpu_pixels()
+                .ok_or("FrameSource actual VIEW expected CPU pixels")?;
             let center = ((240 / 2) * 320 + 320 / 2) * 4;
             if update.browser != browser
                 || update.closed
@@ -473,8 +479,8 @@ mod windows {
                 || frame.info.width != 320
                 || frame.info.height != 240
                 || frame.info.format != rust_cef_runtime::ports::PixelFormat::PremultipliedBgra8
-                || frame.pixels.len() != 320 * 240 * 4
-                || frame.pixels.get(center..center + 4) != Some(&[126, 76, 26, 255])
+                || pixels.len() != 320 * 240 * 4
+                || pixels.get(center..center + 4) != Some(&[126, 76, 26, 255])
             {
                 return Err("FrameSource actual VIEW identity/layout/BGRA witness failed".into());
             }
@@ -482,7 +488,7 @@ mod windows {
                 .frame_budget_stats(browser)
                 .map_err(|e| format!("frame budget: {e:?}"))?;
             if stats.limit != rust_cef_core::frame_budget::DEFAULT_CPU_FRAME_BUDGET
-                || stats.used < frame.pixels.len()
+                || stats.used < pixels.len()
                 || stats.used > stats.limit
                 || stats.peak < stats.used
                 || stats.peak > stats.limit
@@ -513,7 +519,7 @@ mod windows {
                         && live_capture.maps >= live_capture.d3d11_captures
                         && live_capture.maps == live_capture.unmaps
                         && live_capture.live_imports == 0
-                        && live_capture.staging_bytes >= frame.pixels.len() as u64
+                        && live_capture.staging_bytes >= pixels.len() as u64
                         && live_capture.native_resources_live
                 }
                 _ => false,
@@ -532,7 +538,7 @@ mod windows {
             Ok(Self {
                 browser,
                 source,
-                pixels: frame.pixels.clone(),
+                pixels: pixels.clone(),
                 generation: update.view.generation,
                 sequence: frame.info.sequence,
                 live_used: stats.used,
@@ -808,8 +814,8 @@ mod windows {
                 && frame.info.surface_generation == before.info.surface_generation
                 && (frame.info.width, frame.info.height) == (320, 240)
                 && frame
-                    .pixels
-                    .get(4 * (120 * 320 + 160)..4 * (120 * 320 + 160) + 4)
+                    .cpu_pixels()
+                    .and_then(|px| px.get(4 * (120 * 320 + 160)..4 * (120 * 320 + 160) + 4))
                     == Some(&[126, 76, 26, 255])
                 && survivor.snapshot().is_ready()
                 && observations.closed.load(Ordering::Acquire) == 1
@@ -988,8 +994,8 @@ mod windows {
                 && frame.info.surface_generation == before.surface_generation
                 && (frame.info.width, frame.info.height) == (320, 240)
                 && frame
-                    .pixels
-                    .get(4 * (120 * 320 + 160)..4 * (120 * 320 + 160) + 4)
+                    .cpu_pixels()
+                    .and_then(|px| px.get(4 * (120 * 320 + 160)..4 * (120 * 320 + 160) + 4))
                     == Some(&[126, 76, 26, 255])
             {
                 return Ok(SourceVisitorDrain {
@@ -1035,8 +1041,8 @@ mod windows {
                     && frame.info.surface_generation == before.surface_generation
                     && (frame.info.width, frame.info.height) == (before.width, before.height)
                     && frame
-                        .pixels
-                        .get(4 * (120 * 320 + 160)..4 * (120 * 320 + 160) + 4)
+                        .cpu_pixels()
+                        .and_then(|px| px.get(4 * (120 * 320 + 160)..4 * (120 * 320 + 160) + 4))
                         == Some(&[126, 76, 26, 255])
                 {
                     peer.submit(rust_cef_runtime::ports::BrowserCommand::SetFocus(true))
@@ -1245,8 +1251,8 @@ mod windows {
                 && frame.info.surface == SurfaceKind::View
                 && (frame.info.width, frame.info.height) == (320, 240)
                 && frame
-                    .pixels
-                    .get(4 * (120 * 320 + 160)..4 * (120 * 320 + 160) + 4)
+                    .cpu_pixels()
+                    .and_then(|px| px.get(4 * (120 * 320 + 160)..4 * (120 * 320 + 160) + 4))
                     == Some(&[126, 76, 26, 255])
         };
         let retained = old_source
@@ -1445,8 +1451,8 @@ mod windows {
                 && new.info.sequence > good.1
                 && (new.info.width, new.info.height) == (320, 240)
                 && new
-                    .pixels
-                    .get(4 * (120 * 320 + 160)..4 * (120 * 320 + 160) + 4)
+                    .cpu_pixels()
+                    .and_then(|px| px.get(4 * (120 * 320 + 160)..4 * (120 * 320 + 160) + 4))
                     == Some(&[126, 76, 26, 255])
             {
                 let diag = runtime
@@ -1565,11 +1571,11 @@ mod windows {
             && frame.info.surface == SurfaceKind::View
             && (frame.info.width, frame.info.height) == (320, 240)
             && frame.info.format == rust_cef_runtime::ports::PixelFormat::PremultipliedBgra8
-            && frame.pixels.len() == 320 * 240 * 4
-            && frame
-                .pixels
-                .get(4 * (120 * 320 + 160)..4 * (120 * 320 + 160) + 4)
-                == Some(&[126, 76, 26, 255])
+            && frame.cpu_pixels().is_some_and(|px| {
+                px.len() == 320 * 240 * 4
+                    && px.get(4 * (120 * 320 + 160)..4 * (120 * 320 + 160) + 4)
+                        == Some(&[126, 76, 26, 255])
+            })
     }
 
     fn measure_capture_timing(
@@ -2420,7 +2426,7 @@ mod windows {
                 )?);
             }
             if options.scenario == ProbeScenario::MenuDevTools {
-                let mut proof = report.menu_devtools.insert(Default::default());
+                let proof = report.menu_devtools.insert(Default::default());
                 crate::menu_devtools::exercise(
                     &mut runtime,
                     options.mode,
@@ -2430,7 +2436,7 @@ mod windows {
                 )?;
             }
             if options.scenario == ProbeScenario::AuxDevTools {
-                let mut proof = report.aux_devtools.insert(Default::default());
+                let proof = report.aux_devtools.insert(Default::default());
                 crate::aux_devtools::exercise(
                     &mut runtime,
                     options.mode,

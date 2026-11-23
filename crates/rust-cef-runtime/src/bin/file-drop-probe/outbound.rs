@@ -113,8 +113,8 @@ pub fn exercise(
                 && frame.info.width == 320
                 && frame.info.height == 240
                 && frame
-                    .pixels
-                    .get(4 * (320 * 120 + 160)..4 * (320 * 120 + 160) + 4)
+                    .cpu_pixels()
+                    .and_then(|px| px.get(4 * (320 * 120 + 160)..4 * (320 * 120 + 160) + 4))
                     == Some(&[70, 130, 44, 255])
             {
                 recovered = Some(frame.info.sequence);

@@ -664,7 +664,7 @@ impl MenuFocusRegistration {
             if let Some(b) = weak.upgrade() {
                 if b.current.get() == Some(request) && !b.owns_focus(window, cx) {
                     if window.window_handle() == b.window
-                        && window.is_window_active()
+                        && crate::native_view::is_window_effectively_active(window)
                         && b.browser_focus.is_focused(window)
                     {
                         let cancel = {

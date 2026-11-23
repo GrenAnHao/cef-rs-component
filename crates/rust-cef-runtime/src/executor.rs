@@ -132,6 +132,12 @@ pub(crate) enum TaskPayload {
         ticket: crate::resize::ResizeTicket,
     },
     Command(CommandEnvelope),
+    DrainMouseMoves {
+        browser: BrowserId,
+    },
+    ApplyZoom {
+        browser: BrowserId,
+    },
     InputReset(rust_cef_core::ports::CommandId),
     Close {
         browser: BrowserId,
@@ -155,6 +161,7 @@ pub(crate) enum TaskPayload {
     /// step; this payload carries only the original Browser identity.
     OpenDevTools {
         browser: BrowserId,
+        inspect_at: Option<(i32, i32)>,
     },
     /// Host-initiated close of the associated DevTools browser. Mirrors
     /// CefBrowserHostWrapper::CloseDevTools.
@@ -174,6 +181,7 @@ pub(crate) enum TaskPayload {
     /// captured cancel callbacks after every registry lock is released.
     DrainRequests,
     /// Opaque reservation only, never a native callback or borrowed menu.
+    #[cfg(feature = "test-support")]
     MenuCancel(crate::menu_native::MenuCancel),
     MenuReply(crate::menu_native::MenuCancel),
     #[cfg(feature = "test-support")]
@@ -635,7 +643,7 @@ impl Executor {
         }
         let sequence = self
             .next_task
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |next| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |next| {
                 next.checked_add(1)
             })
             .map_err(|_| EngineError::Backend { code: None })?;

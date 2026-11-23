@@ -4,8 +4,8 @@
 //! explicit test-support deferred-menu fixture, not the default client handler.
 use crate::executor::NativeAudit;
 use cef::{
-    ImplRunContextMenuCallback, ImplRunQuickMenuCallback, RunContextMenuCallback,
-    RunQuickMenuCallback, ThreadId, currently_on,
+    ImplRunContextMenuCallback, RunContextMenuCallback, RunQuickMenuCallback, ThreadId,
+    currently_on,
 };
 use rust_cef_core::{
     contracts::BrowserId,
@@ -28,9 +28,6 @@ use std::{
 
 enum Reply {
     Native(RunContextMenuCallback),
-    /// Windowless browsers request the quick menu; the continuation is a separate
-    /// CEF type with the same Continue/Cancel contract.
-    Quick(RunQuickMenuCallback),
     #[cfg(test)]
     Test(Box<dyn FnOnce() + Send>),
 }
@@ -92,7 +89,7 @@ pub struct MenuCancel {
 #[derive(Debug)]
 pub(crate) enum MenuOpenError {
     Unavailable,
-    Request(MenuRequestError),
+    Request(#[allow(dead_code)] MenuRequestError),
 }
 
 struct State {
@@ -102,7 +99,9 @@ struct State {
     pending_ids: std::collections::BTreeMap<BrowserId, u64>,
     work_counts: std::collections::BTreeMap<BrowserId, u64>,
     callbacks: u64,
-    /// Latest windowless quick-menu continuation, if one is outstanding.
+    /// Latest windowless quick-menu continuation, retained to keep the CEF
+    /// callback reference alive until replaced or dropped.
+    #[allow(dead_code)]
     quick: Option<RunQuickMenuCallback>,
 }
 pub(crate) struct NativeMenus {
@@ -167,6 +166,7 @@ impl NativeMenus {
             + s.work_counts.get(&browser).copied().unwrap_or(0)
             + s.callbacks
     }
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn is_active(&self, browser: BrowserId) -> bool {
         self.lock().active.iter().any(|(b, _)| *b == browser)
     }
@@ -195,9 +195,6 @@ impl NativeMenus {
         s.callbacks += 0; // continuation lifetimes are owned by the reply below
         s.quick = Some(callback.clone());
         true
-    }
-    pub(crate) fn take_quick(&self) -> Option<RunQuickMenuCallback> {
-        self.lock().quick.take()
     }
     pub(crate) fn open(
         &self,
@@ -248,10 +245,12 @@ impl NativeMenus {
             )),
         }
     }
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn can_capture(&self) -> bool {
         let s = self.lock();
         s.book.is_some() && self.faults.load(Ordering::Acquire) == 0
     }
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn reserve_cancel(
         &self,
         id: ContextMenuRequestId,
@@ -288,6 +287,7 @@ impl NativeMenus {
             .as_mut()
             .is_some_and(|b| b.rollback(ticket.token))
     }
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn take_cancel(&self, ticket: MenuCancel) -> Option<MenuWork> {
         self.take_reply(ticket).map(|(work, _)| work)
     }
@@ -368,9 +368,61 @@ impl MenuWork {
     pub(crate) fn cancel(self, audit: &NativeAudit) {
         self.finish(audit, || {});
     }
+    pub(crate) fn continue_native(
+        mut self,
+        audit: &NativeAudit,
+        command_id: i32,
+        on_valid: impl FnOnce() -> bool,
+    ) {
+        let payload = self.payload.as_mut().expect("owned menu work");
+        let native = matches!(payload.reply, Some(Reply::Native(_)));
+        if native && currently_on(ThreadId::UI) == 0 {
+            return;
+        }
+        {
+            let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if !s.active.insert((self.id.browser, self.id.sequence)) {
+                self.faults.fetch_max(1, Ordering::AcqRel);
+                return;
+            }
+        }
+        let valid = on_valid();
+        #[cfg(feature = "test-support")]
+        if let Some(p) = &payload.probe {
+            p.cancelling(self.id.sequence);
+        }
+        match payload.reply.take().expect("retained answer") {
+            Reply::Native(callback) => {
+                audit.record();
+                if valid {
+                    callback.cont(
+                        command_id,
+                        cef::EventFlags::from(cef::sys::cef_event_flags_t::EVENTFLAG_NONE),
+                    );
+                } else {
+                    callback.cancel();
+                }
+                drop(callback);
+            }
+            #[cfg(test)]
+            Reply::Test(answer) => answer(),
+        }
+        #[cfg(feature = "test-support")]
+        if let Some(p) = &payload.probe {
+            p.returned(self.id.sequence);
+        }
+        if let Some(scope) = &payload.scope {
+            if valid {
+                scope.note_action();
+            } else {
+                scope.note_cancel();
+            }
+            scope.terminal(self.id);
+        }
+    }
     pub(crate) fn finish(mut self, audit: &NativeAudit, action: impl FnOnce()) {
         let payload = self.payload.as_mut().expect("owned menu work");
-        let native = matches!(payload.reply, Some(Reply::Native(_) | Reply::Quick(_)));
+        let native = matches!(payload.reply, Some(Reply::Native(_)));
         if native && currently_on(ThreadId::UI) == 0 {
             return;
         }
@@ -390,11 +442,6 @@ impl MenuWork {
                 audit.record();
                 callback.cancel();
                 // Still in-flight/active during the last native Release too.
-                drop(callback);
-            }
-            Reply::Quick(callback) => {
-                audit.record();
-                callback.cancel();
                 drop(callback);
             }
             #[cfg(test)]

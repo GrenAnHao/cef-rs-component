@@ -166,6 +166,12 @@ impl Session {
                 }
                 touch.validate_and_normalize()?;
             }
+            BrowserCommand::DragTarget(cmd) => {
+                if self.input_retired {
+                    return Err(EngineError::Backend { code: None });
+                }
+                cmd.validate()?;
+            }
             BrowserCommand::SetNativeBounds(rect) => {
                 if !self.config.options.surface_mode.is_native_child_hwnd() || !rect.is_valid() {
                     return Err(EngineError::InvalidRequest);
@@ -182,9 +188,11 @@ impl Session {
             && matches!(
                 &command,
                 BrowserCommand::SetViewport(_)
+                    | BrowserCommand::SetScreenOrigin { .. }
                     | BrowserCommand::MouseClick(_)
                     | BrowserCommand::Input(_)
                     | BrowserCommand::TouchEvent(_)
+                    | BrowserCommand::DragTarget(_)
                     | BrowserCommand::FinishOutboundDrag(_)
             )
         {

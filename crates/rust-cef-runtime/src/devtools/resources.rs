@@ -54,82 +54,6 @@ struct NativeResource {
     book: Arc<DevToolsLedger>,
 }
 impl NativeResource {
-    fn window_handle(&self, registry: &UiRegistry) -> Result<usize, EngineError> {
-        if self.ui != std::thread::current().id() || self.retiring.load(Ordering::Acquire) {
-            return Err(EngineError::Closed);
-        }
-        let reference = {
-            self.browser
-                .lock()
-                .unwrap_or_else(|e| {
-                    self.book.fault();
-                    e.into_inner()
-                })
-                .as_ref()
-                .cloned()
-        }
-        .ok_or(EngineError::Closed)?;
-        let browser = reference.browser.as_ref().ok_or(EngineError::Closed)?;
-        registry.note_auxiliary_native_call();
-        if browser.is_valid() == 0 {
-            return Err(EngineError::Closed);
-        }
-        registry.note_auxiliary_native_call();
-        if browser.identifier() != self.native_id {
-            return Err(EngineError::InvalidRequest);
-        }
-        if self.retiring.load(Ordering::Acquire) {
-            return Err(EngineError::Closed);
-        }
-        registry.note_auxiliary_native_call();
-        let host = browser.host().ok_or(EngineError::Closed)?;
-        drop(reference);
-        if self.retiring.load(Ordering::Acquire) {
-            return Err(EngineError::Closed);
-        }
-        // Negative SDK defaults (notably has_view/windowless == 0) must not
-        // qualify a missing API. Only this native Chrome, non-Views/windowed
-        // shape is supported; full Show ownership/role admission is still needed.
-        let api = unsafe { host.get_raw().as_ref() }.ok_or(EngineError::InvalidRequest)?;
-        if api.get_window_handle.is_none()
-            || api.get_runtime_style.is_none()
-            || api.has_view.is_none()
-            || api.is_window_rendering_disabled.is_none()
-        {
-            return Err(EngineError::InvalidRequest);
-        }
-        registry.note_auxiliary_native_call();
-        if host.runtime_style() != RuntimeStyle::CHROME {
-            return Err(EngineError::InvalidRequest);
-        }
-        if self.retiring.load(Ordering::Acquire) {
-            return Err(EngineError::Closed);
-        }
-        registry.note_auxiliary_native_call();
-        if host.has_view() != 0 {
-            return Err(EngineError::InvalidRequest);
-        }
-        if self.retiring.load(Ordering::Acquire) {
-            return Err(EngineError::Closed);
-        }
-        registry.note_auxiliary_native_call();
-        if host.is_window_rendering_disabled() != 0 {
-            return Err(EngineError::InvalidRequest);
-        }
-        if self.retiring.load(Ordering::Acquire) {
-            return Err(EngineError::Closed);
-        }
-        registry.note_auxiliary_native_call();
-        let hwnd = host.window_handle().0 as usize;
-        drop(host);
-        if self.retiring.load(Ordering::Acquire) {
-            return Err(EngineError::Closed);
-        }
-        if hwnd == 0 {
-            return Err(EngineError::NotReady);
-        }
-        Ok(hwnd)
-    }
     fn close(&self, registry: &UiRegistry) -> Result<(), EngineError> {
         if self.ui != std::thread::current().id() {
             return Err(EngineError::InvalidRequest);
@@ -309,27 +233,6 @@ impl NativeAuxiliaries {
         }
         .ok_or(EngineError::InvalidRequest)?;
         resource.close(registry)
-    }
-    /// Exact created auxiliary only, after Show's creation stack has returned.
-    /// Neither parent Browser nor GetForegroundWindow is a fallback.
-    pub fn window_handle(
-        &self,
-        registry: &UiRegistry,
-        id: AuxiliaryId,
-        native_id: i32,
-    ) -> Result<usize, EngineError> {
-        registry.note_auxiliary_native_call();
-        if currently_on(ThreadId::UI) == 0 {
-            return Err(EngineError::InvalidRequest);
-        }
-        let resource = {
-            let rows = self.lock();
-            rows.get(&id.owner)
-                .filter(|r| r.id == id && r.native_id == native_id)
-                .cloned()
-        }
-        .ok_or(EngineError::InvalidRequest)?;
-        resource.window_handle(registry)
     }
     pub fn is_empty(&self) -> bool {
         let empty = self.lock().is_empty();

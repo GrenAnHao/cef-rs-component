@@ -397,7 +397,7 @@ pub fn run(
             return Ok(false);
         }
         let off = (120 * frame.info.width as usize + 160) * 4;
-        Ok(frame.pixels.as_slice().get(off..off + 4) == Some(&BGRA_1A4C7E))
+        Ok(frame.cpu_pixels().and_then(|px| px.as_slice().get(off..off + 4)) == Some(&BGRA_1A4C7E))
     })?;
     report.pixel_verified = true;
 
@@ -471,7 +471,7 @@ pub fn run(
             return Ok(false);
         }
         let off = (120 * frame.info.width as usize + 160) * 4;
-        Ok(frame.pixels.as_slice().get(off..off + 4) == Some(&BGRA_2A5C8E))
+        Ok(frame.cpu_pixels().and_then(|px| px.as_slice().get(off..off + 4)) == Some(&BGRA_2A5C8E))
     })?;
 
     // 2a. Headless CDP method call (`Runtime.evaluate` -> 42) & trigger JS prompt.

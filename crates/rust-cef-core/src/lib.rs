@@ -3,6 +3,7 @@
 
 pub mod accessibility;
 pub mod contracts;
+pub mod cursor;
 pub mod custom_schemes;
 pub mod file_drop;
 pub mod find;
@@ -11,6 +12,7 @@ pub mod frame_layout;
 pub mod frame_store;
 pub mod host_capabilities;
 pub mod ime;
+pub mod inbound_drag;
 pub mod input;
 pub mod js_bridge;
 pub mod keymap;

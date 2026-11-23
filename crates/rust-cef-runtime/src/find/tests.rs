@@ -162,6 +162,8 @@ fn setup(
         epoch: 1,
         spelling_opening: 0,
         delivery: Arc::downgrade(&target.delivery),
+        target: crate::menu_bridge::TargetMenuContext::default(),
+        synthesized_target: false,
     });
     let book = Finds::new();
     book.configure(FindLimits {

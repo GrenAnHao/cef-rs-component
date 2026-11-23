@@ -13,9 +13,9 @@ pub use rust_cef_core::input::{
     MouseButton as InputMouseButton, TouchEventType, TouchPointerType, Utf16Range,
 };
 pub use rust_cef_core::{
-    accessibility as accessibility_contracts, contracts, custom_schemes, file_drop, find,
-    host_capabilities, ime, js_bridge, outbound_drag as outbound_drag_contracts, ports, print,
-    source_view as source, url_request as url_request_contracts,
+    accessibility as accessibility_contracts, contracts, cursor, custom_schemes, file_drop, find,
+    host_capabilities, ime, inbound_drag, js_bridge, outbound_drag as outbound_drag_contracts,
+    ports, print, source_view as source, url_request as url_request_contracts,
 };
 
 pub use rust_cef_ui::{
@@ -65,6 +65,8 @@ pub mod native_touch;
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 pub mod ole_drag;
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+pub mod ole_drop;
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 pub use rust_cef_runtime::{
     CdpDiagnostics, ContextMenuConfig, ContextMenuRegistration, ContextMenuStatus,
     CookieMutationStatus, CookieMutationTicket, CookieVisitStatus, CookieVisitTicket,
@@ -91,11 +93,13 @@ pub use native_touch::{NativeTouchDiagnostics, NativeTouchError, NativeTouchServ
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 pub use ole_drag::IntegratedPumpCallback;
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+pub use ole_drop::{NativeDropTargetDiagnostics, NativeDropTargetError, NativeDropTargetServices};
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 pub mod native_view;
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 pub use native_view::{
     NativeCefBrowser, NativeEvalCompletedCallback, NativeJsMessageCallback, NativeShortcutCallback,
-    NativeTakeFocusCallback, NativeViewDiagnostics, window_hwnd,
+    NativeTakeFocusCallback, NativeViewDiagnostics, recommended_windowless_frame_rate, window_hwnd,
 };
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 mod view;
@@ -104,7 +108,8 @@ pub use input::{InputCallback, InputCallbackDiagnostics, InputCallbackGate, Inpu
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 pub use view::{
     CefBrowser, EvalCompletedCallback, JsMessageCallback, OutboundDragCallback, PopupDiagnostics,
-    ShortcutCallback, TakeFocusCallback, ViewDiagnostics, ViewError, cursor_style_for,
+    ShortcutCallback, TakeFocusCallback, ViewDiagnostics, ViewError, ZoomGateStats,
+    cursor_style_for,
 };
 
 /// Test-only frame-probe surface for validation builds; never a stable API.

@@ -25,7 +25,10 @@ use crate::{
     contracts::{BrowserId, Viewport},
     frame_budget::{FrameBudget, FrameError},
     frame_layout::{FrameFormat, copy_rows},
-    ports::{FrameInfo, OwnedFrame, PixelFormat, SurfaceKind},
+    ports::{
+        FrameInfo, FramePayload, GpuSharedTextureFrame, OwnedFrame, PixelFormat, SurfaceKind,
+        TextureFormat,
+    },
 };
 
 /// VIEW/POPUP rectangle in DIP, with the surface origin CEF reports.
@@ -385,21 +388,31 @@ impl FrameMailbox {
         ) {
             return Err(FrameError::InvalidDimensions);
         }
-        Ok(OwnedFrame {
-            info,
-            pixels: buffer.freeze(),
-        })
+        Ok(OwnedFrame::from_cpu_pixels(info, buffer.freeze()))
     }
 
     /// Validates the whole frame identity and stores it as the newest slot.
     ///
     /// The check happens under this mailbox lock, so a resize or close that
     /// completed after `copy_frame` is rejected instead of reviving old pixels.
-    pub fn publish(&self, frame: OwnedFrame) -> Result<FramePublication, FrameError> {
+    pub fn publish(&self, mut frame: OwnedFrame) -> Result<FramePublication, FrameError> {
         let info = frame.info;
         let expected = validate_pixel_size(info.width, info.height)?;
-        if frame.pixels.len() != expected {
-            return Err(FrameError::InvalidDimensions);
+        match &mut frame.payload {
+            FramePayload::CpuBgra { buffer, .. } => {
+                if buffer.len() != expected {
+                    return Err(FrameError::InvalidDimensions);
+                }
+            }
+            FramePayload::GpuSharedTexture(gpu) => {
+                if gpu.width != info.width
+                    || gpu.height != info.height
+                    || gpu.format != TextureFormat::Bgra8888
+                {
+                    return Err(FrameError::InvalidDimensions);
+                }
+                gpu.frame_seq = info.sequence;
+            }
         }
         let mut inner = self.lock();
         if inner.closed {
@@ -408,9 +421,11 @@ impl FrameMailbox {
         if info.browser != inner.browser {
             return Err(FrameError::WrongIdentity);
         }
-        // Foreign budget pixels cannot be charged to this Browser's ledger.
-        if !frame.pixels.shares_ledger(&inner.budget) {
-            return Err(FrameError::WrongIdentity);
+        if let FramePayload::CpuBgra { buffer, .. } = &frame.payload {
+            // Foreign budget pixels cannot be charged to this Browser's ledger.
+            if !buffer.shares_ledger(&inner.budget) {
+                return Err(FrameError::WrongIdentity);
+            }
         }
         if info.format != PixelFormat::PremultipliedBgra8 {
             return Err(FrameError::WrongIdentity);
@@ -428,11 +443,44 @@ impl FrameMailbox {
         if info.sequence == 0 || info.sequence <= state.published_sequence {
             return Err(FrameError::OutOfOrder);
         }
+        if let FramePayload::GpuSharedTexture(gpu) = &frame.payload {
+            gpu.lease.tracker().publish_ready(gpu.slot_index);
+        }
         let frame = Arc::new(frame);
         state.frame = Some(frame.clone());
         state.published_sequence = info.sequence;
         let wake = inner.touch();
         Ok(FramePublication { frame, wake })
+    }
+
+    /// Publishes an external GPU shared-texture slot captured on `token`.
+    pub fn publish_gpu_frame(
+        &self,
+        token: &CaptureToken,
+        mut gpu: GpuSharedTextureFrame,
+    ) -> Result<FramePublication, FrameError> {
+        let info = token.info();
+        gpu.frame_seq = info.sequence;
+        let frame = OwnedFrame {
+            info,
+            payload: FramePayload::GpuSharedTexture(gpu),
+        };
+        self.publish(frame)
+    }
+
+    /// Reclaims an unconsumed GPU shared-texture frame in `surface`'s mailbox slot,
+    /// freeing its [`SharedTextureLease`] without clearing visibility or generation.
+    pub fn try_reclaim_unconsumed_gpu_slot(&self, surface: SurfaceKind) -> Option<usize> {
+        let mut inner = self.lock();
+        let state = inner.surface_mut(surface);
+        let reclaimed_slot = state
+            .frame
+            .as_ref()
+            .and_then(|frame| frame.gpu_texture().map(|gpu| gpu.slot_index));
+        if reclaimed_slot.is_some() {
+            state.frame = None;
+        }
+        reclaimed_slot
     }
 
     /// Reconfigures the VIEW target. An actual change advances the VIEW

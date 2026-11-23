@@ -102,3 +102,7 @@ rust-cef-ui = { path = "crates/rust-cef-ui" }
 cef = { git = "https://github.com/tauri-apps/cef-rs", rev = "7b6bf84e76e919790bd61df077e29dc4132eb5e2", default-features = false }
 gpui = { version = "=0.3.12", package = "gpui-pre", default-features = false, features = ["windows-manifest"] }
 gpui-component = { version = "=0.9.1", default-features = false }
+
+[patch.crates-io]
+gpui-pre = { path = "patches/gpui-pre" }
+gpui-pre-windows = { path = "patches/gpui-pre-windows" }

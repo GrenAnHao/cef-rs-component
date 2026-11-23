@@ -13,6 +13,7 @@ use std::{
 
 pub(crate) mod context;
 pub(crate) mod native;
+#[cfg(feature = "test-support")]
 pub(crate) mod prepare;
 pub(crate) mod resources;
 pub(crate) mod show;
@@ -295,6 +296,7 @@ impl DevToolsLedger {
     }
     /// Build the dedicated Rust-owned interface BEFORE native admission. A
     /// preparation error must not manufacture an irrevocably-issued operation.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn attach_prepared_client(
         &self,
         id: AuxiliaryId,
@@ -314,6 +316,7 @@ impl DevToolsLedger {
         row.client_profile = Some(profile);
         Ok(())
     }
+    #[cfg(any(test, feature = "test-support"))]
     pub fn preflight_reserved_origin(
         &self,
         id: AuxiliaryId,
@@ -336,6 +339,7 @@ impl DevToolsLedger {
     /// Pure abandonment first, interface destruction later and OUTSIDE locks.
     /// An extra interface clone keeps this Reserved row pending until its last
     /// same-UI field is actually gone. Close intent alone never clears a row.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn abandon_preissue(&self, id: AuxiliaryId) -> Result<(), EngineError> {
         let mut s = self.lock();
         let row = Self::row(&mut s, id)?;
@@ -626,6 +630,7 @@ impl DevToolsLedger {
     }
     /// Only a NEW explicit host retry may reopen admission after post rejection.
     /// Lifecycle supplements/drain/duplicate close intents never call this.
+    #[cfg(test)]
     pub fn retry_close(&self, id: AuxiliaryId) -> Result<(), EngineError> {
         let mut s = self.lock();
         let row = Self::row(&mut s, id)?;
@@ -642,6 +647,7 @@ impl DevToolsLedger {
         row.close_attempted = false;
         Ok(())
     }
+    #[cfg(test)]
     pub fn close_post_failures(&self) -> u64 {
         self.lock().close_post_failures
     }
@@ -668,6 +674,7 @@ impl DevToolsLedger {
     ) -> Result<(), EngineError> {
         self.resource_released(id, native_id, true)
     }
+    #[cfg(test)]
     pub(super) fn window_capture_ready(
         &self,
         id: AuxiliaryId,

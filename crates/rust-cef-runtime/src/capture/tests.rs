@@ -82,7 +82,7 @@ fn native_frame_input_failures_keep_source_good_pixels_and_budget() {
         PublishResult::Published
     );
     let good = source.latest(SurfaceKind::View).unwrap();
-    assert_eq!(good.pixels.as_slice(), texture.expected_bgra());
+    assert_eq!(good.cpu_pixels().unwrap().as_slice(), texture.expected_bgra());
     let mut bad = texture.info.clone();
     bad.format = cef::ColorType::NUM_VALUES;
     let result = publish(&endpoint, &source, &bad);
@@ -172,6 +172,14 @@ fn malformed_accelerated_geometry_does_not_enter_letterbox_or_gpu_io() {
             m.coded_size.width = 0;
             m.content_rect.width -= 1;
         }),
+        (CaptureFailureKind::InvalidDimensions, |m| {
+            m.coded_size.width = 16385;
+            m.visible_rect.width = 16385;
+            m.content_rect.width = 16385;
+        }),
+        (CaptureFailureKind::InvalidDimensions, |m| {
+            m.coded_size.height = 16385;
+        }),
     ];
     for &(kind, change) in cases {
         let mut bad = texture.info.clone();
@@ -244,7 +252,7 @@ fn native_capture_faults_unmap_and_never_publish_partial_or_removed_device_frame
             Arc::ptr_eq(&good, &source.latest(SurfaceKind::View).unwrap()),
             "{point:?}"
         );
-        assert_eq!(good.pixels.as_slice(), texture.expected_bgra());
+        assert_eq!(good.cpu_pixels().unwrap().as_slice(), texture.expected_bgra());
         assert_eq!(source.budget().stats().used, 16, "{point:?}");
     }
     endpoint.retire().unwrap();

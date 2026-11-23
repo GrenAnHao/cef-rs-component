@@ -909,8 +909,10 @@ impl Runtime {
         let browser = handle.snapshot().browser;
         let (source, surface_mode) = self.registry.claim_view_attachment(browser)?;
         let ax_tree = self.registry.ax_tree_slot(browser).unwrap_or_default();
+        let cursor_slot = self.registry.cursor_slot(browser).unwrap_or_default();
         Ok(BrowserAttachment::new(browser, handle.clone(), source)
             .with_ax_tree(ax_tree)
+            .with_cursor_slot(cursor_slot)
             .with_surface_mode(surface_mode))
     }
 
@@ -941,6 +943,26 @@ impl Runtime {
     pub fn open_devtools(&self, browser: BrowserId) -> Result<(), EngineError> {
         self.registry.open_devtools(browser)
     }
+    pub fn open_devtools_at(
+        &self,
+        browser: BrowserId,
+        inspect_x: i32,
+        inspect_y: i32,
+    ) -> Result<(), EngineError> {
+        self.registry
+            .open_devtools_at(browser, Some((inspect_x, inspect_y)))
+    }
+    /// Maps an OSR view-relative DIP coordinate to physical screen coordinates
+    /// if the host view has supplied a window screen origin.
+    pub fn browser_screen_point(
+        &self,
+        browser: BrowserId,
+        view_x: i32,
+        view_y: i32,
+    ) -> Option<(i32, i32)> {
+        self.registry.browser_screen_point(browser, view_x, view_y)
+    }
+
     pub fn devtools_tails(&self, browser: BrowserId) -> Option<String> {
         self.registry.devtools_tails(browser)
     }
@@ -1031,6 +1053,12 @@ impl Runtime {
     /// a checkable item and a one-level submenu, appended as host-managed items.
     pub fn configure_menu_structure(&self, enabled: bool) -> Result<(), EngineError> {
         self.registry.configure_menu_structure(enabled)
+    }
+    /// Host opt-in for standard browser page items (`Back`, `Forward`, `Reload`,
+    /// `Copy` on non-empty selection, `Select All`) when CEF's windowless OSR
+    /// menu has no edit commands (blank areas, links, non-editable text).
+    pub fn configure_menu_navigation(&self, enabled: bool) -> Result<(), EngineError> {
+        self.registry.configure_menu_navigation(enabled)
     }
     /// The host-managed structural command the last real selection landed on.
     pub fn host_menu_item(&self) -> Option<i32> {
@@ -1667,13 +1695,9 @@ impl Runtime {
                     ));
                 }
                 match config.render_preference {
-                    RenderPreference::SoftwareRequired | RenderPreference::D3d11Required => {}
-                    // Selection is explicit: no automatic software fallback is implemented.
-                    RenderPreference::Auto => {
-                        return Err(BrowserCreateError::UnsupportedBackend(
-                            config.render_preference,
-                        ));
-                    }
+                    RenderPreference::SoftwareRequired
+                    | RenderPreference::D3d11Required
+                    | RenderPreference::Auto => {}
                 }
             }
             BrowserSurfaceMode::NativeChildHwnd(native_cfg) => {

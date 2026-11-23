@@ -9,6 +9,8 @@ mod build_stamp;
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 mod capture;
 pub mod client;
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+mod cursor_win;
 pub mod deployment;
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 mod devtools;

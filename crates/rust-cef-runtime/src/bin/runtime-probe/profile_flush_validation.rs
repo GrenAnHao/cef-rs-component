@@ -339,8 +339,8 @@ impl FlushCase {
                 && f.info.surface_generation == generation
                 && (f.info.width, f.info.height) == (320, 240)
                 && f.info.sequence > w.survivor_frame_before
-                && f.pixels
-                    .get(4 * (120 * 320 + 160)..4 * (120 * 320 + 160) + 4)
+                && f.cpu_pixels()
+                    .and_then(|px| px.get(4 * (120 * 320 + 160)..4 * (120 * 320 + 160) + 4))
                     == Some(&[126, 76, 26, 255])
                 && rt
                     .probe_frame_state(b)
