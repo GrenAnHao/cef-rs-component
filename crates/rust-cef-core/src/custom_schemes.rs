@@ -14,6 +14,7 @@ pub const MAX_SCHEME_TOTAL_MEMORY_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_INTERCEPT_HEADERS: usize = 16;
 pub const MAX_HEADER_NAME_BYTES: usize = 128;
 pub const MAX_HEADER_VALUE_BYTES: usize = 2048;
+pub const MAX_INTERCEPT_POST_BODY_BYTES: usize = 64 * 1024;
 
 pub const CUSTOM_SCHEMES_SWITCH: &str = "rust-cef-custom-schemes";
 
@@ -221,6 +222,7 @@ pub struct InterceptRequest {
     pub url: String,
     pub method: String,
     pub is_main_frame: bool,
+    pub post_body: Option<Vec<u8>>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -261,10 +263,39 @@ impl fmt::Debug for InterceptAction {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResponseFilterStep {
+    NeedMoreData,
+    Done,
+    Error,
+}
+
+/// Streaming response body filter mirroring CefSharp `IResponseFilter`
+/// (`CefSharp/IResponseFilter.cs:14-40`). Implementations rewrite bytes from
+/// `input` into `output` and return `(bytes_read, bytes_written, status)`.
+pub trait ResponseBodyFilter: Send + Sync {
+    fn init(&mut self) -> bool {
+        true
+    }
+
+    fn filter(&mut self, input: &[u8], output: &mut [u8]) -> (usize, usize, ResponseFilterStep);
+}
+
 /// Optional host request interceptor. Invoked strictly on IO callbacks AFTER
 /// `TrustedContentPolicy` has already approved the request URL.
 pub trait ResourceInterceptor: Send + Sync {
     fn intercept(&self, request: &InterceptRequest) -> InterceptAction;
+
+    fn response_filter(
+        &self,
+        _info: &crate::contracts::ResourceResponseInfo,
+    ) -> Option<Box<dyn ResponseBodyFilter>> {
+        None
+    }
+
+    fn on_resource_response(&self, _info: &crate::contracts::ResourceResponseInfo) {}
+
+    fn on_resource_load_complete(&self, _info: &crate::contracts::ResourceLoadCompleteInfo) {}
 }
 
 pub fn validate_intercept_header(name: &str, value: &str) -> bool {

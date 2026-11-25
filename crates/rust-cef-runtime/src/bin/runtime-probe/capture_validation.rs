@@ -1316,8 +1316,8 @@ mod tests {
             if let Some(index) = bad {
                 buffer.as_mut_slice()[index] ^= 1;
             }
-            OwnedFrame {
-                info: rust_cef_runtime::ports::FrameInfo {
+            OwnedFrame::from_cpu_pixels(
+                rust_cef_runtime::ports::FrameInfo {
                     browser: BrowserId::new(
                         rust_cef_runtime::contracts::RuntimeGeneration::new(1),
                         1,
@@ -1329,8 +1329,8 @@ mod tests {
                     height: 8,
                     format: PixelFormat::PremultipliedBgra8,
                 },
-                pixels: buffer.freeze(),
-            }
+                buffer.freeze(),
+            )
         };
         assert!(valid_frame(&make_frame(None)));
         assert!(!valid_frame(&make_frame(Some(0))), "border is not exempt");

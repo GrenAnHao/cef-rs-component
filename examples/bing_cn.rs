@@ -240,6 +240,277 @@ mod win {
         }
     }
 
+    fn exercise_ole_drop_target_and_data_object(
+        hwnd: isize,
+        scale: f32,
+        handle: &BrowserHandle,
+    ) -> Result<(), String> {
+        use std::ffi::c_void;
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct ComPoint {
+            x: i32,
+            y: i32,
+        }
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct FormatEtc {
+            cf_format: u16,
+            ptd: *mut c_void,
+            dw_aspect: u32,
+            lindex: i32,
+            tymed: u32,
+        }
+        #[repr(C)]
+        struct StgMedium {
+            tymed: u32,
+            union_ptr: *mut c_void,
+            p_unk_for_release: *mut c_void,
+        }
+        #[repr(C)]
+        struct IDataObjectVtbl {
+            _qi: usize,
+            _add_ref: usize,
+            _release: usize,
+            get_data:
+                unsafe extern "system" fn(*mut c_void, *const FormatEtc, *mut StgMedium) -> i32,
+            _get_data_here: usize,
+            query_get_data: unsafe extern "system" fn(*mut c_void, *const FormatEtc) -> i32,
+        }
+        #[repr(C)]
+        struct IDropTargetVtbl {
+            _qi: usize,
+            _add_ref: usize,
+            _release: usize,
+            drag_enter: unsafe extern "system" fn(
+                *mut c_void,
+                *mut c_void,
+                u32,
+                ComPoint,
+                *mut u32,
+            ) -> i32,
+            drag_over: unsafe extern "system" fn(*mut c_void, u32, ComPoint, *mut u32) -> i32,
+            drag_leave: unsafe extern "system" fn(*mut c_void) -> i32,
+            drop: unsafe extern "system" fn(
+                *mut c_void,
+                *mut c_void,
+                u32,
+                ComPoint,
+                *mut u32,
+            ) -> i32,
+        }
+        #[link(name = "ole32")]
+        unsafe extern "system" {
+            fn OleInitialize(pv_reserved: *mut c_void) -> i32;
+            fn OleUninitialize();
+            fn ReleaseStgMedium(medium: *mut StgMedium);
+        }
+        #[link(name = "user32")]
+        unsafe extern "system" {
+            fn GetPropW(hwnd: *mut c_void, name: *const u16) -> *mut c_void;
+            fn ClientToScreen(hwnd: *mut c_void, pt: *mut ComPoint) -> i32;
+            fn RegisterClipboardFormatW(format: *const u16) -> u32;
+        }
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GlobalLock(mem: *mut c_void) -> *mut c_void;
+            fn GlobalUnlock(mem: *mut c_void) -> i32;
+            fn GlobalSize(mem: *mut c_void) -> usize;
+        }
+
+        const OLE_DROP_TARGET_PROP: &[u16] = &[
+            0x4f, 0x6c, 0x65, 0x44, 0x72, 0x6f, 0x70, 0x54, 0x61, 0x72, 0x67, 0x65, 0x74, 0x49,
+            0x6e, 0x74, 0x65, 0x72, 0x66, 0x61, 0x63, 0x65, 0,
+        ];
+        const CFSTR_URL_W: &[u16] = &[
+            0x55, 0x6e, 0x69, 0x66, 0x6f, 0x72, 0x6d, 0x52, 0x65, 0x73, 0x6f, 0x75, 0x72, 0x63,
+            0x65, 0x4c, 0x6f, 0x63, 0x61, 0x74, 0x6f, 0x72, 0x57, 0,
+        ];
+        const CFSTR_DRAG_IMAGE_BITS: &[u16] = &[
+            0x44, 0x72, 0x61, 0x67, 0x49, 0x6d, 0x61, 0x67, 0x65, 0x42, 0x69, 0x74, 0x73, 0,
+        ];
+
+        let ole_hr = unsafe { OleInitialize(std::ptr::null_mut()) };
+        if ole_hr < 0 {
+            return Err(format!("OleInitialize failed: 0x{:08x}", ole_hr as u32));
+        }
+        let ole_init = ole_hr == 0 || ole_hr == 1;
+
+        let res = (|| -> Result<(), String> {
+            let pixels = vec![0x80u8; 4 * 4 * 4];
+            let drag_img =
+                rust_cef_gpui::outbound_drag_contracts::DragImage::bounded(4, 4, 2, 2, pixels)
+                    .ok_or("DragImage::bounded")?;
+            let payload = rust_cef_gpui::outbound_drag_contracts::DraggedPayload::bounded(
+                Some("https://gpui.rs/"),
+                None,
+                Some("https://gpui.rs/"),
+                Vec::new(),
+            )
+            .with_image(Some(drag_img));
+            let data_obj = rust_cef_gpui::ole_drag::new_ole_data_object(&payload);
+            if data_obj.is_null() {
+                return Err("new_ole_data_object returned null".into());
+            }
+            let plain_payload = rust_cef_gpui::outbound_drag_contracts::DraggedPayload::bounded(
+                Some("PlainExternalText"),
+                None,
+                None,
+                Vec::new(),
+            );
+            let plain_obj = rust_cef_gpui::ole_drag::new_ole_data_object(&plain_payload);
+            if plain_obj.is_null() {
+                unsafe { rust_cef_gpui::ole_drag::release_ole_data_object(data_obj) };
+                return Err("new_ole_data_object(plain) returned null".into());
+            }
+
+            let obj_check = (|| -> Result<(), String> {
+                let data_vtbl = unsafe { *(data_obj as *const *const IDataObjectVtbl) };
+                let cf_url_w = unsafe { RegisterClipboardFormatW(CFSTR_URL_W.as_ptr()) } as u16;
+                let cf_drag_bits =
+                    unsafe { RegisterClipboardFormatW(CFSTR_DRAG_IMAGE_BITS.as_ptr()) } as u16;
+                for (name, cf) in [("CF_UNICODETEXT", 13u16), ("URLW", cf_url_w), ("DragImageBits", cf_drag_bits)] {
+                    let fmt = FormatEtc {
+                        cf_format: cf,
+                        ptd: std::ptr::null_mut(),
+                        dw_aspect: 1,
+                        lindex: -1,
+                        tymed: 1,
+                    };
+                    let hr = unsafe { ((*data_vtbl).query_get_data)(data_obj, &fmt) };
+                    if hr != 0 {
+                        return Err(format!("IDataObject::QueryGetData({name}) hr=0x{:08x}", hr as u32));
+                    }
+                }
+                let fmt_bits = FormatEtc {
+                    cf_format: cf_drag_bits,
+                    ptd: std::ptr::null_mut(),
+                    dw_aspect: 1,
+                    lindex: -1,
+                    tymed: 1,
+                };
+                let mut med = StgMedium {
+                    tymed: 0,
+                    union_ptr: std::ptr::null_mut(),
+                    p_unk_for_release: std::ptr::null_mut(),
+                };
+                let hr = unsafe { ((*data_vtbl).get_data)(data_obj, &fmt_bits, &mut med) };
+                if hr != 0 || med.union_ptr.is_null() {
+                    return Err(format!("IDataObject::GetData(DragImageBits) hr=0x{:08x}", hr as u32));
+                }
+                let ok_dims = unsafe {
+                    let sz = GlobalSize(med.union_ptr);
+                    let ptr = GlobalLock(med.union_ptr);
+                    let dims = if !ptr.is_null() && sz >= 8 {
+                        let b = std::slice::from_raw_parts(ptr.cast::<u8>(), 8);
+                        Some((
+                            u32::from_le_bytes([b[0], b[1], b[2], b[3]]),
+                            u32::from_le_bytes([b[4], b[5], b[6], b[7]]),
+                        ))
+                    } else {
+                        None
+                    };
+                    if !ptr.is_null() {
+                        GlobalUnlock(med.union_ptr);
+                    }
+                    dims == Some((4, 4))
+                };
+                unsafe { ReleaseStgMedium(&mut med) };
+                if !ok_dims {
+                    return Err("SHDRAGIMAGE DragImageBits dimensions != (4, 4)".into());
+                }
+
+                let hwnd_ptr = hwnd as *mut c_void;
+                let dt = unsafe { GetPropW(hwnd_ptr, OLE_DROP_TARGET_PROP.as_ptr()) };
+                if dt.is_null() {
+                    return Err("window missing ComDropTarget property".into());
+                }
+                let dt_vtbl = unsafe { *(dt as *const *const IDropTargetVtbl) };
+
+                let to_screen = |dip_x: f32, dip_y: f32| -> ComPoint {
+                    let mut pt = ComPoint {
+                        x: (dip_x * scale).round() as i32,
+                        y: (dip_y * scale).round() as i32,
+                    };
+                    unsafe { ClientToScreen(hwnd_ptr, &mut pt) };
+                    pt
+                };
+                let pt_para = to_screen(120.0, TOP_BAR_HEIGHT_DIP + 138.0);
+                let pt_input = to_screen(160.0, TOP_BAR_HEIGHT_DIP + 34.0);
+
+                // 1. Over non-droppable paragraph `#para1` with plain external text:
+                //    (Chromium accepts external URL drops on page body to navigate, whereas
+                //     external plain text over `#para1` must yield DROPEFFECT_NONE / `🚫`.)
+                let mut eff = 1u32 | 2 | 4;
+                let _ = unsafe { ((*dt_vtbl).drag_enter)(dt, plain_obj, 1, pt_para, &mut eff) };
+                std::thread::sleep(Duration::from_millis(30));
+                eff = 1 | 2 | 4;
+                let _ = unsafe { ((*dt_vtbl).drag_over)(dt, 1, pt_para, &mut eff) };
+                if eff != 0 {
+                    let _ = unsafe { ((*dt_vtbl).drag_leave)(dt) };
+                    return Err(format!("expected DROPEFFECT_NONE over #para1, got {eff}"));
+                }
+
+                // 2. Simulate dragging out across window border (DragLeave): resets drag_target_operation.
+                let _ = unsafe { ((*dt_vtbl).drag_leave)(dt) };
+                std::thread::sleep(Duration::from_millis(20));
+                if handle.drag_target_operation() != DragOperationMask::NONE {
+                    return Err("drag_target_operation not cleared on DragLeave".into());
+                }
+
+                // 3. Plain text over `<input id='sb_form_q'>` negotiates DROPEFFECT_COPY (`1`), then leaves.
+                let mut eff_plain = 1u32 | 2 | 4;
+                let _ = unsafe { ((*dt_vtbl).drag_enter)(dt, plain_obj, 1, pt_input, &mut eff_plain) };
+                for _ in 0..40 {
+                    if eff_plain != 0 {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                    eff_plain = 1 | 2 | 4;
+                    let _ = unsafe { ((*dt_vtbl).drag_over)(dt, 1, pt_input, &mut eff_plain) };
+                }
+                let _ = unsafe { ((*dt_vtbl).drag_leave)(dt) };
+                if eff_plain != 1 {
+                    return Err(format!("expected DROPEFFECT_COPY (1) for plain text over #sb_form_q, got {eff_plain}"));
+                }
+                std::thread::sleep(Duration::from_millis(20));
+
+                // 4. Re-enter with URL + SHDRAGIMAGE `data_obj` over `<input id='sb_form_q'>` and drop URL.
+                let mut eff_in = 1u32 | 2 | 4;
+                let _ = unsafe { ((*dt_vtbl).drag_enter)(dt, data_obj, 1, pt_input, &mut eff_in) };
+                for _ in 0..40 {
+                    if eff_in != 0 {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                    eff_in = 1 | 2 | 4;
+                    let _ = unsafe { ((*dt_vtbl).drag_over)(dt, 1, pt_input, &mut eff_in) };
+                }
+                if eff_in != 1 && eff_in != 4 {
+                    let _ = unsafe { ((*dt_vtbl).drag_leave)(dt) };
+                    return Err(format!("expected Copy(1) or Link(4) over #sb_form_q, got {eff_in}"));
+                }
+                let mut eff_drop = 1u32 | 2 | 4;
+                let _ = unsafe { ((*dt_vtbl).drop)(dt, data_obj, 0, pt_input, &mut eff_drop) };
+                if eff_drop != 1 && eff_drop != 4 {
+                    return Err(format!("expected non-zero drop effect on #sb_form_q, got {eff_drop}"));
+                }
+                Ok(())
+            })();
+
+            unsafe {
+                rust_cef_gpui::ole_drag::release_ole_data_object(plain_obj);
+                rust_cef_gpui::ole_drag::release_ole_data_object(data_obj);
+            }
+            obj_check
+        })();
+
+        if ole_init {
+            unsafe { OleUninitialize() };
+        }
+        res
+    }
+
     struct Args {
         bundle: PathBuf,
         helper: PathBuf,
@@ -248,7 +519,9 @@ mod win {
         mode: ThreadMode,
         backend: RenderPreference,
         native_hwnd: bool,
+        custom_menu: bool,
         self_test_osr: bool,
+        self_test_osr_dnd: bool,
         smoke: Option<Duration>,
     }
 
@@ -265,14 +538,18 @@ mod win {
         let mut mode = ThreadMode::Threaded;
         let mut backend = RenderPreference::D3d11Required;
         let mut native_hwnd = false;
+        let mut custom_menu = false;
         let mut self_test_osr = false;
+        let mut self_test_osr_dnd = false;
         let mut smoke = None;
 
         let mut it = std::env::args().skip(1);
         while let Some(flag) = it.next() {
             match flag.as_str() {
                 "--native-hwnd" => native_hwnd = true,
+                "--custom-menu" => custom_menu = true,
                 "--self-test-osr" => self_test_osr = true,
+                "--self-test-osr-dnd" => self_test_osr_dnd = true,
                 "--do-not-de-elevate" => {
                     // Consumed directly by libcef from GetCommandLineW() before
                     // BasicStartupComplete() when launched from an elevated Windows shell.
@@ -310,12 +587,18 @@ mod win {
                 }
                 "--help" | "-h" => {
                     println!(
-                        "bing_cn [--url https://cn.bing.com/] [--mode Threaded|Integrated] [--backend D3d11|Software] [--native-hwnd] [--self-test-osr] [--do-not-de-elevate] [--smoke-ms 500..60000] [--bundle <dir>] [--helper <exe>] [--cache-root <dir>]"
+                        "bing_cn [--url https://cn.bing.com/] [--mode Threaded|Integrated] [--backend D3d11|Software] [--native-hwnd] [--custom-menu] [--self-test-osr|--self-test-osr-dnd] [--do-not-de-elevate] [--smoke-ms 500..60000] [--bundle <dir>] [--helper <exe>] [--cache-root <dir>]"
                     );
                     std::process::exit(0);
                 }
                 other => return Err(format!("unknown argument: {other}")),
             }
+        }
+        if self_test_osr && self_test_osr_dnd {
+            return Err("--self-test-osr and --self-test-osr-dnd cannot be combined".into());
+        }
+        if self_test_osr_dnd && native_hwnd {
+            return Err("--self-test-osr-dnd requires OSR mode (omit --native-hwnd)".into());
         }
         Ok(Args {
             bundle,
@@ -325,7 +608,9 @@ mod win {
             mode,
             backend,
             native_hwnd,
+            custom_menu,
             self_test_osr,
+            self_test_osr_dnd,
             smoke,
         })
     }
@@ -802,7 +1087,6 @@ mod win {
 
     struct BingWindow {
         view: Option<BrowserView>,
-        bounds_sub: Option<gpui::Subscription>,
         handle: Option<BrowserHandle>,
         open_devtools: Option<Rc<dyn Fn()>>,
         cancel_find: Option<Rc<dyn Fn()>>,
@@ -1163,14 +1447,15 @@ mod win {
             .parent()
             .unwrap_or(&args.bundle)
             .join("bing-cn-downloads");
-        let dl_dir = if args.self_test_osr {
+        let any_self_test = args.self_test_osr || args.self_test_osr_dnd;
+        let dl_dir = if any_self_test {
             bundle_sibling_dl
         } else {
             std::env::var_os("USERPROFILE")
                 .map(|p| PathBuf::from(p).join("Downloads"))
                 .unwrap_or(bundle_sibling_dl)
         };
-        let obs = Arc::new(Observer::new(args.self_test_osr || args.smoke.is_some()));
+        let obs = Arc::new(Observer::new(any_self_test || args.smoke.is_some()));
         let rt = match Runtime::start(
             RuntimeConfig {
                 files: RuntimeFiles {
@@ -1236,13 +1521,13 @@ mod win {
         });
         let file_dialog_decisions = Arc::new(Mutex::new(Vec::new()));
         let file_dialogs = Arc::new(BingFileDialogHandler {
-            auto_cancel: args.self_test_osr,
+            auto_cancel: any_self_test,
             wake: sender.clone(),
             decisions: file_dialog_decisions.clone(),
         });
         let js_dialog_decisions = Arc::new(Mutex::new(Vec::new()));
         let js_dialogs = Arc::new(BingJsDialogHandler {
-            auto_accept: args.self_test_osr,
+            auto_accept: any_self_test,
             wake: sender.clone(),
             decisions: js_dialog_decisions.clone(),
         });
@@ -1269,23 +1554,26 @@ mod win {
             max_suggestions: nz(5),
             max_total_bytes: nz(8192),
         };
+        let use_custom_menu = !args.native_hwnd && (args.custom_menu || args.self_test_osr);
         if !args.native_hwnd {
             let rt_ref = rt.borrow();
-            let _ = rt_ref.configure_context_menus(ContextMenuConfig {
-                capacity: nz(1),
-                model_limits: limits,
-                context_limits,
-            });
-            let _ = rt_ref.configure_menu_navigation(true);
             let _ = rt_ref.configure_devtools(nz(1));
-            let _ = rt_ref.configure_finds(FindLimits {
-                capacity: nz(1),
-                max_query_bytes: nz(256),
-            });
-            let _ = rt_ref.configure_source_views(SourceViewLimits {
-                capacity: nz(2),
-                max_source_bytes: nz(2 * 1024 * 1024),
-            });
+            if use_custom_menu {
+                let _ = rt_ref.configure_context_menus(ContextMenuConfig {
+                    capacity: nz(1),
+                    model_limits: limits,
+                    context_limits,
+                });
+                let _ = rt_ref.configure_menu_navigation(true);
+                let _ = rt_ref.configure_finds(FindLimits {
+                    capacity: nz(1),
+                    max_query_bytes: nz(256),
+                });
+                let _ = rt_ref.configure_source_views(SourceViewLimits {
+                    capacity: nz(2),
+                    max_source_bytes: nz(2 * 1024 * 1024),
+                });
+            }
         }
 
         let (width, height, scale) = win
@@ -1303,6 +1591,11 @@ mod win {
                 1.0,
             ));
 
+        let parent_hwnd = win
+            .update(cx, |_, window, _| window_hwnd(window))
+            .ok()
+            .flatten()
+            .expect("Win32 HWND required for browser host window");
         let mut options = BrowserOptions::default()
             .with_tooltip_events(!args.native_hwnd)
             .with_outbound_drag_policy(if args.native_hwnd {
@@ -1311,14 +1604,11 @@ mod win {
                 OutboundDragPolicy::AllowAsync
             });
         if !args.native_hwnd {
-            options = options.with_frame_rate(rust_cef_gpui::recommended_windowless_frame_rate());
+            options = options
+                .with_frame_rate(rust_cef_gpui::recommended_windowless_frame_rate())
+                .with_parent_hwnd(parent_hwnd);
         }
         if args.native_hwnd {
-            let parent_hwnd = win
-                .update(cx, |_, window, _| window_hwnd(window))
-                .ok()
-                .flatten()
-                .expect("Win32 HWND required for native-hwnd mode");
             options = options.with_surface_mode(BrowserSurfaceMode::NativeChildHwnd(
                 NativeChildHwndConfig {
                     parent_hwnd,
@@ -1420,22 +1710,6 @@ mod win {
                     BrowserView::Osr(v)
                 };
                 root.view = Some(view.clone());
-                let mut last_extent = (0.0f32, 0.0f32, 0.0f32);
-                root.bounds_sub =
-                    Some(cx.observe_window_bounds(window, move |root, window, cx| {
-                        let wb = window.bounds();
-                        let extent = (
-                            f32::from(wb.size.width),
-                            f32::from(wb.size.height),
-                            window.scale_factor(),
-                        );
-                        if extent != last_extent {
-                            last_extent = extent;
-                            if let Some(view) = root.view.clone() {
-                                let _ = view.consume(window, cx);
-                            }
-                        }
-                    }));
                 root.handle = Some(handle.clone());
                 if !args.native_hwnd {
                     let rt_dt = rt_for_devtools.clone();
@@ -1533,7 +1807,9 @@ mod win {
         let mut menu_pair: Option<(ContextMenuServices, Arc<ContextMenuRegistration>)> = None;
         let mut sources: Option<SourceViewServices> = None;
         let mut finds: Option<FindServices> = None;
-        let presenter = if let BrowserView::Osr(entity) = &attached_view {
+        let presenter = if use_custom_menu
+            && let BrowserView::Osr(entity) = &attached_view
+        {
             let mut menus = ContextMenuServices::new(nz(1), nz(1), limits, context_limits);
             if let Ok(target) = win
                 .update(cx, |_, window, cx| menus.register(entity, window, cx))
@@ -1676,10 +1952,52 @@ mod win {
         let mut kb_mode = "native_win32";
         let mut bing_denied_resources = 0u64;
         let mut bing_denied_navs = 0u64;
-        let self_test_deadline = args
-            .self_test_osr
-            .then(|| Instant::now() + Duration::from_secs(45));
-        let mut self_test_passed = !args.self_test_osr;
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        enum DndSelfTestPhase {
+            WaitInitialReady,
+            WaitFixturePage(Option<Instant>),
+            S1WaitActive(Instant),
+            S1WaitMidProbe(u64, Instant),
+            S1WaitEndProbe(u64, Instant),
+            S2WaitSelSettle(Instant),
+            S2WaitSelProbe(u64, Instant),
+            S2WaitActive(Instant),
+            S2WaitEndProbe(u64, Instant),
+            S3TextWaitActive { since: Instant, nudged: bool },
+            S3TextWaitDropSettle(Instant),
+            S3TextWaitProbe(u64, Instant),
+            S3LinkWaitClear(Instant),
+            S3LinkWaitActive { since: Instant, nudged: bool },
+            S3LinkWaitDropSettle(Instant),
+            S3LinkWaitProbe(u64, Instant),
+            S4EscWaitClear(Instant),
+            S4EscWaitActive { since: Instant, nudged: bool },
+            S4EscWaitCleared(Instant),
+            S4EscWaitProbe(u64, Instant),
+            S4IntWaitSelSettle(Instant),
+            S4IntWaitLnk1Active(Instant),
+            S4IntWaitLnk1Release(Instant),
+            S4IntWaitBlankSettle(Instant),
+            S4IntWaitLnk2Active(Instant),
+            S4IntWaitProbe(u64, Instant),
+            S5OleRun,
+            S5OleWaitSettle(Instant),
+            S5OleWaitProbe(u64, Instant),
+            Done(Instant),
+        }
+        let mut dnd_phase = DndSelfTestPhase::WaitInitialReady;
+        let mut dnd_probe_seq = 0u64;
+        let mut dnd_s2_sel0 = String::new();
+        let mut dnd_s1_link_drag_no_sel_ok = false;
+        let mut dnd_s2_sel_drag_stable_ok = false;
+        let mut dnd_s3_drop_text_ok = false;
+        let mut dnd_s3_drop_link_ok = false;
+        let mut dnd_s4_escape_cancel_ok = false;
+        let mut dnd_s4_interleaved_ok = false;
+        let mut dnd_s5_ole_outbound_and_drop_ok = false;
+
+        let self_test_deadline = any_self_test.then(|| Instant::now() + Duration::from_secs(45));
+        let mut self_test_passed = !any_self_test;
 
         let smoke_deadline = args.smoke.map(|d| Instant::now() + d);
         let loop_deadline = match (smoke_deadline, self_test_deadline) {
@@ -2786,13 +3104,625 @@ mod win {
                 }
             }
 
+            if args.self_test_osr_dnd && !args.native_hwnd {
+                let mut exit_dnd_selftest = false;
+                let mut esc_hwnd: Option<isize> = None;
+                let mut ole_test_params: Option<(isize, f32)> = None;
+                let any_win: gpui::AnyWindowHandle = win.into();
+                let kb_active = keyboard.as_ref().is_some_and(|k| !k.diagnostics().retired);
+                let parse_dnd_probe = |title: &str, expected_seq: u64| -> Option<(String, String, u64)> {
+                    let prefix = format!("DND:{expected_seq}|");
+                    let rest = title.strip_prefix(&prefix)?;
+                    let mut sel = String::new();
+                    let mut q = String::new();
+                    let mut nav = 0u64;
+                    for part in rest.split('|') {
+                        if let Some(v) = part.strip_prefix("sel=") {
+                            sel = v.to_owned();
+                        } else if let Some(v) = part.strip_prefix("q=") {
+                            q = v.to_owned();
+                        } else if let Some(v) = part.strip_prefix("nav=") {
+                            nav = v.parse::<u64>().unwrap_or(99);
+                        }
+                    }
+                    Some((sel, q, nav))
+                };
+                let issue_dnd_probe = |seq: &mut u64| -> u64 {
+                    *seq += 1;
+                    let id = *seq;
+                    let script = format!(
+                        "document.title='DND:{id}|sel='+window.getSelection().toString()+'|q='+document.getElementById('sb_form_q').value+'|nav='+(window._nav||0);"
+                    );
+                    let _ = handle.submit(BrowserCommand::ExecuteJavaScript {
+                        script,
+                        frame_scope: rust_cef_gpui::js_bridge::JsFrameScope::MainFrame,
+                    });
+                    id
+                };
+                let _ = cx.update_window(any_win, |_, window, cx| {
+                    let point = |x: f32, y: f32| gpui::point(px(x), px(y));
+                    let dispatch_click = |btn: MouseButton, x: f32, y: f32, window: &mut Window, cx: &mut App| {
+                        window.dispatch_event(
+                            PlatformInput::MouseDown(MouseDownEvent {
+                                button: btn,
+                                position: point(x, y),
+                                modifiers: Modifiers::default(),
+                                click_count: 1,
+                                first_mouse: false,
+                            }),
+                            cx,
+                        );
+                        window.dispatch_event(
+                            PlatformInput::MouseUp(MouseUpEvent {
+                                button: btn,
+                                position: point(x, y),
+                                modifiers: Modifiers::default(),
+                                click_count: 1,
+                            }),
+                            cx,
+                        );
+                    };
+                    let dispatch_drag_path = |x0: f32, y0: f32, x1: f32, y1: f32, window: &mut Window, cx: &mut App| {
+                        if !window.is_window_active() {
+                            window.activate_window();
+                        }
+                        if let Some(hwnd) = window_hwnd(window) {
+                            let _ = ensure_win32_focus(hwnd.get() as isize);
+                        }
+                        window.dispatch_event(
+                            PlatformInput::MouseDown(MouseDownEvent {
+                                button: MouseButton::Left,
+                                position: point(x0, y0),
+                                modifiers: Modifiers::default(),
+                                click_count: 1,
+                                first_mouse: false,
+                            }),
+                            cx,
+                        );
+                        let steps = 8u8;
+                        for step in 1..=steps {
+                            let t = f32::from(step) / f32::from(steps);
+                            window.dispatch_event(
+                                PlatformInput::MouseMove(MouseMoveEvent {
+                                    position: point(x0 + (x1 - x0) * t, y0 + (y1 - y0) * t),
+                                    pressed_button: Some(MouseButton::Left),
+                                    modifiers: Modifiers::default(),
+                                }),
+                                cx,
+                            );
+                        }
+                    };
+                    let view_state = |cx: &App| -> (bool, bool, Option<DragOperationMask>, bool) {
+                        if let BrowserView::Osr(v) = &attached_view {
+                            let b = v.read(cx);
+                            (
+                                b.has_active_drag(),
+                                b.has_active_drag_preview(),
+                                b.active_drag_cursor_op(),
+                                b.is_left_mouse_down(),
+                            )
+                        } else {
+                            (false, false, None, false)
+                        }
+                    };
+                    let (active_drag, drag_preview, drag_op, left_down) = view_state(cx);
+                    let y_off = TOP_BAR_HEIGHT_DIP;
+
+                    match dnd_phase {
+                        DndSelfTestPhase::WaitInitialReady => {
+                            if ready_printed && !cur_loading {
+                                if !window.is_window_active() {
+                                    window.activate_window();
+                                }
+                                if let BrowserView::Osr(v) = &attached_view {
+                                    let focus = v.read(cx).focus_handle(cx);
+                                    window.focus(&focus, cx);
+                                }
+                                let dnd_html = "data:text/html;charset=utf-8,%3C!doctype%20html%3E%3Cbody%20style%3D'margin%3A0%3Bpadding%3A0%3Bfont-family%3Asans-serif'%3E%3Cinput%20id%3D'sb_form_q'%20style%3D'position%3Afixed%3Bleft%3A20px%3Btop%3A16px%3Bwidth%3A360px%3Bheight%3A36px%3Bfont-size%3A16px'%3E%3Ca%20id%3D'lnk1'%20href%3D'https%3A%2F%2Fexample.com%2Fresult-1'%20onclick%3D%22window._nav%3D(window._nav%7C%7C0)%2B1%3Breturn%20false%3B%22%20style%3D'position%3Afixed%3Bleft%3A20px%3Btop%3A80px%3Bfont-size%3A22px%3Bline-height%3A32px'%3ESearch%20Result%20One%3C%2Fa%3E%3Cdiv%20id%3D'para1'%20style%3D'position%3Afixed%3Bleft%3A20px%3Btop%3A124px%3Bwidth%3A520px%3Bfont-size%3A18px%3Bline-height%3A28px%3Buser-select%3Atext'%3ESnippet%20paragraph%20text%20below%20result%20one%20that%20must%20never%20be%20painted%20blue%20during%20link%20drag.%3C%2Fdiv%3E%3Cdiv%20id%3D'sel_box'%20style%3D'position%3Afixed%3Bleft%3A20px%3Btop%3A190px%3Bwidth%3A480px%3Bfont-size%3A24px%3Bline-height%3A36px%3Buser-select%3Atext'%3ESelectedPhraseToken%3C%2Fdiv%3E%3Ca%20id%3D'lnk2'%20href%3D'https%3A%2F%2Fexample.com%2Fresult-2'%20onclick%3D%22window._nav%3D(window._nav%7C%7C0)%2B1%3Breturn%20false%3B%22%20style%3D'position%3Afixed%3Bleft%3A20px%3Btop%3A250px%3Bfont-size%3A22px%3Bline-height%3A32px'%3ESecond%20Result%20Link%3C%2Fa%3E%3C%2Fbody%3E";
+                                let _ = handle.submit(BrowserCommand::Navigate(dnd_html.into()));
+                                dnd_phase = DndSelfTestPhase::WaitFixturePage(None);
+                            }
+                        }
+                        DndSelfTestPhase::WaitFixturePage(settled) => {
+                            if last_addr.starts_with("data:text/html") && !cur_loading {
+                                match settled {
+                                    None => {
+                                        dnd_phase = DndSelfTestPhase::WaitFixturePage(Some(Instant::now()));
+                                    }
+                                    Some(since) if since.elapsed() >= Duration::from_millis(200) => {
+                                        dispatch_drag_path(60.0, y_off + 96.0, 420.0, y_off + 340.0, window, cx);
+                                        dnd_phase = DndSelfTestPhase::S1WaitActive(Instant::now());
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        DndSelfTestPhase::S1WaitActive(since) => {
+                            if active_drag || since.elapsed() >= Duration::from_secs(2) {
+                                let mid_ok = active_drag && drag_preview && drag_op == Some(DragOperationMask::NONE);
+                                for &(mx, my) in &[(140.0_f32, 138.0_f32), (280.0, 138.0), (420.0, 340.0)] {
+                                    window.dispatch_event(
+                                        PlatformInput::MouseMove(MouseMoveEvent {
+                                            position: point(mx, y_off + my),
+                                            pressed_button: Some(MouseButton::Left),
+                                            modifiers: Modifiers::default(),
+                                        }),
+                                        cx,
+                                    );
+                                }
+                                dnd_s1_link_drag_no_sel_ok = mid_ok;
+                                let seq = issue_dnd_probe(&mut dnd_probe_seq);
+                                dnd_phase = DndSelfTestPhase::S1WaitMidProbe(seq, Instant::now());
+                            }
+                        }
+                        DndSelfTestPhase::S1WaitMidProbe(seq, since) => {
+                            let parsed = parse_dnd_probe(&last_title, seq);
+                            if parsed.is_some() || since.elapsed() >= Duration::from_secs(2) {
+                                let mid_clean = parsed.is_some_and(|(sel, _, nav)| sel.is_empty() && nav == 0);
+                                dnd_s1_link_drag_no_sel_ok &= mid_clean;
+                                window.dispatch_event(
+                                    PlatformInput::MouseUp(MouseUpEvent {
+                                        button: MouseButton::Left,
+                                        position: point(420.0, y_off + 340.0),
+                                        modifiers: Modifiers::default(),
+                                        click_count: 1,
+                                    }),
+                                    cx,
+                                );
+                                let (a2, _, _, l2) = view_state(cx);
+                                dnd_s1_link_drag_no_sel_ok &= !a2 && !l2;
+                                let next_seq = issue_dnd_probe(&mut dnd_probe_seq);
+                                dnd_phase = DndSelfTestPhase::S1WaitEndProbe(next_seq, Instant::now());
+                            }
+                        }
+                        DndSelfTestPhase::S1WaitEndProbe(seq, since) => {
+                            let parsed = parse_dnd_probe(&last_title, seq);
+                            if parsed.is_some() || since.elapsed() >= Duration::from_secs(2) {
+                                let end_clean = parsed.is_some_and(|(sel, _, nav)| sel.is_empty() && nav == 0);
+                                dnd_s1_link_drag_no_sel_ok &= end_clean;
+                                dispatch_drag_path(21.0, y_off + 208.0, 320.0, y_off + 208.0, window, cx);
+                                window.dispatch_event(
+                                    PlatformInput::MouseUp(MouseUpEvent {
+                                        button: MouseButton::Left,
+                                        position: point(320.0, y_off + 208.0),
+                                        modifiers: Modifiers::default(),
+                                        click_count: 1,
+                                    }),
+                                    cx,
+                                );
+                                dnd_phase = DndSelfTestPhase::S2WaitSelSettle(Instant::now());
+                            }
+                        }
+                        DndSelfTestPhase::S2WaitSelSettle(since) => {
+                            if since.elapsed() >= Duration::from_millis(120) {
+                                let seq = issue_dnd_probe(&mut dnd_probe_seq);
+                                dnd_phase = DndSelfTestPhase::S2WaitSelProbe(seq, Instant::now());
+                            }
+                        }
+                        DndSelfTestPhase::S2WaitSelProbe(seq, since) => {
+                            let parsed = parse_dnd_probe(&last_title, seq);
+                            if parsed.is_some() || since.elapsed() >= Duration::from_secs(2) {
+                                if let Some((sel, _, _)) = parsed
+                                    && sel.contains("SelectedPhraseToken")
+                                {
+                                    dnd_s2_sel0 = sel;
+                                    dnd_s2_sel_drag_stable_ok = true;
+                                }
+                                dispatch_drag_path(80.0, y_off + 208.0, 420.0, y_off + 340.0, window, cx);
+                                dnd_phase = DndSelfTestPhase::S2WaitActive(Instant::now());
+                            }
+                        }
+                        DndSelfTestPhase::S2WaitActive(since) => {
+                            if active_drag || since.elapsed() >= Duration::from_secs(2) {
+                                dnd_s2_sel_drag_stable_ok &= active_drag && drag_preview;
+                                window.dispatch_event(
+                                    PlatformInput::MouseUp(MouseUpEvent {
+                                        button: MouseButton::Left,
+                                        position: point(420.0, y_off + 340.0),
+                                        modifiers: Modifiers::default(),
+                                        click_count: 1,
+                                    }),
+                                    cx,
+                                );
+                                let (a2, _, _, l2) = view_state(cx);
+                                dnd_s2_sel_drag_stable_ok &= !a2 && !l2;
+                                let next_seq = issue_dnd_probe(&mut dnd_probe_seq);
+                                dnd_phase = DndSelfTestPhase::S2WaitEndProbe(next_seq, Instant::now());
+                            }
+                        }
+                        DndSelfTestPhase::S2WaitEndProbe(seq, since) => {
+                            let parsed = parse_dnd_probe(&last_title, seq);
+                            if parsed.is_some() || since.elapsed() >= Duration::from_secs(2) {
+                                dnd_s2_sel_drag_stable_ok &= !dnd_s2_sel0.is_empty()
+                                    && parsed.is_some_and(|(sel, _, nav)| sel == dnd_s2_sel0 && nav == 0);
+                                dispatch_drag_path(80.0, y_off + 208.0, 160.0, y_off + 34.0, window, cx);
+                                dnd_phase = DndSelfTestPhase::S3TextWaitActive {
+                                    since: Instant::now(),
+                                    nudged: false,
+                                };
+                            }
+                        }
+                        DndSelfTestPhase::S3TextWaitActive { since, nudged } => {
+                            if active_drag && drag_op.is_some_and(|op| op != DragOperationMask::NONE) {
+                                window.dispatch_event(
+                                    PlatformInput::MouseUp(MouseUpEvent {
+                                        button: MouseButton::Left,
+                                        position: point(160.0, y_off + 34.0),
+                                        modifiers: Modifiers::default(),
+                                        click_count: 1,
+                                    }),
+                                    cx,
+                                );
+                                let (a2, _, _, l2) = view_state(cx);
+                                dnd_s3_drop_text_ok = !a2 && !l2;
+                                dnd_phase = DndSelfTestPhase::S3TextWaitDropSettle(Instant::now());
+                            } else if active_drag && !nudged {
+                                window.dispatch_event(
+                                    PlatformInput::MouseMove(MouseMoveEvent {
+                                        position: point(164.0, y_off + 34.0),
+                                        pressed_button: Some(MouseButton::Left),
+                                        modifiers: Modifiers::default(),
+                                    }),
+                                    cx,
+                                );
+                                window.dispatch_event(
+                                    PlatformInput::MouseMove(MouseMoveEvent {
+                                        position: point(160.0, y_off + 34.0),
+                                        pressed_button: Some(MouseButton::Left),
+                                        modifiers: Modifiers::default(),
+                                    }),
+                                    cx,
+                                );
+                                dnd_phase = DndSelfTestPhase::S3TextWaitActive { since, nudged: true };
+                            } else if since.elapsed() >= Duration::from_secs(2) {
+                                window.dispatch_event(
+                                    PlatformInput::MouseUp(MouseUpEvent {
+                                        button: MouseButton::Left,
+                                        position: point(160.0, y_off + 34.0),
+                                        modifiers: Modifiers::default(),
+                                        click_count: 1,
+                                    }),
+                                    cx,
+                                );
+                                dnd_s3_drop_text_ok = false;
+                                dnd_phase = DndSelfTestPhase::S3TextWaitDropSettle(Instant::now());
+                            }
+                        }
+                        DndSelfTestPhase::S3TextWaitDropSettle(since) => {
+                            if since.elapsed() >= Duration::from_millis(100) {
+                                let seq = issue_dnd_probe(&mut dnd_probe_seq);
+                                dnd_phase = DndSelfTestPhase::S3TextWaitProbe(seq, Instant::now());
+                            }
+                        }
+                        DndSelfTestPhase::S3TextWaitProbe(seq, since) => {
+                            let parsed = parse_dnd_probe(&last_title, seq);
+                            if parsed.is_some() || since.elapsed() >= Duration::from_secs(2) {
+                                dnd_s3_drop_text_ok &= parsed.is_some_and(|(_, q, nav)| {
+                                    q.contains("SelectedPhraseToken") && nav == 0
+                                });
+                                let _ = handle.submit(BrowserCommand::ExecuteJavaScript {
+                                    script: "document.getElementById('sb_form_q').value='';".into(),
+                                    frame_scope: rust_cef_gpui::js_bridge::JsFrameScope::MainFrame,
+                                });
+                                dispatch_click(MouseButton::Left, 420.0, y_off + 340.0, window, cx);
+                                dnd_phase = DndSelfTestPhase::S3LinkWaitClear(Instant::now());
+                            }
+                        }
+                        DndSelfTestPhase::S3LinkWaitClear(since) => {
+                            if since.elapsed() >= Duration::from_millis(80) {
+                                dispatch_drag_path(60.0, y_off + 96.0, 160.0, y_off + 34.0, window, cx);
+                                dnd_phase = DndSelfTestPhase::S3LinkWaitActive {
+                                    since: Instant::now(),
+                                    nudged: false,
+                                };
+                            }
+                        }
+                        DndSelfTestPhase::S3LinkWaitActive { since, nudged } => {
+                            if active_drag && drag_op.is_some_and(|op| op != DragOperationMask::NONE) {
+                                window.dispatch_event(
+                                    PlatformInput::MouseUp(MouseUpEvent {
+                                        button: MouseButton::Left,
+                                        position: point(160.0, y_off + 34.0),
+                                        modifiers: Modifiers::default(),
+                                        click_count: 1,
+                                    }),
+                                    cx,
+                                );
+                                let (a2, _, _, l2) = view_state(cx);
+                                dnd_s3_drop_link_ok = !a2 && !l2;
+                                dnd_phase = DndSelfTestPhase::S3LinkWaitDropSettle(Instant::now());
+                            } else if active_drag && !nudged {
+                                window.dispatch_event(
+                                    PlatformInput::MouseMove(MouseMoveEvent {
+                                        position: point(164.0, y_off + 34.0),
+                                        pressed_button: Some(MouseButton::Left),
+                                        modifiers: Modifiers::default(),
+                                    }),
+                                    cx,
+                                );
+                                window.dispatch_event(
+                                    PlatformInput::MouseMove(MouseMoveEvent {
+                                        position: point(160.0, y_off + 34.0),
+                                        pressed_button: Some(MouseButton::Left),
+                                        modifiers: Modifiers::default(),
+                                    }),
+                                    cx,
+                                );
+                                dnd_phase = DndSelfTestPhase::S3LinkWaitActive { since, nudged: true };
+                            } else if since.elapsed() >= Duration::from_secs(2) {
+                                window.dispatch_event(
+                                    PlatformInput::MouseUp(MouseUpEvent {
+                                        button: MouseButton::Left,
+                                        position: point(160.0, y_off + 34.0),
+                                        modifiers: Modifiers::default(),
+                                        click_count: 1,
+                                    }),
+                                    cx,
+                                );
+                                dnd_s3_drop_link_ok = false;
+                                dnd_phase = DndSelfTestPhase::S3LinkWaitDropSettle(Instant::now());
+                            }
+                        }
+                        DndSelfTestPhase::S3LinkWaitDropSettle(since) => {
+                            if since.elapsed() >= Duration::from_millis(100) {
+                                let seq = issue_dnd_probe(&mut dnd_probe_seq);
+                                dnd_phase = DndSelfTestPhase::S3LinkWaitProbe(seq, Instant::now());
+                            }
+                        }
+                        DndSelfTestPhase::S3LinkWaitProbe(seq, since) => {
+                            let parsed = parse_dnd_probe(&last_title, seq);
+                            if parsed.is_some() || since.elapsed() >= Duration::from_secs(2) {
+                                dnd_s3_drop_link_ok &= parsed.is_some_and(|(_, q, nav)| {
+                                    q.contains("https://example.com/result-1") && nav == 0
+                                });
+                                let _ = handle.submit(BrowserCommand::ExecuteJavaScript {
+                                    script: "document.getElementById('sb_form_q').value='';".into(),
+                                    frame_scope: rust_cef_gpui::js_bridge::JsFrameScope::MainFrame,
+                                });
+                                dispatch_click(MouseButton::Left, 420.0, y_off + 340.0, window, cx);
+                                dnd_phase = DndSelfTestPhase::S4EscWaitClear(Instant::now());
+                            }
+                        }
+                        DndSelfTestPhase::S4EscWaitClear(since) => {
+                            if since.elapsed() >= Duration::from_millis(80) {
+                                dispatch_drag_path(60.0, y_off + 266.0, 160.0, y_off + 34.0, window, cx);
+                                dnd_phase = DndSelfTestPhase::S4EscWaitActive {
+                                    since: Instant::now(),
+                                    nudged: false,
+                                };
+                            }
+                        }
+                        DndSelfTestPhase::S4EscWaitActive { since, nudged } => {
+                            if active_drag && drag_op.is_some_and(|op| op != DragOperationMask::NONE) {
+                                dnd_s4_escape_cancel_ok = true;
+                                if kb_active {
+                                    esc_hwnd = window_hwnd(window).map(|h| h.get() as isize);
+                                } else {
+                                    window.dispatch_event(
+                                        PlatformInput::KeyDown(KeyDownEvent {
+                                            keystroke: Keystroke::parse("escape").unwrap(),
+                                            is_held: false,
+                                            prefer_character_input: false,
+                                        }),
+                                        cx,
+                                    );
+                                    window.dispatch_event(
+                                        PlatformInput::KeyUp(KeyUpEvent {
+                                            keystroke: Keystroke::parse("escape").unwrap(),
+                                        }),
+                                        cx,
+                                    );
+                                }
+                                dnd_phase = DndSelfTestPhase::S4EscWaitCleared(Instant::now());
+                            } else if active_drag && !nudged {
+                                window.dispatch_event(
+                                    PlatformInput::MouseMove(MouseMoveEvent {
+                                        position: point(164.0, y_off + 34.0),
+                                        pressed_button: Some(MouseButton::Left),
+                                        modifiers: Modifiers::default(),
+                                    }),
+                                    cx,
+                                );
+                                window.dispatch_event(
+                                    PlatformInput::MouseMove(MouseMoveEvent {
+                                        position: point(160.0, y_off + 34.0),
+                                        pressed_button: Some(MouseButton::Left),
+                                        modifiers: Modifiers::default(),
+                                    }),
+                                    cx,
+                                );
+                                dnd_phase = DndSelfTestPhase::S4EscWaitActive { since, nudged: true };
+                            } else if since.elapsed() >= Duration::from_secs(2) {
+                                dnd_s4_escape_cancel_ok = false;
+                                dnd_phase = DndSelfTestPhase::S4EscWaitCleared(Instant::now());
+                            }
+                        }
+                        DndSelfTestPhase::S4EscWaitCleared(since) => {
+                            if !active_drag || since.elapsed() >= Duration::from_secs(1) {
+                                window.dispatch_event(
+                                    PlatformInput::MouseUp(MouseUpEvent {
+                                        button: MouseButton::Left,
+                                        position: point(160.0, y_off + 34.0),
+                                        modifiers: Modifiers::default(),
+                                        click_count: 1,
+                                    }),
+                                    cx,
+                                );
+                                let (a2, _, _, l2) = view_state(cx);
+                                dnd_s4_escape_cancel_ok &= !a2 && !l2;
+                                let seq = issue_dnd_probe(&mut dnd_probe_seq);
+                                dnd_phase = DndSelfTestPhase::S4EscWaitProbe(seq, Instant::now());
+                            }
+                        }
+                        DndSelfTestPhase::S4EscWaitProbe(seq, since) => {
+                            let parsed = parse_dnd_probe(&last_title, seq);
+                            if parsed.is_some() || since.elapsed() >= Duration::from_secs(2) {
+                                dnd_s4_escape_cancel_ok &= parsed.is_some_and(|(_, q, nav)| {
+                                    q.is_empty() && nav == 0
+                                });
+                                dispatch_drag_path(21.0, y_off + 208.0, 320.0, y_off + 208.0, window, cx);
+                                window.dispatch_event(
+                                    PlatformInput::MouseUp(MouseUpEvent {
+                                        button: MouseButton::Left,
+                                        position: point(320.0, y_off + 208.0),
+                                        modifiers: Modifiers::default(),
+                                        click_count: 1,
+                                    }),
+                                    cx,
+                                );
+                                dnd_phase = DndSelfTestPhase::S4IntWaitSelSettle(Instant::now());
+                            }
+                        }
+                        DndSelfTestPhase::S4IntWaitSelSettle(since) => {
+                            if since.elapsed() >= Duration::from_millis(80) {
+                                dispatch_drag_path(60.0, y_off + 96.0, 420.0, y_off + 340.0, window, cx);
+                                dnd_phase = DndSelfTestPhase::S4IntWaitLnk1Active(Instant::now());
+                            }
+                        }
+                        DndSelfTestPhase::S4IntWaitLnk1Active(since) => {
+                            if active_drag || since.elapsed() >= Duration::from_secs(2) {
+                                dnd_s4_interleaved_ok = active_drag;
+                                window.dispatch_event(
+                                    PlatformInput::MouseUp(MouseUpEvent {
+                                        button: MouseButton::Left,
+                                        position: point(420.0, y_off + 340.0),
+                                        modifiers: Modifiers::default(),
+                                        click_count: 1,
+                                    }),
+                                    cx,
+                                );
+                                dnd_phase = DndSelfTestPhase::S4IntWaitLnk1Release(Instant::now());
+                            }
+                        }
+                        DndSelfTestPhase::S4IntWaitLnk1Release(since) => {
+                            if since.elapsed() >= Duration::from_millis(80) {
+                                window.dispatch_event(
+                                    PlatformInput::MouseMove(MouseMoveEvent {
+                                        position: point(420.0, y_off + 340.0),
+                                        pressed_button: None,
+                                        modifiers: Modifiers::default(),
+                                    }),
+                                    cx,
+                                );
+                                dispatch_click(MouseButton::Left, 420.0, y_off + 340.0, window, cx);
+                                dnd_phase = DndSelfTestPhase::S4IntWaitBlankSettle(Instant::now());
+                            }
+                        }
+                        DndSelfTestPhase::S4IntWaitBlankSettle(since) => {
+                            if since.elapsed() >= Duration::from_millis(80) {
+                                dispatch_drag_path(60.0, y_off + 266.0, 420.0, y_off + 340.0, window, cx);
+                                dnd_phase = DndSelfTestPhase::S4IntWaitLnk2Active(Instant::now());
+                            }
+                        }
+                        DndSelfTestPhase::S4IntWaitLnk2Active(since) => {
+                            if active_drag || since.elapsed() >= Duration::from_secs(2) {
+                                dnd_s4_interleaved_ok &= active_drag;
+                                window.dispatch_event(
+                                    PlatformInput::MouseUp(MouseUpEvent {
+                                        button: MouseButton::Left,
+                                        position: point(420.0, y_off + 340.0),
+                                        modifiers: Modifiers::default(),
+                                        click_count: 1,
+                                    }),
+                                    cx,
+                                );
+                                for &(mx, my) in &[
+                                    (40.0_f32, 138.0_f32),
+                                    (340.0, 138.0),
+                                    (40.0, 208.0),
+                                    (340.0, 208.0),
+                                ] {
+                                    window.dispatch_event(
+                                        PlatformInput::MouseMove(MouseMoveEvent {
+                                            position: point(mx, y_off + my),
+                                            pressed_button: None,
+                                            modifiers: Modifiers::default(),
+                                        }),
+                                        cx,
+                                    );
+                                }
+                                let (a2, _, _, l2) = view_state(cx);
+                                dnd_s4_interleaved_ok &= !a2 && !l2;
+                                let seq = issue_dnd_probe(&mut dnd_probe_seq);
+                                dnd_phase = DndSelfTestPhase::S4IntWaitProbe(seq, Instant::now());
+                            }
+                        }
+                        DndSelfTestPhase::S4IntWaitProbe(seq, since) => {
+                            let parsed = parse_dnd_probe(&last_title, seq);
+                            if parsed.is_some() || since.elapsed() >= Duration::from_secs(2) {
+                                dnd_s4_interleaved_ok &= !active_drag
+                                    && !left_down
+                                    && parsed.is_some_and(|(sel, _, nav)| sel.is_empty() && nav == 0);
+                                let _ = handle.submit(BrowserCommand::ExecuteJavaScript {
+                                    script: "document.getElementById('sb_form_q').value='';".into(),
+                                    frame_scope: rust_cef_gpui::js_bridge::JsFrameScope::MainFrame,
+                                });
+                                dnd_phase = DndSelfTestPhase::S5OleRun;
+                            }
+                        }
+                        DndSelfTestPhase::S5OleRun => {
+                            if let Some(hwnd) = window_hwnd(window) {
+                                ole_test_params = Some((hwnd.get() as isize, window.scale_factor()));
+                            }
+                            dnd_phase = DndSelfTestPhase::S5OleWaitSettle(Instant::now());
+                        }
+                        DndSelfTestPhase::S5OleWaitSettle(since) => {
+                            if since.elapsed() >= Duration::from_millis(100) {
+                                let seq = issue_dnd_probe(&mut dnd_probe_seq);
+                                dnd_phase = DndSelfTestPhase::S5OleWaitProbe(seq, Instant::now());
+                            }
+                        }
+                        DndSelfTestPhase::S5OleWaitProbe(seq, since) => {
+                            let parsed = parse_dnd_probe(&last_title, seq);
+                            if parsed.is_some() || since.elapsed() >= Duration::from_secs(2) {
+                                dnd_s5_ole_outbound_and_drop_ok &= parsed.is_some_and(|(_, q, nav)| {
+                                    q.contains("https://gpui.rs/") && nav == 0
+                                });
+                                self_test_passed = dnd_s1_link_drag_no_sel_ok
+                                    && dnd_s2_sel_drag_stable_ok
+                                    && dnd_s3_drop_text_ok
+                                    && dnd_s3_drop_link_ok
+                                    && dnd_s4_escape_cancel_ok
+                                    && dnd_s4_interleaved_ok
+                                    && dnd_s5_ole_outbound_and_drop_ok;
+                                println!(
+                                    "BING_OSR_DND_SELFTEST s1_link_drag_no_sel_ok={dnd_s1_link_drag_no_sel_ok} s2_sel_drag_stable_ok={dnd_s2_sel_drag_stable_ok} s3_drop_text_ok={dnd_s3_drop_text_ok} s3_drop_link_ok={dnd_s3_drop_link_ok} s4_escape_cancel_ok={dnd_s4_escape_cancel_ok} s4_interleaved_ok={dnd_s4_interleaved_ok} s5_ole_outbound_and_drop_ok={dnd_s5_ole_outbound_and_drop_ok} sel0={dnd_s2_sel0:?}"
+                                );
+                                dnd_phase = DndSelfTestPhase::Done(Instant::now());
+                            }
+                        }
+                        DndSelfTestPhase::Done(since) => {
+                            if since.elapsed() >= Duration::from_millis(100) {
+                                exit_dnd_selftest = true;
+                            }
+                        }
+                    }
+                });
+                if let Some((hwnd, scale)) = ole_test_params {
+                    match exercise_ole_drop_target_and_data_object(hwnd, scale, &handle) {
+                        Ok(()) => dnd_s5_ole_outbound_and_drop_ok = true,
+                        Err(e) => {
+                            eprintln!("BING_OSR_DND_OLE_ERR: {e}");
+                            dnd_s5_ole_outbound_and_drop_ok = false;
+                        }
+                    }
+                }
+                if let Some(hwnd) = esc_hwnd {
+                    post_win32_key(hwnd, 0x1B, false);
+                    post_win32_key(hwnd, 0x1B, true);
+                }
+                if exit_dnd_selftest {
+                    break;
+                }
+            }
+
             if let Err(e) = service_loop(cx, &rt, &receiver, loop_deadline).await {
                 eprintln!("service loop error: {e}");
                 break;
             }
         }
 
-        if args.self_test_osr && !self_test_passed {
+        if any_self_test && !self_test_passed {
             let active = win
                 .update(cx, |_, window, _| window.is_window_active())
                 .unwrap_or(false);
@@ -2807,8 +3737,9 @@ mod win {
                 None
             };
             eprintln!(
-                "BING_SELFTEST_TIMEOUT phase={:?} active={} handler_counts={:?} observed={:?} kb_diag={:?} view_diag={:?} menu_diag={:?} pres_diag={:?}",
+                "BING_SELFTEST_TIMEOUT phase={:?} dnd_phase={:?} active={} handler_counts={:?} observed={:?} kb_diag={:?} view_diag={:?} menu_diag={:?} pres_diag={:?}",
                 self_test_phase,
+                dnd_phase,
                 active,
                 rt.borrow().context_menu_handler_counts(),
                 *observed_menus.borrow(),
@@ -2844,7 +3775,6 @@ mod win {
         let final_images = win
             .update(cx, |root, window, cx| {
                 let mut imgs = 0u64;
-                root.bounds_sub = None;
                 if let Some(view) = root.view.take() {
                     match view {
                         BrowserView::Osr(v) => {
@@ -2939,7 +3869,6 @@ mod win {
                         });
                         cx.new(|_| BingWindow {
                             view: None,
-                            bounds_sub: None,
                             handle: None,
                             open_devtools: None,
                             cancel_find: None,

@@ -135,6 +135,9 @@ pub(crate) enum TaskPayload {
     DrainMouseMoves {
         browser: BrowserId,
     },
+    UpdateOsrDrag {
+        browser: BrowserId,
+    },
     ApplyZoom {
         browser: BrowserId,
     },
@@ -412,6 +415,16 @@ pub(crate) enum TaskPayload {
     DestroyNativeChildHwnd {
         browser: BrowserId,
         hwnd: std::num::NonZeroUsize,
+    },
+    ClosePopup {
+        slot: crate::popup_window::PopupSlotId,
+    },
+    PopupClientReleased {
+        slot: crate::popup_window::PopupSlotId,
+    },
+    NavigateMainFrame {
+        browser: BrowserId,
+        url: String,
     },
 }
 

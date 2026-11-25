@@ -1005,10 +1005,13 @@ impl DirectXRenderer {
                     },
                 },
                 grayscale: false.into(),
-                opacity: 1.0,
+                opacity: surface.opacity,
                 bounds: surface.bounds,
                 content_mask: surface.content_mask.clone(),
                 corner_radii: Corners::default(),
+                transformation: surface.transformation,
+                nearest_sampling: surface.nearest_sampling.into(),
+                pad2: 0,
             };
             let keyed_mutex = surface
                 .texture

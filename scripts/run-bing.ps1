@@ -5,6 +5,7 @@ param(
     [switch]$NativeHwnd,
     [switch]$DoNotDeElevate,
     [switch]$SelfTestOsr,
+    [switch]$SelfTestOsrDnd,
     [string]$Url = 'https://cn.bing.com/',
     [ValidateRange(0, 60)][int]$SmokeSeconds = 0,
     [switch]$Release,
@@ -73,6 +74,7 @@ try {
     )
     if ($NativeHwnd) { $cliArgs += '--native-hwnd' }
     if ($SelfTestOsr) { $cliArgs += '--self-test-osr' }
+    if ($SelfTestOsrDnd) { $cliArgs += '--self-test-osr-dnd' }
     if ($SmokeSeconds -gt 0) { $cliArgs += @('--smoke-ms', [string]($SmokeSeconds * 1000)) }
 
     $isElevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(

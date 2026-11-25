@@ -86,9 +86,26 @@ impl Scene {
 
     pub fn insert_primitive(&mut self, primitive: impl Into<Primitive>) {
         let mut primitive = primitive.into();
-        let clipped_bounds = primitive
-            .bounds()
-            .intersect(&primitive.content_mask().bounds);
+        let transformed_bounds = match &primitive {
+            Primitive::PolychromeSprite(sprite)
+                if sprite.transformation != TransformationMatrix::unit() =>
+            {
+                Some(transformed_aabb(sprite.bounds, &sprite.transformation))
+            }
+            Primitive::Surface(surface)
+                if surface.transformation != TransformationMatrix::unit() =>
+            {
+                Some(transformed_aabb(surface.bounds, &surface.transformation))
+            }
+            Primitive::MonochromeSprite(sprite)
+                if sprite.transformation != TransformationMatrix::unit() =>
+            {
+                Some(transformed_aabb(sprite.bounds, &sprite.transformation))
+            }
+            _ => None,
+        };
+        let effective_bounds = transformed_bounds.as_ref().unwrap_or_else(|| primitive.bounds());
+        let clipped_bounds = effective_bounds.intersect(&primitive.content_mask().bounds);
 
         if clipped_bounds.is_empty() {
             return;
@@ -755,6 +772,43 @@ pub struct PolychromeSprite {
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
     pub corner_radii: Corners<ScaledPixels>,
+    pub transformation: TransformationMatrix,
+    pub nearest_sampling: PaddedBool32,
+    pub pad2: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<PolychromeSprite>() == 128);
+
+fn transformed_aabb(
+    bounds: Bounds<ScaledPixels>,
+    transformation: &TransformationMatrix,
+) -> Bounds<ScaledPixels> {
+    let x0 = bounds.origin.x.0;
+    let y0 = bounds.origin.y.0;
+    let x1 = x0 + bounds.size.width.0;
+    let y1 = y0 + bounds.size.height.0;
+    let m = transformation.rotation_scale;
+    let t = transformation.translation;
+    let corners = [(x0, y0), (x1, y0), (x0, y1), (x1, y1)];
+    let mut min_x = f32::INFINITY;
+    let mut min_y = f32::INFINITY;
+    let mut max_x = f32::NEG_INFINITY;
+    let mut max_y = f32::NEG_INFINITY;
+    for (cx, cy) in corners {
+        let tx = m[0][0] * cx + m[0][1] * cy + t[0];
+        let ty = m[1][0] * cx + m[1][1] * cy + t[1];
+        min_x = min_x.min(tx);
+        min_y = min_y.min(ty);
+        max_x = max_x.max(tx);
+        max_y = max_y.max(ty);
+    }
+    Bounds {
+        origin: point(ScaledPixels(min_x), ScaledPixels(min_y)),
+        size: crate::size(
+            ScaledPixels((max_x - min_x).max(0.0)),
+            ScaledPixels((max_y - min_y).max(0.0)),
+        ),
+    }
 }
 
 impl From<PolychromeSprite> for Primitive {
@@ -799,6 +853,9 @@ pub struct PaintSurface {
     pub order: DrawOrder,
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
+    pub opacity: f32,
+    pub transformation: TransformationMatrix,
+    pub nearest_sampling: bool,
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     pub image_buffer: objc2_core_foundation::CFRetained<objc2_core_video::CVPixelBuffer>,
     #[cfg(target_os = "windows")]

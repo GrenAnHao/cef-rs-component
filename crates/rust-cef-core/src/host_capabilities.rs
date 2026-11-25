@@ -17,7 +17,7 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
-use crate::contracts::BrowserId;
+use crate::contracts::{BrowserId, BrowserKeyEvent, FocusRequestSource};
 use crate::js_bridge::{MAX_JS_JSON_DEPTH, validate_bounded_json};
 
 pub const MAX_CDP_JSON_BYTES: usize = 512 * 1024;
@@ -332,6 +332,96 @@ pub struct PopupRequest {
     pub policy_allowed: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub enum PopupPolicy {
+    /// Headless unattached `Runtime` defaults to `Deny`; attaching to a UI view
+    /// (`Runtime::attach_browser` -> `CefBrowser` / `NativeCefBrowser`) upgrades
+    /// `Auto` to `AllowNativePopup` (CefSharp default).
+    #[default]
+    Auto = 0,
+    /// Cancel native popup creation (`OnBeforePopup` returns `1` / `true`).
+    Deny = 1,
+    /// Open a managed native popup `HWND` (`SetAsPopup`, tracked & closed with parent/Runtime).
+    AllowNativePopup = 2,
+    /// Cancel native popup `HWND` creation and navigate the opener browser's main frame to `target_url`.
+    NavigateCurrentTab = 3,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PopupDecision {
+    Cancel,
+    AllowNativePopup { no_javascript_access: bool },
+    NavigateCurrentTab,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NavigationDecision {
+    Allow,
+    Cancel,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NavigationRequest {
+    pub browser: BrowserId,
+    pub url: String,
+    pub method: String,
+    pub is_main_frame: bool,
+    pub is_redirect: bool,
+    pub user_gesture: bool,
+    pub transition_type: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DragEnterInfo {
+    pub browser: BrowserId,
+    pub is_link: bool,
+    pub is_fragment: bool,
+    pub is_file: bool,
+    pub link_url: String,
+    pub mask: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DragEnterDecision {
+    Allow,
+    Cancel,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FocusDecision {
+    Allow,
+    Cancel,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PreKeyDecision {
+    PassThrough,
+    PassAsShortcut,
+    Handled,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyEventDecision {
+    PassThrough,
+    Handled,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProtocolExecutionDecision {
+    Deny,
+    AllowOsExecution,
+}
+
+pub type PopupFilter = Arc<dyn Fn(&PopupRequest) -> PopupDecision + Send + Sync>;
+pub type NavigationFilter = Arc<dyn Fn(&NavigationRequest) -> NavigationDecision + Send + Sync>;
+pub type DragEnterFilter = Arc<dyn Fn(&DragEnterInfo) -> DragEnterDecision + Send + Sync>;
+pub type SetFocusFilter = Arc<dyn Fn(BrowserId, FocusRequestSource) -> FocusDecision + Send + Sync>;
+pub type PreKeyFilter = Arc<dyn Fn(BrowserId, &BrowserKeyEvent) -> PreKeyDecision + Send + Sync>;
+pub type KeyEventFilter = Arc<dyn Fn(BrowserId, &BrowserKeyEvent) -> KeyEventDecision + Send + Sync>;
+pub type ProtocolExecutionFilter =
+    Arc<dyn Fn(BrowserId, &str) -> ProtocolExecutionDecision + Send + Sync>;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AuthRequest {
     pub id: HostRequestId,
@@ -573,7 +663,14 @@ pub trait PermissionService: Send + Sync {
 }
 
 pub trait PopupService: Send + Sync {
-    fn on_popup_request(&self, request: PopupRequest);
+    fn on_popup_request(&self, request: PopupRequest) {
+        let _ = request;
+    }
+
+    fn decide_popup(&self, request: PopupRequest) -> PopupDecision {
+        self.on_popup_request(request);
+        PopupDecision::Cancel
+    }
 }
 
 pub trait AuthService: Send + Sync {
@@ -599,6 +696,34 @@ pub trait CdpObserver: Send + Sync {
     fn on_detached(&self, _browser: BrowserId) {}
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AudioStreamConfig {
+    pub channel_layout: i32,
+    pub sample_rate: i32,
+    pub frames_per_buffer: i32,
+}
+
+/// Optional host audio PCM capture service mirroring CefSharp `IAudioHandler`
+/// (`CefSharp/Handler/IAudioHandler.cs:14-72`). When absent in `HostCapabilities`,
+/// CEF uses normal OS speaker output without attaching `CefAudioHandler`.
+pub trait AudioStreamService: Send + Sync {
+    fn configure_stream(
+        &self,
+        _browser: BrowserId,
+        default_config: AudioStreamConfig,
+    ) -> Option<AudioStreamConfig> {
+        Some(default_config)
+    }
+
+    fn on_stream_started(&self, _browser: BrowserId, _config: AudioStreamConfig, _channels: usize) {}
+
+    fn on_stream_packet(&self, _browser: BrowserId, _channels: &[Vec<f32>], _pts: i64) {}
+
+    fn on_stream_stopped(&self, _browser: BrowserId) {}
+
+    fn on_stream_error(&self, _browser: BrowserId, _message: String) {}
+}
+
 #[derive(Clone, Default)]
 pub struct HostCapabilities {
     pub download: Option<Arc<dyn DownloadService>>,
@@ -610,6 +735,40 @@ pub struct HostCapabilities {
     pub certificate: Option<Arc<dyn CertificateService>>,
     pub cookie_access: Option<Arc<dyn CookieAccessPolicy>>,
     pub cdp_observer: Option<Arc<dyn CdpObserver>>,
+    pub audio: Option<Arc<dyn AudioStreamService>>,
+}
+
+impl HostCapabilities {
+    #[must_use]
+    pub fn merge_fallback(&self, fallback: &Self) -> Self {
+        Self {
+            download: self.download.clone().or_else(|| fallback.download.clone()),
+            file_dialog: self
+                .file_dialog
+                .clone()
+                .or_else(|| fallback.file_dialog.clone()),
+            js_dialog: self.js_dialog.clone().or_else(|| fallback.js_dialog.clone()),
+            permission: self
+                .permission
+                .clone()
+                .or_else(|| fallback.permission.clone()),
+            popup: self.popup.clone().or_else(|| fallback.popup.clone()),
+            auth: self.auth.clone().or_else(|| fallback.auth.clone()),
+            certificate: self
+                .certificate
+                .clone()
+                .or_else(|| fallback.certificate.clone()),
+            cookie_access: self
+                .cookie_access
+                .clone()
+                .or_else(|| fallback.cookie_access.clone()),
+            cdp_observer: self
+                .cdp_observer
+                .clone()
+                .or_else(|| fallback.cdp_observer.clone()),
+            audio: self.audio.clone().or_else(|| fallback.audio.clone()),
+        }
+    }
 }
 
 impl fmt::Debug for HostCapabilities {
@@ -624,6 +783,7 @@ impl fmt::Debug for HostCapabilities {
             .field("certificate", &self.certificate.is_some())
             .field("cookie_access", &self.cookie_access.is_some())
             .field("cdp_observer", &self.cdp_observer.is_some())
+            .field("audio", &self.audio.is_some())
             .finish()
     }
 }
@@ -1025,5 +1185,59 @@ mod tests {
             validate_cdp_json(&huge),
             Err(HostCapabilityError::CdpPayloadTooLarge)
         );
+    }
+
+    #[test]
+    fn popup_service_default_decide_popup_delegates_to_on_popup_request_and_cancels() {
+        use std::sync::Mutex;
+        struct RecordingService(Mutex<Vec<PopupRequest>>);
+        impl PopupService for RecordingService {
+            fn on_popup_request(&self, request: PopupRequest) {
+                self.0.lock().unwrap().push(request);
+            }
+        }
+        let svc = RecordingService(Mutex::new(Vec::new()));
+        let req = PopupRequest {
+            browser: bid(7),
+            target_url: "https://example.com/next".into(),
+            target_frame_name: "_blank".into(),
+            disposition: PopupDisposition::NewForegroundTab,
+            user_gesture: true,
+            policy_allowed: true,
+        };
+        assert_eq!(svc.decide_popup(req.clone()), PopupDecision::Cancel);
+        assert_eq!(svc.0.lock().unwrap().as_slice(), &[req]);
+        assert_eq!(PopupPolicy::default(), PopupPolicy::Auto);
+    }
+
+    #[test]
+    fn host_capabilities_merge_fallback_prefers_browser_slot_and_falls_back_to_runtime() {
+        struct GlobalAudio;
+        impl AudioStreamService for GlobalAudio {}
+        struct BrowserPopup;
+        impl PopupService for BrowserPopup {}
+
+        let runtime = HostCapabilities {
+            audio: Some(Arc::new(GlobalAudio)),
+            popup: Some(Arc::new(BrowserPopup)),
+            ..Default::default()
+        };
+        struct CustomPopup;
+        impl PopupService for CustomPopup {}
+        let browser_override = HostCapabilities {
+            popup: Some(Arc::new(CustomPopup)),
+            ..Default::default()
+        };
+        let merged = browser_override.merge_fallback(&runtime);
+        assert!(merged.audio.is_some());
+        assert!(merged.popup.is_some());
+        assert!(Arc::ptr_eq(
+            merged.popup.as_ref().unwrap(),
+            browser_override.popup.as_ref().unwrap()
+        ));
+        assert!(Arc::ptr_eq(
+            merged.audio.as_ref().unwrap(),
+            runtime.audio.as_ref().unwrap()
+        ));
     }
 }

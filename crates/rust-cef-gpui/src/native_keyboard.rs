@@ -182,6 +182,7 @@ pub type HostShortcutPolicy = Rc<dyn Fn(u32, MouseModifiers, bool, &mut Window, 
 pub(crate) enum NativeDownAdmission {
     Admitted(u64),
     Deferred(u64),
+    ConsumedByHostGesture,
     Refused,
 }
 
@@ -215,6 +216,7 @@ struct Envelope {
     nonce: u64,
     key: NativeKey,
     claimed: bool,
+    host_consumed: bool,
     text_allowed: bool,
     epoch: Option<u64>,
 }
@@ -454,19 +456,21 @@ impl NativeKeyboardServices {
                 // by observing propagation=false.
                 if let Some(view) = route.view.upgrade() {
                     app.stop_propagation();
-                    let admission =
-                        view.update(app, |view, _| view.native_key_down(envelope.key, window));
-                    let (epoch, text_allowed) = match admission {
-                        NativeDownAdmission::Admitted(epoch) => (Some(epoch), true),
-                        NativeDownAdmission::Deferred(epoch) => (Some(epoch), false),
-                        NativeDownAdmission::Refused => (None, false),
+                    let admission = view
+                        .update(app, |view, cx| view.native_key_down(envelope.key, window, cx));
+                    let (claim, text_allowed, host_consumed, epoch) = match admission {
+                        NativeDownAdmission::Admitted(epoch) => (true, true, false, Some(epoch)),
+                        NativeDownAdmission::Deferred(epoch) => (true, false, false, Some(epoch)),
+                        NativeDownAdmission::ConsumedByHostGesture => (true, false, true, None),
+                        NativeDownAdmission::Refused => (false, false, false, None),
                     };
-                    if epoch.is_some() {
+                    if claim {
                         let _ = claim_nonce(
                             &intercept_state.current,
                             &event.keystroke,
                             false,
                             text_allowed,
+                            host_consumed,
                             epoch,
                         );
                     }
@@ -793,6 +797,7 @@ fn claim_nonce(
     stroke: &Keystroke,
     up: bool,
     text_allowed: bool,
+    host_consumed: bool,
     epoch: Option<u64>,
 ) -> Option<NativeKey> {
     let mut envelope = slot.get()?;
@@ -800,6 +805,7 @@ fn claim_nonce(
         return None;
     }
     envelope.claimed = true;
+    envelope.host_consumed = host_consumed;
     envelope.text_allowed = text_allowed;
     envelope.epoch = epoch;
     slot.set(Some(envelope));
@@ -1038,6 +1044,7 @@ impl Route {
             nonce,
             key,
             claimed: false,
+            host_consumed: false,
             text_allowed: false,
             epoch: None,
         }));
@@ -1065,7 +1072,16 @@ impl Route {
             return;
         }
         let result = state.current.get();
-        let claimed = result.is_some_and(|envelope| envelope.claimed);
+        let host_consumed = result.is_some_and(|envelope| envelope.claimed && envelope.host_consumed);
+        let claimed = result.is_some_and(|envelope| envelope.claimed && !envelope.host_consumed);
+        if host_consumed && !key.up {
+            let mut exceptions = self.host_exceptions.get();
+            exceptions[index] = true;
+            self.host_exceptions.set(exceptions);
+            let mut diagnostics = state.diagnostics.borrow_mut();
+            diagnostics.host_shortcuts = diagnostics.host_shortcuts.saturating_add(1);
+            return;
+        }
         if claimed {
             let mut owned = self.owned_keys.get();
             owned[index] = !key.up;
@@ -1159,5 +1175,5 @@ pub(crate) fn claim_up(
     {
         return None;
     }
-    claim_nonce(&state.current, &event.keystroke, true, false, None)
+    claim_nonce(&state.current, &event.keystroke, true, false, false, None)
 }

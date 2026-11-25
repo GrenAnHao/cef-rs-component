@@ -10,6 +10,8 @@ mod build_stamp;
 mod capture;
 pub mod client;
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+mod client_handlers;
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 mod cursor_win;
 pub mod deployment;
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
@@ -85,6 +87,8 @@ pub mod outbound_drag;
 pub mod policy;
 mod policy_handlers;
 mod policy_native;
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+pub(crate) mod popup_window;
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 mod print_operations;
 mod print_provider;

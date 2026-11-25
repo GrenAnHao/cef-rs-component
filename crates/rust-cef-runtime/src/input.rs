@@ -57,6 +57,7 @@ pub(crate) struct NativeInput {
     inbound_drag_active: bool,
     touches: ActiveTouchTracker,
     last_pointer: (i32, i32),
+    last_modifiers: MouseModifiers,
     pub(crate) admitted: u64,
     pub(crate) executed: u64,
     pub(crate) rejected: u64,
@@ -95,6 +96,7 @@ impl NativeInput {
         audit: &NativeAudit,
     ) {
         self.last_pointer = (x, y);
+        self.last_modifiers = modifiers;
         audit.record();
         host.send_mouse_move_event(
             Some(&MouseEvent {
@@ -118,6 +120,7 @@ impl NativeInput {
         audit: &NativeAudit,
     ) {
         self.last_pointer = (x, y);
+        self.last_modifiers = modifiers;
         audit.record();
         host.send_mouse_wheel_event(
             Some(&MouseEvent {
@@ -131,11 +134,12 @@ impl NativeInput {
         self.executed = self.executed.saturating_add(1);
     }
 
-    pub(crate) fn dispatch(
+    pub(crate) fn dispatch_with_drag_gate(
         &mut self,
         input: &InputEvent,
         host: &BrowserHost,
         audit: &NativeAudit,
+        osr_drag_active: bool,
     ) -> Result<(), EngineError> {
         validate_native_input(input)?;
         let event = |x, y, modifiers| MouseEvent { x, y, modifiers };
@@ -195,11 +199,14 @@ impl NativeInput {
                 modifiers,
             } => {
                 self.last_pointer = (*x, *y);
-                audit.record();
-                host.send_mouse_move_event(
-                    Some(&event(*x, *y, self.mouse_flags(*modifiers))),
-                    i32::from(*leaving),
-                );
+                self.last_modifiers = *modifiers;
+                if !osr_drag_active {
+                    audit.record();
+                    host.send_mouse_move_event(
+                        Some(&event(*x, *y, self.mouse_flags(*modifiers))),
+                        i32::from(*leaving),
+                    );
+                }
             }
             InputKind::MouseButton {
                 x,
@@ -210,11 +217,14 @@ impl NativeInput {
                 modifiers,
             } => {
                 self.last_pointer = (*x, *y);
+                self.last_modifiers = *modifiers;
                 let id = button_id(*button);
                 if !*up {
                     self.buttons.insert(id);
                 }
-                if let Some(native) = native_button_type(*button) {
+                if osr_drag_active && *up && *button == MouseButton::Left {
+                    self.buttons.remove(&id);
+                } else if let Some(native) = native_button_type(*button) {
                     let flags = self.mouse_flags(*modifiers)
                         & if *up { !button_flag(id) } else { u32::MAX };
                     audit.record();
@@ -432,9 +442,14 @@ impl NativeInput {
             || !self.touches.is_empty()
     }
 
+    pub(crate) fn take_inbound_drag_active(&mut self) -> bool {
+        std::mem::replace(&mut self.inbound_drag_active, false)
+    }
+
     pub(crate) fn dispatch_drag_target(
         &mut self,
         cmd: &InboundDragCommand,
+        osr_drag_data: Option<cef::DragData>,
         host: &BrowserHost,
         audit: &NativeAudit,
     ) -> Result<(), EngineError> {
@@ -453,54 +468,61 @@ impl NativeInput {
                     audit.record();
                     host.drag_target_drag_leave();
                 }
-                audit.record();
-                let mut data =
-                    cef::drag_data_create().ok_or(EngineError::Backend { code: None })?;
-                audit.record();
-                data.reset_file_contents();
-                if let Some(url) = &payload.url
-                    && !url.is_empty()
-                {
+                let mut data = if let Some(cloned) = osr_drag_data {
                     audit.record();
-                    data.set_link_url(Some(&CefString::from(url.as_str())));
-                }
-                if let Some(title) = &payload.url_title
-                    && !title.is_empty()
-                {
+                    cloned.reset_file_contents();
+                    cloned
+                } else {
                     audit.record();
-                    data.set_link_title(Some(&CefString::from(title.as_str())));
-                }
-                if let Some(text) = &payload.text
-                    && !text.is_empty()
-                {
+                    let created =
+                        cef::drag_data_create().ok_or(EngineError::Backend { code: None })?;
                     audit.record();
-                    data.set_fragment_text(Some(&CefString::from(text.as_str())));
-                }
-                if let Some(html) = &payload.html
-                    && !html.is_empty()
-                {
-                    audit.record();
-                    data.set_fragment_html(Some(&CefString::from(html.as_str())));
-                }
-                if let Some(base) = &payload.html_base_url
-                    && !base.is_empty()
-                {
-                    audit.record();
-                    data.set_fragment_base_url(Some(&CefString::from(base.as_str())));
-                }
-                for path in &payload.files {
-                    let text = path.to_str().ok_or(EngineError::InvalidRequest)?;
-                    audit.record();
-                    data.add_file(Some(&CefString::from(text)), None);
-                }
+                    created.reset_file_contents();
+                    if let Some(url) = &payload.url
+                        && !url.is_empty()
+                    {
+                        audit.record();
+                        created.set_link_url(Some(&CefString::from(url.as_str())));
+                    }
+                    if let Some(title) = &payload.url_title
+                        && !title.is_empty()
+                    {
+                        audit.record();
+                        created.set_link_title(Some(&CefString::from(title.as_str())));
+                    }
+                    if let Some(text) = &payload.text
+                        && !text.is_empty()
+                    {
+                        audit.record();
+                        created.set_fragment_text(Some(&CefString::from(text.as_str())));
+                    }
+                    if let Some(html) = &payload.html
+                        && !html.is_empty()
+                    {
+                        audit.record();
+                        created.set_fragment_html(Some(&CefString::from(html.as_str())));
+                    }
+                    if let Some(base) = &payload.html_base_url
+                        && !base.is_empty()
+                    {
+                        audit.record();
+                        created.set_fragment_base_url(Some(&CefString::from(base.as_str())));
+                    }
+                    for path in &payload.files {
+                        let text = path.to_str().ok_or(EngineError::InvalidRequest)?;
+                        audit.record();
+                        created.add_file(Some(&CefString::from(text)), None);
+                    }
+                    created
+                };
                 self.inbound_drag_active = true;
                 self.last_pointer = (*x, *y);
+                let mouse_evt = event(*x, *y, flags(*modifiers));
+                let cef_allowed = crate::outbound_drag::core_mask_to_cef(*allowed_ops);
                 audit.record();
-                host.drag_target_drag_enter(
-                    Some(&mut data),
-                    Some(&event(*x, *y, flags(*modifiers))),
-                    crate::outbound_drag::core_mask_to_cef(*allowed_ops),
-                );
+                host.drag_target_drag_enter(Some(&mut data), Some(&mouse_evt), cef_allowed);
+                audit.record();
+                host.drag_target_drag_over(Some(&mouse_evt), cef_allowed);
             }
             InboundDragCommand::Over {
                 x,

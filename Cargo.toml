@@ -18,6 +18,11 @@ path = "src/bin/component-demo.rs"
 required-features = ["component-demo"]
 
 [[bin]]
+name = "gpui-cef-example"
+path = "src/bin/cef-example.rs"
+required-features = ["component-demo"]
+
+[[bin]]
 name = "gpui-cef-poc"
 path = "src/main.rs"
 required-features = ["legacy-demo"]

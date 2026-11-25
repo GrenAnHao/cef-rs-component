@@ -8,6 +8,9 @@ mod host;
 #[cfg(all(target_os = "windows", target_arch = "x86_64", target_env = "msvc"))]
 #[path = "../component_demo/shell.rs"]
 mod shell;
+#[cfg(all(target_os = "windows", target_arch = "x86_64", target_env = "msvc"))]
+#[path = "../cef_example/mod.rs"]
+mod cef_example;
 
 fn main() {
     #[cfg(all(target_os = "windows", target_arch = "x86_64", target_env = "msvc"))]

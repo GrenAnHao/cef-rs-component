@@ -26,17 +26,23 @@ use gpui::{
 use raw_window_handle::RawWindowHandle;
 use rust_cef_core::{
     contracts::{
-        BrowserCursor, BrowserId, BrowserSurfaceMode, NavigationSnapshot, PixelRect, ShortcutId,
+        BrowserCursor, BrowserId, BrowserSurfaceMode, PixelRect, ShortcutId,
     },
     cursor::{NativeCursorData, StandardCursor},
+    host_capabilities::PopupRequest,
     js_bridge::{EvalOutcome, EvalRequestId, JsFrameScope},
+    outbound_drag::DragOperationMask,
     ports::{BrowserCommand, BrowserEvent, BrowserHandle, CloseMode, CommandId},
 };
 use rust_cef_ui::native_slot::{NativeSlotController, NativeSlotError};
 
 use crate::{
     BrowserAttachment,
-    view::{ViewError, ViewUxState, bounds_dip, checked_scale, window_identity},
+    events::{BrowserViewCallbacks, dispatch_single_view_event},
+    view::{
+        ViewError, ViewUxState, bounds_dip, checked_scale, clear_routing_and_filters,
+        window_identity,
+    },
 };
 
 #[repr(C)]
@@ -95,6 +101,7 @@ unsafe extern "system" {
     fn LoadImageW(h_inst: isize, name: usize, type_: u32, cx: i32, cy: i32, fu_load: u32) -> isize;
     fn SetCursor(h_cursor: isize) -> isize;
     fn GetCursor() -> isize;
+    fn GetCapture() -> isize;
     fn GetDC(hwnd: isize) -> isize;
     fn ReleaseDC(hwnd: isize, hdc: isize) -> i32;
     fn CreateIconIndirect(piconinfo: *const CursorIconInfo) -> isize;
@@ -137,6 +144,8 @@ unsafe extern "system" {
 
 const SMOOTH_RESIZE_SUBCLASS_ID: usize = 0x4345_465F_5253_5A31;
 const SMOOTH_RESIZE_TIMER_ID: usize = 0x4345_4652;
+const SIZEMOVE_POLL_TIMER_ID: usize = 0x4345_4653;
+const SIZEMOVE_POLL_INTERVAL_MS: u32 = 16;
 const WM_CEF_SIZEMOVE_PRESENT: u32 = 0x8043;
 const MOVE_COALESCE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(32);
 const SIZE_COALESCE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(4);
@@ -378,6 +387,12 @@ unsafe fn apply_cursor_if_over_surface(hwnd: isize, rect_px: (i32, i32, i32, i32
     }
 }
 
+#[allow(clashing_extern_declarations)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GetModuleHandleW(lp_module_name: *const u16) -> isize;
+}
+
 #[derive(Default)]
 struct SmoothResizeState {
     in_sizemove: bool,
@@ -388,6 +403,43 @@ struct SmoothResizeState {
     last_size_commit: Option<std::time::Instant>,
     pending_size: Option<(usize, isize)>,
     surface_cursors: Vec<SurfaceCursorEntry>,
+    active_drag_cursor: Option<OwnedWinCursor>,
+    sizemove_sources: Vec<(u64, std::sync::Weak<dyn rust_cef_core::ports::FrameSource>)>,
+}
+
+fn drag_op_cursor(op: DragOperationMask) -> OwnedWinCursor {
+    if op == DragOperationMask::NONE {
+        return OwnedWinCursor::Standard(standard_hcursor(StandardCursor::No));
+    }
+    const IMAGE_CURSOR: u32 = 2;
+    const LR_DEFAULTSIZE: u32 = 0x0040;
+    const LR_SHARED: u32 = 0x8000;
+    const OLE32_UTF16: &[u16] = &[
+        b'o' as u16, b'l' as u16, b'e' as u16, b'3' as u16, b'2' as u16, b'.' as u16,
+        b'd' as u16, b'l' as u16, b'l' as u16, 0,
+    ];
+    let preferred = op.preferred_single_op();
+    let res_id: usize = if preferred == DragOperationMask::COPY {
+        3
+    } else if preferred == DragOperationMask::LINK {
+        4
+    } else if preferred == DragOperationMask::MOVE {
+        2
+    } else {
+        3
+    };
+    let hmod = unsafe { GetModuleHandleW(OLE32_UTF16.as_ptr()) };
+    if hmod != 0 {
+        let hcursor = unsafe { LoadImageW(hmod, res_id, IMAGE_CURSOR, 0, 0, LR_DEFAULTSIZE | LR_SHARED) };
+        if hcursor != 0 {
+            return OwnedWinCursor::Standard(hcursor);
+        }
+    }
+    if preferred == DragOperationMask::MOVE {
+        OwnedWinCursor::Standard(standard_hcursor(StandardCursor::SizeAll))
+    } else {
+        OwnedWinCursor::Standard(standard_hcursor(StandardCursor::Arrow))
+    }
 }
 
 std::thread_local! {
@@ -467,6 +519,16 @@ unsafe extern "system" fn smooth_resize_subclass_proc(
         WM_SETCURSOR => {
             let hit_code = (lparam as usize) & 0xFFFF;
             if hit_code == HTCLIENT && unsafe { IsWindowEnabled(hwnd) != 0 } {
+                let drag_hcursor = SIZEMOVE_STATE.with(|m| {
+                    m.borrow()
+                        .get(&hwnd)
+                        .and_then(|st| st.active_drag_cursor.as_ref())
+                        .map(OwnedWinCursor::raw)
+                });
+                if let Some(hcursor) = drag_hcursor {
+                    let _ = unsafe { SetCursor(hcursor) };
+                    return 1;
+                }
                 let mut pt = Win32Point { x: 0, y: 0 };
                 if unsafe { GetCursorPos(&mut pt) != 0 && ScreenToClient(hwnd, &mut pt) != 0 } {
                     let matched = SIZEMOVE_STATE.with(|m| {
@@ -497,10 +559,19 @@ unsafe extern "system" fn smooth_resize_subclass_proc(
                 st.last_size_commit = None;
                 st.pending_size = None;
             });
+            let _ = unsafe {
+                SetTimer(
+                    hwnd,
+                    SIZEMOVE_POLL_TIMER_ID,
+                    SIZEMOVE_POLL_INTERVAL_MS,
+                    std::ptr::null(),
+                )
+            };
             unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }
         }
         WM_EXITSIZEMOVE => {
             let _ = unsafe { KillTimer(hwnd, SMOOTH_RESIZE_TIMER_ID) };
+            let _ = unsafe { KillTimer(hwnd, SIZEMOVE_POLL_TIMER_ID) };
             let (pending_move, pending_size) = SIZEMOVE_STATE.with(|m| {
                 let mut map = m.borrow_mut();
                 let st = map.entry(hwnd).or_default();
@@ -548,6 +619,7 @@ unsafe extern "system" fn smooth_resize_subclass_proc(
         }
         WM_SIZE if wparam == SIZE_MINIMIZED => {
             let _ = unsafe { KillTimer(hwnd, SMOOTH_RESIZE_TIMER_ID) };
+            let _ = unsafe { KillTimer(hwnd, SIZEMOVE_POLL_TIMER_ID) };
             SIZEMOVE_STATE.with(|m| {
                 if let Some(st) = m.borrow_mut().get_mut(&hwnd) {
                     st.pending_size = None;
@@ -611,6 +683,42 @@ unsafe extern "system" fn smooth_resize_subclass_proc(
             }
             0
         }
+        WM_TIMER if wparam == SIZEMOVE_POLL_TIMER_ID => {
+            let should_redraw = SIZEMOVE_STATE.with(|m| {
+                let mut map = m.borrow_mut();
+                let Some(st) = map.get_mut(&hwnd) else {
+                    return false;
+                };
+                st.sizemove_sources.retain(|(_, w)| w.strong_count() > 0);
+                if !st.in_sizemove || st.sync_painting {
+                    return false;
+                }
+                let has_pending = st
+                    .sizemove_sources
+                    .iter()
+                    .filter_map(|(_, w)| w.upgrade())
+                    .any(|src| src.has_pending_update());
+                if has_pending {
+                    st.sync_painting = true;
+                    true
+                } else {
+                    false
+                }
+            });
+            if should_redraw {
+                if unsafe { IsWindowVisible(hwnd) != 0 } {
+                    let _ = unsafe {
+                        RedrawWindow(hwnd, std::ptr::null(), 0, RDW_INVALIDATE | RDW_UPDATENOW)
+                    };
+                }
+                SIZEMOVE_STATE.with(|m| {
+                    if let Some(st) = m.borrow_mut().get_mut(&hwnd) {
+                        st.sync_painting = false;
+                    }
+                });
+            }
+            0
+        }
         WM_CEF_SIZEMOVE_PRESENT => {
             enum PresentAction {
                 Skip,
@@ -656,6 +764,7 @@ unsafe extern "system" fn smooth_resize_subclass_proc(
         }
         WM_NCDESTROY => {
             let _ = unsafe { KillTimer(hwnd, SMOOTH_RESIZE_TIMER_ID) };
+            let _ = unsafe { KillTimer(hwnd, SIZEMOVE_POLL_TIMER_ID) };
             let removed = SIZEMOVE_STATE.with(|m| m.borrow_mut().remove(&hwnd));
             if let Some(state) = removed {
                 let active = unsafe { GetCursor() };
@@ -787,25 +896,100 @@ pub(crate) fn set_surface_cursor_hover(window: &Window, browser_key: u64, hovere
     }
 }
 
+pub(crate) fn set_window_drag_cursor(window: &Window, op: Option<DragOperationMask>) {
+    let Some(hwnd) = window_hwnd(window) else {
+        return;
+    };
+    let raw = hwnd.get() as isize;
+    if unsafe { IsWindow(raw) == 0 } {
+        return;
+    }
+    let next = op.map(drag_op_cursor);
+    let next_raw = next.as_ref().map(OwnedWinCursor::raw);
+    let old = SIZEMOVE_STATE.with(|m| {
+        let mut map = m.borrow_mut();
+        let st = map.entry(raw).or_default();
+        std::mem::replace(&mut st.active_drag_cursor, next)
+    });
+    if let Some(hcursor) = next_raw {
+        let mut pt = Win32Point { x: 0, y: 0 };
+        let over = unsafe {
+            GetCursorPos(&mut pt) != 0 && (WindowFromPoint(pt) == raw || GetCapture() == raw)
+        };
+        if over && unsafe { IsWindowVisible(raw) != 0 && IsWindowEnabled(raw) != 0 } {
+            let _ = unsafe { SetCursor(hcursor) };
+        }
+    } else if unsafe { IsWindowVisible(raw) != 0 && IsWindowEnabled(raw) != 0 } {
+        let mut pt = Win32Point { x: 0, y: 0 };
+        if unsafe { GetCursorPos(&mut pt) != 0 && WindowFromPoint(pt) == raw } {
+            let mut client_pt = pt;
+            let _ = unsafe { ScreenToClient(raw, &mut client_pt) };
+            let restored = SIZEMOVE_STATE.with(|m| {
+                let map = m.borrow();
+                let st = map.get(&raw)?;
+                st.surface_cursors
+                    .iter()
+                    .rev()
+                    .find(|e| e.hovered && point_in_rect_px(client_pt, e.rect_px))
+                    .map(|e| e.cursor.raw())
+            });
+            let _ = unsafe {
+                SetCursor(restored.unwrap_or_else(|| standard_hcursor(StandardCursor::Arrow)))
+            };
+        }
+    }
+    drop(old);
+}
+
+pub(crate) fn register_sizemove_source(
+    window: &Window,
+    browser_key: u64,
+    source: std::sync::Weak<dyn rust_cef_core::ports::FrameSource>,
+) {
+    let Some(hwnd) = window_hwnd(window) else {
+        return;
+    };
+    let raw = hwnd.get() as isize;
+    if unsafe { IsWindow(raw) == 0 } {
+        return;
+    }
+    SIZEMOVE_STATE.with(|m| {
+        let mut map = m.borrow_mut();
+        let st = map.entry(raw).or_default();
+        st.sizemove_sources
+            .retain(|(k, w)| *k != browser_key && w.strong_count() > 0);
+        st.sizemove_sources.push((browser_key, source));
+    });
+}
+
 pub(crate) fn clear_surface_cursor(hwnd_raw: Option<isize>, browser_key: u64) {
     let Some(raw) = hwnd_raw else {
         return;
     };
-    let removed = SIZEMOVE_STATE.with(|m| {
+    let (removed, old_drag) = SIZEMOVE_STATE.with(|m| {
         let mut map = m.borrow_mut();
-        let st = map.get_mut(&raw)?;
+        let Some(st) = map.get_mut(&raw) else {
+            return (None, None);
+        };
+        st.sizemove_sources
+            .retain(|(k, w)| *k != browser_key && w.strong_count() > 0);
+        let drag = st.active_drag_cursor.take();
         let pos = st
             .surface_cursors
             .iter()
-            .position(|e| e.browser_key == browser_key)?;
-        Some(st.surface_cursors.remove(pos))
+            .position(|e| e.browser_key == browser_key);
+        let removed = pos.map(|i| st.surface_cursors.remove(i));
+        (removed, drag)
     });
-    if let Some(entry) = removed {
-        if matches!(entry.cursor, OwnedWinCursor::Custom(h) if h.get() == unsafe { GetCursor() }) {
-            let _ = unsafe { SetCursor(standard_hcursor(StandardCursor::Arrow)) };
-        }
-        drop(entry);
+    if old_drag.is_some()
+        || removed
+            .as_ref()
+            .is_some_and(|e| matches!(e.cursor, OwnedWinCursor::Custom(h) if h.get() == unsafe { GetCursor() }))
+    {
+        let _ = unsafe { SetCursor(standard_hcursor(StandardCursor::Arrow)) };
     }
+    drop(old_drag);
+    drop(removed);
 }
 
 pub(crate) fn is_window_in_sizemove(window: &Window) -> bool {
@@ -984,6 +1168,10 @@ pub type NativeEvalCompletedCallback = Box<
         &mut Context<NativeCefBrowser>,
     ),
 >;
+pub type NativePopupCallback =
+    Box<dyn FnMut(PopupRequest, &mut NativeCefBrowser, &mut Window, &mut Context<NativeCefBrowser>)>;
+pub type NativeNavigationCallback =
+    Box<dyn FnMut(String, &mut NativeCefBrowser, &mut Window, &mut Context<NativeCefBrowser>)>;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct NativeViewDiagnostics {
@@ -1019,6 +1207,11 @@ pub struct NativeCefBrowser {
     on_shortcut: Option<NativeShortcutCallback>,
     on_js_message: Option<NativeJsMessageCallback>,
     on_eval_completed: Option<NativeEvalCompletedCallback>,
+    on_popup: Option<NativePopupCallback>,
+    on_popup_epoch: u64,
+    on_address_changed: Option<NativeNavigationCallback>,
+    on_address_epoch: u64,
+    callbacks: BrowserViewCallbacks<Self>,
 }
 
 impl NativeCefBrowser {
@@ -1080,6 +1273,11 @@ impl NativeCefBrowser {
             on_shortcut: None,
             on_js_message: None,
             on_eval_completed: None,
+            on_popup: None,
+            on_popup_epoch: 0,
+            on_address_changed: None,
+            on_address_epoch: 0,
+            callbacks: BrowserViewCallbacks::default(),
         });
 
         let release_subscription = cx.observe_release(&view, |view, _app| {
@@ -1093,7 +1291,10 @@ impl NativeCefBrowser {
             if close_view.update(app, |view, _| view.retire()).is_err() {
                 close_token.retire();
                 let _ = close_handle.submit(BrowserCommand::SetVisible(false));
+                clear_routing_and_filters(&close_handle);
                 close_handle.request_close(CloseMode::Graceful);
+            } else {
+                clear_routing_and_filters(&close_handle);
             }
         });
 
@@ -1220,6 +1421,7 @@ impl NativeCefBrowser {
         }
         self.sync_ux(window, cx);
         self.sync_js(window, cx);
+        self.sync_view_events(window, cx);
         cx.notify();
         Ok(())
     }
@@ -1230,13 +1432,23 @@ impl NativeCefBrowser {
         let events = self.handle.take_ux_events();
         let mut focus_taken = Vec::new();
         let mut shortcuts = Vec::new();
+        let mut addresses = Vec::new();
+        let mut popups = Vec::new();
         for event in events {
-            let (focus, shortcut) = self.ux.apply_event(event);
-            if let Some(next) = focus {
-                focus_taken.push(next);
-            }
-            if let Some(id) = shortcut {
-                shortcuts.push(id);
+            match event {
+                BrowserEvent::PopupRequested(req) => popups.push(req),
+                other => {
+                    if let BrowserEvent::AddressChanged(ref addr) = other {
+                        addresses.push(addr.clone());
+                    }
+                    let (focus, shortcut) = self.ux.apply_event(other);
+                    if let Some(next) = focus {
+                        focus_taken.push(next);
+                    }
+                    if let Some(id) = shortcut {
+                        shortcuts.push(id);
+                    }
+                }
             }
         }
         if !focus_taken.is_empty()
@@ -1257,6 +1469,28 @@ impl NativeCefBrowser {
             }
             if self.on_shortcut.is_none() {
                 self.on_shortcut = Some(cb);
+            }
+        }
+        if !addresses.is_empty()
+            && let Some(mut cb) = self.on_address_changed.take()
+        {
+            let epoch = self.on_address_epoch;
+            for addr in addresses {
+                cb(addr, self, window, cx);
+            }
+            if self.on_address_epoch == epoch && self.on_address_changed.is_none() {
+                self.on_address_changed = Some(cb);
+            }
+        }
+        if !popups.is_empty()
+            && let Some(mut cb) = self.on_popup.take()
+        {
+            let epoch = self.on_popup_epoch;
+            for req in popups {
+                cb(req, self, window, cx);
+            }
+            if self.on_popup_epoch == epoch && self.on_popup.is_none() {
+                self.on_popup = Some(cb);
             }
         }
     }
@@ -1289,7 +1523,33 @@ impl NativeCefBrowser {
         }
     }
 
+    fn callbacks_mut(&mut self) -> &mut BrowserViewCallbacks<Self> {
+        &mut self.callbacks
+    }
+
+    fn sync_view_events(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let events = self.handle.take_view_events();
+        for event in events {
+            if let BrowserEvent::DraggableRegionsChanged(ref regions) = event {
+                self.ux.draggable_regions.clone_from(regions);
+            }
+            dispatch_single_view_event(self, event, window, cx, Self::callbacks_mut);
+        }
+    }
+
+    fn clear_callbacks_and_filters(&mut self) {
+        self.on_take_focus = None;
+        self.on_shortcut = None;
+        self.on_js_message = None;
+        self.on_eval_completed = None;
+        self.set_on_popup(None);
+        self.set_on_address_changed(None);
+        self.callbacks.clear_all();
+        clear_routing_and_filters(&self.handle);
+    }
+
     pub fn retire(&mut self) {
+        self.clear_callbacks_and_filters();
         self.slot.borrow_mut().retire();
     }
 
@@ -1305,6 +1565,18 @@ impl NativeCefBrowser {
         &self.ux.status_text
     }
 
+    pub fn favicon_urls(&self) -> &[String] {
+        &self.ux.favicon_urls
+    }
+
+    pub fn fullscreen(&self) -> bool {
+        self.ux.fullscreen
+    }
+
+    pub fn loading_progress(&self) -> f64 {
+        f64::from(self.ux.loading_progress_per_mille) / 1000.0
+    }
+
     pub fn zoom_level(&self) -> f64 {
         f64::from(self.ux.zoom_level_milli) / 1000.0
     }
@@ -1313,8 +1585,17 @@ impl NativeCefBrowser {
         self.ux.audio_muted
     }
 
-    pub fn navigation_snapshot(&self) -> NavigationSnapshot {
-        self.handle.snapshot().navigation
+    crate::events::impl_view_surface_api!();
+
+    pub fn set_on_popup(&mut self, handler: Option<NativePopupCallback>) {
+        self.on_popup_epoch = self.on_popup_epoch.wrapping_add(1);
+        self.handle.set_popup_ui_listener_active(handler.is_some());
+        self.on_popup = handler;
+    }
+
+    pub fn set_on_address_changed(&mut self, handler: Option<NativeNavigationCallback>) {
+        self.on_address_epoch = self.on_address_epoch.wrapping_add(1);
+        self.on_address_changed = handler;
     }
 
     pub fn set_on_take_focus(&mut self, handler: Option<NativeTakeFocusCallback>) {
@@ -1411,6 +1692,7 @@ impl NativeCefBrowser {
 
 impl Drop for NativeCefBrowser {
     fn drop(&mut self) {
+        self.clear_callbacks_and_filters();
         self.slot.borrow_mut().retire();
     }
 }

@@ -53,6 +53,21 @@ impl DragOperationMask {
     pub const fn contains(self, flag: u32) -> bool {
         (self.0 & flag) != 0
     }
+
+    /// Picks a single canonical negotiated operation for `CefBrowserHost::DragSourceEndedAt`.
+    pub const fn preferred_single_op(self) -> Self {
+        if self.0 == DRAG_OP_NONE {
+            Self::NONE
+        } else if self.contains(DRAG_OP_COPY) {
+            Self::COPY
+        } else if self.contains(DRAG_OP_LINK) {
+            Self::LINK
+        } else if self.contains(DRAG_OP_MOVE) {
+            Self::MOVE
+        } else {
+            Self(1u32 << self.0.trailing_zeros())
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -62,13 +77,15 @@ pub struct DragSessionId {
 }
 
 /// Bounded top-down 32-bit unpremultiplied BGRA drag preview image captured from
-/// `CefDragData::GetImage()` + `GetImageHotspot()` for Win32 `SHDRAGIMAGE`.
+/// `CefDragData::GetImage()` + `GetImageHotspot()` for Win32 `SHDRAGIMAGE` / GPUI overlay.
 #[derive(Clone, PartialEq, Eq)]
 pub struct DragImage {
     pub width: u32,
     pub height: u32,
     pub hotspot_x: i32,
     pub hotspot_y: i32,
+    /// Display scale factor used when rasterizing `bgra` and scaling `hotspot_x/y` (e.g. 1250 for 1.25x).
+    pub scale_milli: u32,
     pub bgra: Vec<u8>,
 }
 
@@ -98,8 +115,14 @@ impl DragImage {
             height,
             hotspot_x: hotspot_x.clamp(0, width as i32),
             hotspot_y: hotspot_y.clamp(0, height as i32),
+            scale_milli: 1000,
             bgra,
         })
+    }
+
+    pub fn with_scale_milli(mut self, scale_milli: u32) -> Self {
+        self.scale_milli = scale_milli.max(1);
+        self
     }
 
     pub fn validate(&self) -> Result<(), EngineError> {
@@ -463,6 +486,15 @@ pub struct OutboundDragFinish {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OsrDragFinish {
+    pub drag_id: DragSessionId,
+    pub x: i32,
+    pub y: i32,
+    pub modifiers: crate::ports::MouseModifiers,
+    pub allow_drop: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ActiveDrag {
     drag_id: DragSessionId,
     start_x: i32,
@@ -716,10 +748,44 @@ mod tests {
         let img = DragImage::bounded(4, 2, -5, 99, vec![0xAA; 4 * 2 * 4]).unwrap();
         assert_eq!(img.hotspot_x, 0);
         assert_eq!(img.hotspot_y, 2);
+        assert_eq!(img.scale_milli, 1000);
         assert_eq!(img.validate(), Ok(()));
-        let debug = format!("{img:?}");
+        let scaled = img.with_scale_milli(1500);
+        assert_eq!(scaled.scale_milli, 1500);
+        assert_eq!(scaled.validate(), Ok(()));
+        let clamped_scale = scaled.with_scale_milli(0);
+        assert_eq!(clamped_scale.scale_milli, 1);
+        let debug = format!("{clamped_scale:?}");
         assert!(debug.contains("bgra_bytes: 32"));
         assert!(!debug.contains("170"));
+    }
+
+    #[test]
+    fn preferred_single_op_picks_canonical_operation() {
+        assert_eq!(
+            DragOperationMask::NONE.preferred_single_op(),
+            DragOperationMask::NONE
+        );
+        assert_eq!(
+            DragOperationMask(DRAG_OP_COPY | DRAG_OP_LINK | DRAG_OP_MOVE).preferred_single_op(),
+            DragOperationMask::COPY
+        );
+        assert_eq!(
+            DragOperationMask(DRAG_OP_LINK | DRAG_OP_MOVE).preferred_single_op(),
+            DragOperationMask::LINK
+        );
+        assert_eq!(
+            DragOperationMask::MOVE.preferred_single_op(),
+            DragOperationMask::MOVE
+        );
+        assert_eq!(
+            DragOperationMask::EVERY.preferred_single_op(),
+            DragOperationMask::COPY
+        );
+        assert_eq!(
+            DragOperationMask(DRAG_OP_DELETE).preferred_single_op(),
+            DragOperationMask(DRAG_OP_DELETE)
+        );
     }
 
     #[test]

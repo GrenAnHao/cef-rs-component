@@ -489,7 +489,7 @@ impl HostRequestManager {
         item_info: DownloadUpdateSnapshot,
         callback: Option<DownloadItemCallback>,
         audit: &NativeAudit,
-        policy: &NativePolicy,
+        caps: &HostCapabilities,
     ) {
         let state = item_info.state;
         let (tracked_id, prev_cb, cancel_cb, unconfirmed_cancel) = {
@@ -517,7 +517,7 @@ impl HostRequestManager {
                 let cancel_cb = if cancel_now { callback } else { None };
                 (Some(dl_id), prev_cb, cancel_cb, None)
             } else {
-                let download_enabled = policy.host_capabilities().download.is_some();
+                let download_enabled = caps.download.is_some();
                 let cancel_cb = if book.should_cancel_untracked_update(
                     (browser, item_info.cef_id),
                     state,
@@ -542,7 +542,7 @@ impl HostRequestManager {
             cb.cancel();
         }
         if let Some(id) = tracked_id
-            && let Some(svc) = policy.host_capabilities().download
+            && let Some(ref svc) = caps.download
         {
             svc.on_download_updated(DownloadProgress {
                 id,

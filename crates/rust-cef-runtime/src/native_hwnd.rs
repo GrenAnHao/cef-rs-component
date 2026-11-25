@@ -70,6 +70,7 @@ unsafe extern "system" {
     ) -> i32;
     fn ShowWindow(hwnd: Handle, cmd_show: i32) -> i32;
     fn GetWindowRect(hwnd: Handle, rect: *mut WinRect) -> i32;
+    fn ClientToScreen(hwnd: Handle, point: *mut WinPoint) -> i32;
     fn ScreenToClient(hwnd: Handle, point: *mut WinPoint) -> i32;
     fn DestroyWindow(hwnd: Handle) -> i32;
 }
@@ -106,6 +107,36 @@ pub(crate) fn is_valid_window(hwnd: NonZeroUsize) -> bool {
     let raw = hwnd.get() as Handle;
     // SAFETY: Win32 `IsWindow` safely probes arbitrary handle values.
     unsafe { IsWindow(raw) != 0 }
+}
+
+/// Converts a client-area physical pixel point on `hwnd` to screen physical pixels.
+///
+/// Cross-thread safe: `ClientToScreen` reads win32k geometry without sending window messages.
+pub(crate) fn client_to_screen(hwnd: NonZeroUsize, x_px: i32, y_px: i32) -> Option<(i32, i32)> {
+    if !is_valid_window(hwnd) {
+        return None;
+    }
+    let mut pt = WinPoint { x: x_px, y: y_px };
+    // SAFETY: `pt` is valid stack storage and `hwnd` passed `IsWindow`.
+    if unsafe { ClientToScreen(hwnd.get() as Handle, &mut pt) } == 0 {
+        return None;
+    }
+    Some((pt.x, pt.y))
+}
+
+/// Constructs OSR `WindowInfo` matching CEF `156.0.31` (`cef_win.h:126-130`) and
+/// CefSharp `156.0.15` (`ChromiumWebBrowser.cs:2051-2056` / `LifespanHandler.cs:203-216`).
+pub(crate) fn build_offscreen_window_info(
+    parent_hwnd: Option<NonZeroUsize>,
+    shared_texture_enabled: bool,
+) -> WindowInfo {
+    let parent_handle = match parent_hwnd {
+        Some(hwnd) => cef::sys::HWND(hwnd.get() as *mut c_void as _),
+        None => cef::sys::HWND(std::ptr::null_mut()),
+    };
+    let mut info = WindowInfo::default().set_as_windowless(parent_handle);
+    info.shared_texture_enabled = i32::from(shared_texture_enabled);
+    info
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -502,5 +533,50 @@ mod tests {
         assert!(!is_valid_window(child));
         assert!(is_valid_window(parent));
         assert!(destroy_native_child_hwnd(child, parent));
+    }
+
+    #[test]
+    fn build_offscreen_window_info_binds_parent_hwnd_and_shared_texture() {
+        let hwnd = NonZeroUsize::new(0x1234_5678).unwrap();
+        let with_parent = build_offscreen_window_info(Some(hwnd), true);
+        assert_eq!(with_parent.windowless_rendering_enabled, 1);
+        assert_eq!(with_parent.shared_texture_enabled, 1);
+        assert_eq!(with_parent.runtime_style, RuntimeStyle::ALLOY);
+        assert_eq!(with_parent.parent_window.0 as usize, hwnd.get());
+
+        let without_parent = build_offscreen_window_info(None, false);
+        assert_eq!(without_parent.windowless_rendering_enabled, 1);
+        assert_eq!(without_parent.shared_texture_enabled, 0);
+        assert_eq!(without_parent.runtime_style, RuntimeStyle::ALLOY);
+        assert!(without_parent.parent_window.0.is_null());
+    }
+
+    #[test]
+    fn client_to_screen_converts_real_window_client_pixels_and_rejects_invalid_hwnd() {
+        let class = static_class_wide();
+        let raw = unsafe {
+            CreateWindowExW(
+                0,
+                class.as_ptr(),
+                ptr::null(),
+                WS_POPUP,
+                120,
+                140,
+                400,
+                300,
+                0,
+                0,
+                0,
+                ptr::null_mut(),
+            )
+        };
+        assert_ne!(raw, 0, "popup window must be created");
+        let _guard = ScopedWindow(raw);
+        let hwnd = NonZeroUsize::new(raw as usize).unwrap();
+
+        let (x0, y0) = client_to_screen(hwnd, 0, 0).expect("client_to_screen(0, 0)");
+        let (x1, y1) = client_to_screen(hwnd, 165, 141).expect("client_to_screen(165, 141)");
+        assert_eq!((x1 - x0, y1 - y0), (165, 141));
+        assert_eq!(client_to_screen(NonZeroUsize::new(0xDEAD).unwrap(), 10, 10), None);
     }
 }

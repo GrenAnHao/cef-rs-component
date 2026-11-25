@@ -721,7 +721,22 @@ mod windows {
                 | BrowserEvent::EvalCompleted { .. }
                 | BrowserEvent::StartOutboundDrag(_)
                 | BrowserEvent::OutboundDragCursorChanged(_)
-                | BrowserEvent::AccessibilityTreeUpdated { .. } => None,
+                | BrowserEvent::AccessibilityTreeUpdated { .. }
+                | BrowserEvent::PopupRequested(_)
+                | BrowserEvent::DraggableRegionsChanged(_)
+                | BrowserEvent::AutoResized { .. }
+                | BrowserEvent::MediaAccessChanged { .. }
+                | BrowserEvent::DocumentAvailableInMainFrame
+                | BrowserEvent::FrameCreated(_)
+                | BrowserEvent::FrameAttached { .. }
+                | BrowserEvent::FrameDetached { .. }
+                | BrowserEvent::MainFrameChanged { .. }
+                | BrowserEvent::ContextCreated { .. }
+                | BrowserEvent::ContextReleased { .. }
+                | BrowserEvent::FocusedNodeChanged(_)
+                | BrowserEvent::UncaughtJsException(_)
+                | BrowserEvent::ResourceResponseObserved(_)
+                | BrowserEvent::ResourceLoadCompleted(_) => None,
                 BrowserEvent::CloseCancelled => {
                     state.record_error("unexpected CloseCancelled event");
                     None
@@ -1813,25 +1828,25 @@ mod windows {
             let expected =
                 BrowserId::new(rust_cef_runtime::contracts::RuntimeGeneration::new(1), 1);
             let foreign = BrowserId::new(rust_cef_runtime::contracts::RuntimeGeneration::new(2), 1);
-            let frame = || OwnedFrame {
-                info: rust_cef_runtime::ports::FrameInfo {
-                    browser: foreign,
-                    surface: SurfaceKind::View,
-                    surface_generation: 1,
-                    sequence: 1,
-                    width: FRAME_WIDTH_U32,
-                    height: FRAME_HEIGHT_U32,
-                    format: rust_cef_runtime::ports::PixelFormat::PremultipliedBgra8,
-                },
-                pixels: {
-                    let mut buffer = rust_cef_core::frame_budget::FrameBudget::default()
-                        .allocate((FRAME_WIDTH_U32 * FRAME_HEIGHT_U32 * 4) as usize)
-                        .unwrap();
-                    for pixel in buffer.as_mut_slice().chunks_exact_mut(4) {
-                        pixel.copy_from_slice(&CENTER_BGRA);
-                    }
-                    buffer.freeze()
-                },
+            let frame = || {
+                let mut buffer = rust_cef_core::frame_budget::FrameBudget::default()
+                    .allocate((FRAME_WIDTH_U32 * FRAME_HEIGHT_U32 * 4) as usize)
+                    .unwrap();
+                for pixel in buffer.as_mut_slice().chunks_exact_mut(4) {
+                    pixel.copy_from_slice(&CENTER_BGRA);
+                }
+                OwnedFrame::from_cpu_pixels(
+                    rust_cef_runtime::ports::FrameInfo {
+                        browser: foreign,
+                        surface: SurfaceKind::View,
+                        surface_generation: 1,
+                        sequence: 1,
+                        width: FRAME_WIDTH_U32,
+                        height: FRAME_HEIGHT_U32,
+                        format: rust_cef_runtime::ports::PixelFormat::PremultipliedBgra8,
+                    },
+                    buffer.freeze(),
+                )
             };
             let early = Observations::default();
             FrameSink::publish(&early, frame());

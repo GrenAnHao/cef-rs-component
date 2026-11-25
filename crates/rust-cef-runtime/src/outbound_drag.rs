@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use cef::*;
 use rust_cef_core::contracts::BrowserId;
 use rust_cef_core::outbound_drag::{
-    DragImage, DragOperationMask, DraggedFileContents, DraggedPayload,
+    DragImage, DragOperationMask, DragSessionId, DraggedFileContents, DraggedPayload,
     MAX_DRAG_FILE_CONTENTS_BYTES, MAX_DRAG_FILE_PATH_BYTES, MAX_DRAG_FILE_PATHS,
     MAX_DRAG_IMAGE_BYTES, OutboundDragFinish, OutboundDragLedger, OutboundDragStart,
 };
@@ -98,7 +98,9 @@ fn extract_drag_image(data: &DragData, scale_factor: f32) -> Option<DragImage> {
     let hotspot = data.image_hotspot();
     let hotspot_x = (hotspot.x as f32 * actual_scale).round() as i32;
     let hotspot_y = (hotspot.y as f32 * actual_scale).round() as i32;
+    let scale_milli = (actual_scale * 1000.0).round().max(1.0) as u32;
     DragImage::bounded(width, height, hotspot_x, hotspot_y, bgra)
+        .map(|img| img.with_scale_milli(scale_milli))
 }
 
 wrap_write_handler! {
@@ -204,9 +206,19 @@ pub(crate) fn extract_drag_payload(data: &DragData, scale_factor: f32) -> Dragge
         .with_image(image)
 }
 
+/// Native CEF `DragData` + target-tracking state retained on the CEF UI thread
+/// for an in-flight OSR HTML5 drag session.
+pub(crate) struct ActiveNativeOsrDrag {
+    pub(crate) drag_id: DragSessionId,
+    pub(crate) drag_data: Option<DragData>,
+    pub(crate) allowed_ops: DragOperationsMask,
+    pub(crate) target_entered: bool,
+}
+
 /// Manages single-in-flight asynchronous outbound drag state per Browser.
 pub(crate) struct OutboundDragManager {
     ledgers: Mutex<BTreeMap<BrowserId, OutboundDragLedger>>,
+    native_drags: Mutex<BTreeMap<BrowserId, ActiveNativeOsrDrag>>,
     active: AtomicU64,
 }
 
@@ -214,10 +226,12 @@ impl OutboundDragManager {
     pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self {
             ledgers: Mutex::new(BTreeMap::new()),
+            native_drags: Mutex::new(BTreeMap::new()),
             active: AtomicU64::new(0),
         })
     }
 
+    #[allow(dead_code)]
     pub(crate) fn begin(
         &self,
         browser: BrowserId,
@@ -233,6 +247,72 @@ impl OutboundDragManager {
         Ok(started)
     }
 
+    pub(crate) fn begin_osr(
+        &self,
+        browser: BrowserId,
+        payload: DraggedPayload,
+        allowed_ops: DragOperationMask,
+        cef_allowed_ops: DragOperationsMask,
+        drag_data: DragData,
+        x: i32,
+        y: i32,
+    ) -> Result<OutboundDragStart, EngineError> {
+        let started = {
+            let mut guard = lock(&self.ledgers);
+            let ledger = guard.entry(browser).or_default();
+            let started = ledger.begin(browser, payload, allowed_ops, x, y)?;
+            self.active.fetch_add(1, Ordering::AcqRel);
+            started
+        };
+        let mut native = lock(&self.native_drags);
+        native.insert(
+            browser,
+            ActiveNativeOsrDrag {
+                drag_id: started.drag_id,
+                drag_data: Some(drag_data),
+                allowed_ops: cef_allowed_ops,
+                target_entered: false,
+            },
+        );
+        Ok(started)
+    }
+
+    pub(crate) fn cloned_drag_data_for_browser(&self, browser: BrowserId) -> Option<DragData> {
+        let guard = lock(&self.native_drags);
+        let state = guard.get(&browser)?;
+        state
+            .drag_data
+            .as_ref()
+            .and_then(|d| cef::ImplDragData::clone(d).or_else(|| Some(Clone::clone(d))))
+    }
+
+    pub(crate) fn prepare_osr_drag_move(
+        &self,
+        drag_id: DragSessionId,
+        in_view: bool,
+    ) -> Option<(bool, DragOperationsMask, Option<DragData>)> {
+        let mut native = lock(&self.native_drags);
+        let state = native.get_mut(&drag_id.browser)?;
+        if state.drag_id != drag_id {
+            return None;
+        }
+        let was_entered = state.target_entered;
+        if in_view {
+            if !was_entered {
+                state.target_entered = true;
+                let data = state.drag_data.clone();
+                return Some((false, state.allowed_ops, data));
+            }
+            Some((true, state.allowed_ops, None))
+        } else {
+            if was_entered {
+                state.target_entered = false;
+                return Some((true, state.allowed_ops, None));
+            }
+            None
+        }
+    }
+
     pub(crate) fn update_cursor(&self, browser: BrowserId, op: DragOperationMask) -> bool {
         let mut guard = lock(&self.ledgers);
         guard
@@ -243,22 +323,49 @@ impl OutboundDragManager {
     pub(crate) fn complete(
         &self,
         finish: OutboundDragFinish,
-    ) -> Result<OutboundDragFinish, EngineError> {
-        let mut guard = lock(&self.ledgers);
-        let ledger = guard
-            .get_mut(&finish.drag_id.browser)
-            .ok_or(EngineError::InvalidRequest)?;
-        let done = ledger.finish(finish)?;
-        self.active.fetch_sub(1, Ordering::AcqRel);
-        Ok(done)
+    ) -> Result<(OutboundDragFinish, Option<ActiveNativeOsrDrag>), EngineError> {
+        let done = {
+            let mut guard = lock(&self.ledgers);
+            let ledger = guard
+                .get_mut(&finish.drag_id.browser)
+                .ok_or(EngineError::InvalidRequest)?;
+            let done = ledger.finish(finish)?;
+            self.active.fetch_sub(1, Ordering::AcqRel);
+            done
+        };
+        let native = {
+            let mut guard = lock(&self.native_drags);
+            if guard
+                .get(&finish.drag_id.browser)
+                .is_some_and(|s| s.drag_id == finish.drag_id)
+            {
+                guard.remove(&finish.drag_id.browser)
+            } else {
+                None
+            }
+        };
+        Ok((done, native))
     }
 
-    pub(crate) fn take_active_for_browser(&self, browser: BrowserId) -> Option<OutboundDragFinish> {
-        let mut guard = lock(&self.ledgers);
-        let mut ledger = guard.remove(&browser)?;
-        let cancelled = ledger.cancel_active()?;
-        self.active.fetch_sub(1, Ordering::AcqRel);
-        Some(cancelled)
+    pub(crate) fn take_active_for_browser(
+        &self,
+        browser: BrowserId,
+    ) -> Option<(OutboundDragFinish, Option<ActiveNativeOsrDrag>)> {
+        let cancelled = {
+            let mut guard = lock(&self.ledgers);
+            let mut ledger = guard.remove(&browser)?;
+            let cancelled = ledger.cancel_active()?;
+            self.active.fetch_sub(1, Ordering::AcqRel);
+            cancelled
+        };
+        let native = lock(&self.native_drags).remove(&browser);
+        Some((cancelled, native))
+    }
+
+    pub(crate) fn drain_all_native(&self) -> Vec<DragData> {
+        let mut native = lock(&self.native_drags);
+        let drained = std::mem::take(&mut *native);
+        drained.into_values().filter_map(|v| v.drag_data).collect()
     }
 
     pub(crate) fn pending_count(&self) -> u64 {
@@ -316,7 +423,8 @@ mod tests {
                 x: 0,
                 y: 0,
                 operation: DragOperationMask::NONE,
-            }),
+            })
+            .map(|(d, _)| d),
             Err(EngineError::InvalidRequest)
         );
         assert_eq!(mgr.pending_count(), 1);
@@ -327,17 +435,17 @@ mod tests {
             y: 50,
             operation: DragOperationMask::COPY,
         };
-        assert_eq!(mgr.complete(finish), Ok(finish));
+        assert_eq!(mgr.complete(finish).map(|(d, _)| d), Ok(finish));
         assert_eq!(mgr.pending_count(), 0);
         assert!(mgr.is_clear());
-        assert_eq!(mgr.complete(finish), Err(EngineError::InvalidRequest));
+        assert_eq!(mgr.complete(finish).map(|(d, _)| d), Err(EngineError::InvalidRequest));
 
         // Close cancels remaining active drag and drops barrier count to zero.
         let s2 = mgr
             .begin(browser(2), payload, DragOperationMask::MOVE, 5, 6)
             .unwrap();
         assert_eq!(mgr.pending_count(), 1);
-        let cancelled = mgr.take_active_for_browser(browser(2)).unwrap();
+        let (cancelled, _) = mgr.take_active_for_browser(browser(2)).unwrap();
         assert_eq!(cancelled.drag_id, s2.drag_id);
         assert_eq!(cancelled.operation, DragOperationMask::NONE);
         assert_eq!(mgr.pending_count(), 0);

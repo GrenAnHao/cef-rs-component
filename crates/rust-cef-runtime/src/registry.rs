@@ -47,6 +47,13 @@ use crate::{
 };
 
 const MAX_UX_EVENTS: usize = 64;
+const MAX_VIEW_EVENTS: usize = 256;
+
+struct ViewEventBuffer {
+    events: VecDeque<BrowserEvent>,
+    created_emitted: bool,
+    terminal_emitted: bool,
+}
 const FAST_MOUSE_MOVE_CAPACITY: usize = 2048;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -212,6 +219,15 @@ impl FastMouseMoveQueue {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         std::mem::take(&mut st.queue)
     }
+
+    fn clear_moves(&self) {
+        let mut st = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        st.queue
+            .retain(|item| !matches!(item.kind, FastPointerKind::Move { .. }));
+    }
 }
 
 /// Coalesces adjacent fast wheel items with matching modifiers while preserving
@@ -261,6 +277,7 @@ fn dispatch_fast_pointer_batch(
     ledger: &mut crate::input::NativeInput,
     host: &cef::BrowserHost,
     audit: &NativeAudit,
+    osr_drag_active: bool,
 ) -> u64 {
     let coalesced = coalesce_fast_pointer_batch(batch);
     let mut dispatched = 0u64;
@@ -272,7 +289,9 @@ fn dispatch_fast_pointer_batch(
                 leaving,
                 modifiers,
             } => {
-                ledger.dispatch_mouse_move_raw(x, y, leaving, modifiers, host, audit);
+                if !osr_drag_active {
+                    ledger.dispatch_mouse_move_raw(x, y, leaving, modifiers, host, audit);
+                }
             }
             FastPointerKind::Wheel {
                 x,
@@ -287,6 +306,95 @@ fn dispatch_fast_pointer_batch(
         dispatched += 1;
     }
     dispatched
+}
+
+#[derive(Clone, Copy)]
+struct FastOsrDragSample {
+    drag_id: rust_cef_core::outbound_drag::DragSessionId,
+    x: i32,
+    y: i32,
+    modifiers: MouseModifiers,
+    in_view: bool,
+}
+
+#[derive(Default)]
+struct FastOsrDragState {
+    pending: Option<FastOsrDragSample>,
+    scheduled: bool,
+}
+
+pub(crate) struct FastOsrDragSlot {
+    ready: AtomicBool,
+    state: Mutex<FastOsrDragState>,
+}
+
+impl FastOsrDragSlot {
+    fn new() -> Self {
+        Self {
+            ready: AtomicBool::new(false),
+            state: Mutex::new(FastOsrDragState::default()),
+        }
+    }
+
+    fn is_ready(&self) -> bool {
+        self.ready.load(Ordering::Acquire)
+    }
+
+    fn set_ready(&self, ready: bool) {
+        self.ready.store(ready, Ordering::Release);
+        if !ready {
+            let mut st = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            st.pending = None;
+            st.scheduled = false;
+        }
+    }
+
+    fn enqueue(&self, sample: FastOsrDragSample) -> Result<bool, EngineError> {
+        if !self.is_ready() {
+            return Err(EngineError::NotReady);
+        }
+        let mut st = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !self.is_ready() {
+            return Err(EngineError::NotReady);
+        }
+        st.pending = Some(sample);
+        let should_post = !st.scheduled;
+        if should_post {
+            st.scheduled = true;
+        }
+        Ok(should_post)
+    }
+
+    fn clear_scheduled(&self) {
+        let mut st = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        st.scheduled = false;
+    }
+
+    fn clear_pending(&self) {
+        let mut st = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        st.pending = None;
+    }
+
+    fn take_for_task(&self) -> Option<FastOsrDragSample> {
+        let mut st = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        st.scheduled = false;
+        st.pending.take()
+    }
 }
 
 #[derive(Default)]
@@ -388,6 +496,24 @@ fn is_ux_event(event: &BrowserEvent) -> bool {
             | BrowserEvent::StartOutboundDrag(_)
             | BrowserEvent::OutboundDragCursorChanged(_)
             | BrowserEvent::AccessibilityTreeUpdated { .. }
+            | BrowserEvent::AddressChanged(_)
+            | BrowserEvent::PopupRequested(_)
+    )
+}
+
+fn should_buffer_view_event(event: &BrowserEvent) -> bool {
+    !matches!(
+        event,
+        BrowserEvent::StartOutboundDrag(_)
+            | BrowserEvent::OutboundDragCursorChanged(_)
+            | BrowserEvent::JsMessageReceived { .. }
+            | BrowserEvent::EvalCompleted { .. }
+            | BrowserEvent::AccessibilityTreeUpdated { .. }
+            | BrowserEvent::CaptureFailed(_)
+            | BrowserEvent::PopupRequested(_)
+            | BrowserEvent::FocusTaken { .. }
+            | BrowserEvent::HostShortcutTriggered { .. }
+            | BrowserEvent::AddressChanged(_)
     )
 }
 
@@ -481,11 +607,15 @@ struct Entry {
     eval_events: VecDeque<BrowserEvent>,
     ax_tree: Arc<crate::accessibility::RuntimeAccessibilityState>,
     cursor_slot: rust_cef_core::cursor::CursorSlot,
+    native_context_menu: rust_cef_core::menu::NativeContextMenuSlot,
     native_hwnd: Option<crate::native_hwnd::ChildHwndState>,
     drag_target_op: Arc<AtomicU32>,
+    osr_drag_active: Arc<AtomicBool>,
     fast_mouse: Arc<FastMouseMoveQueue>,
+    fast_osr_drag: Arc<FastOsrDragSlot>,
     fast_zoom: Arc<FastZoomSlot>,
     input_mouse_cuts: BTreeMap<u64, u64>,
+    routing: Arc<crate::client::PopupAndNavRoutingState>,
 }
 
 struct DeferredClose {
@@ -505,6 +635,7 @@ impl Entry {
             && !self.session.input_reset_pending()
             && !self.session.input_retired();
         self.fast_mouse.set_ready(ready);
+        self.fast_osr_drag.set_ready(ready);
         self.fast_zoom.set_ready(live);
     }
 
@@ -575,6 +706,7 @@ pub(crate) struct UiRegistry {
     pub(crate) devtools: Arc<crate::devtools::DevToolsLedger>,
     pub(crate) auxiliary_native: crate::devtools::resources::NativeAuxiliaries,
     pub(crate) auxiliary_windows: crate::devtools::windows::NativeWindows,
+    pub(crate) popups: Arc<crate::popup_window::PopupLedger>,
     pub(crate) host_requests: Arc<crate::host_requests::HostRequestManager>,
     pub(crate) pdf_exports: Arc<crate::pdf_export::PdfExportRegistry>,
     pub(crate) headless_cdp: Arc<crate::headless_cdp::HeadlessCdpManager>,
@@ -611,6 +743,7 @@ pub(crate) struct UiRegistry {
     menu_handler_requests: AtomicU64,
     menu_handler_bound: AtomicU64,
     evals: Mutex<EvalLedger>,
+    view_events: Mutex<BTreeMap<BrowserId, ViewEventBuffer>>,
     js_messages_dropped: AtomicU64,
     audit: Arc<NativeAudit>,
     windowless_rendering_enabled: AtomicBool,
@@ -709,6 +842,7 @@ impl UiRegistry {
             prints: crate::print_operations::PrintOperations::default(),
             auxiliary_native: crate::devtools::resources::NativeAuxiliaries::new(devtools.clone()),
             auxiliary_windows: crate::devtools::windows::NativeWindows::new(devtools.clone()),
+            popups: crate::popup_window::PopupLedger::new(),
             host_requests: crate::host_requests::HostRequestManager::new(),
             pdf_exports: crate::pdf_export::PdfExportRegistry::new(),
             headless_cdp: crate::headless_cdp::HeadlessCdpManager::new(),
@@ -738,6 +872,7 @@ impl UiRegistry {
             menu_handler_requests: AtomicU64::new(0),
             menu_handler_bound: AtomicU64::new(0),
             evals: Mutex::new(EvalLedger::new()),
+            view_events: Mutex::new(BTreeMap::new()),
             js_messages_dropped: AtomicU64::new(0),
             audit,
             windowless_rendering_enabled: AtomicBool::new(true),
@@ -877,15 +1012,19 @@ impl UiRegistry {
         self.url_requests.get().and_then(Weak::upgrade)
     }
 
-    pub(crate) fn begin_outbound_drag(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn begin_outbound_drag_osr(
         &self,
         browser: BrowserId,
+        _host: &cef::BrowserHost,
         payload: rust_cef_core::outbound_drag::DraggedPayload,
         allowed_ops: rust_cef_core::outbound_drag::DragOperationMask,
+        cef_allowed_ops: cef::DragOperationsMask,
+        cloned_drag_data: cef::DragData,
         x: i32,
         y: i32,
     ) -> Result<(), EngineError> {
-        {
+        let (drag_flag, fast_mouse, drag_target_op) = {
             let state = self.lock();
             if state.draining {
                 return Err(EngineError::Closing);
@@ -896,10 +1035,26 @@ impl UiRegistry {
             if entry.cleanup_started || entry.session.snapshot().state != SessionState::Alive {
                 return Err(EngineError::Closing);
             }
-        }
-        let started = self
-            .outbound_drags
-            .begin(browser, payload, allowed_ops, x, y)?;
+            (
+                entry.osr_drag_active.clone(),
+                entry.fast_mouse.clone(),
+                entry.drag_target_op.clone(),
+            )
+        };
+        cloned_drag_data.reset_file_contents();
+        let started = self.outbound_drags.begin_osr(
+            browser,
+            payload,
+            allowed_ops,
+            cef_allowed_ops,
+            cloned_drag_data,
+            x,
+            y,
+        )?;
+        drag_flag.store(true, Ordering::Release);
+        fast_mouse.clear_moves();
+        drag_target_op.store(0, Ordering::Release);
+        self.clear_input_buttons(browser);
         self.navigation_event(browser, BrowserEvent::StartOutboundDrag(started));
         Ok(())
     }
@@ -920,6 +1075,25 @@ impl UiRegistry {
         }
         if notify_outbound && self.outbound_drags.update_cursor(browser, op) {
             self.navigation_event(browser, BrowserEvent::OutboundDragCursorChanged(op));
+        }
+    }
+
+    pub(crate) fn reset_drag_target_op(&self, browser: BrowserId) {
+        let target_op = self
+            .lock()
+            .browsers
+            .get(&browser)
+            .map(|e| e.drag_target_op.clone());
+        if let Some(atomic) = target_op {
+            atomic.store(0, Ordering::Release);
+        }
+    }
+
+    pub(crate) fn clear_osr_drag_active(&self, browser: BrowserId) {
+        let state = self.lock();
+        if let Some(entry) = state.browsers.get(&browser) {
+            entry.osr_drag_active.store(false, Ordering::Release);
+            entry.fast_osr_drag.clear_pending();
         }
     }
 
@@ -963,6 +1137,29 @@ impl UiRegistry {
         Ok(id)
     }
 
+    pub(crate) fn submit_osr_drag_finish(
+        &self,
+        browser: BrowserId,
+        executor: &Executor,
+        finish: rust_cef_core::outbound_drag::OsrDragFinish,
+    ) -> Result<CommandId, EngineError> {
+        if finish.drag_id.browser != browser || browser.runtime() != self.runtime {
+            return Err(EngineError::WrongRuntime);
+        }
+        let mut state = self.lock();
+        let entry = state
+            .browsers
+            .get_mut(&browser)
+            .ok_or(EngineError::Closed)?;
+        let envelope = entry.session.admit_osr_drag_finish(finish)?;
+        let id = envelope.id;
+        if let Err(error) = executor.post_while_draining(TaskPayload::Command(envelope)) {
+            entry.session.cancel_command(id);
+            return Err(error);
+        }
+        Ok(id)
+    }
+
     pub(crate) fn ax_tree_slot(
         &self,
         browser: BrowserId,
@@ -997,6 +1194,24 @@ impl UiRegistry {
             return Err(EngineError::Closed);
         }
         Ok(entry.cursor_slot.clone())
+    }
+
+    pub(crate) fn native_context_menu_slot(
+        &self,
+        browser: BrowserId,
+    ) -> Result<rust_cef_core::menu::NativeContextMenuSlot, EngineError> {
+        if browser.runtime() != self.runtime {
+            return Err(EngineError::WrongRuntime);
+        }
+        let state = self.lock();
+        let entry = state.browsers.get(&browser).ok_or(EngineError::Closed)?;
+        if matches!(
+            entry.session.snapshot().state,
+            SessionState::Closed | SessionState::CreateFailed
+        ) {
+            return Err(EngineError::Closed);
+        }
+        Ok(entry.native_context_menu.clone())
     }
 
     pub(crate) fn policy(&self) -> Option<Arc<NativePolicy>> {
@@ -1063,7 +1278,10 @@ impl UiRegistry {
             Entry {
                 session,
                 document_epoch: 1,
-                viewport: Arc::new(ViewportState::new(config.viewport)),
+                viewport: Arc::new(ViewportState::new_with_parent(
+                    config.viewport,
+                    config.options.parent_hwnd,
+                )),
                 store,
                 client_state: None,
                 #[cfg(feature = "test-support")]
@@ -1111,14 +1329,76 @@ impl UiRegistry {
                 eval_events: VecDeque::new(),
                 ax_tree,
                 cursor_slot: rust_cef_core::cursor::CursorSlot::new(),
+                native_context_menu: rust_cef_core::menu::NativeContextMenuSlot::new(),
                 native_hwnd,
                 drag_target_op: Arc::new(AtomicU32::new(0)),
+                osr_drag_active: Arc::new(AtomicBool::new(false)),
                 fast_mouse: Arc::new(FastMouseMoveQueue::new()),
+                fast_osr_drag: Arc::new(FastOsrDragSlot::new()),
                 fast_zoom: Arc::new(FastZoomSlot::new()),
                 input_mouse_cuts: BTreeMap::new(),
+                routing: Arc::new(crate::client::PopupAndNavRoutingState::new(
+                    config.options.popup_policy,
+                )),
             },
         );
         Ok(())
+    }
+
+    pub(crate) fn post_popup_close(&self, slot: crate::popup_window::PopupSlotId) {
+        if let Some(executor) = self.executor() {
+            let _ = executor.post_close(TaskPayload::ClosePopup { slot });
+        }
+    }
+
+    pub(crate) fn post_popup_client_released(&self, slot: crate::popup_window::PopupSlotId) {
+        if let Some(executor) = self.executor()
+            && executor
+                .post_while_draining(TaskPayload::PopupClientReleased { slot })
+                .is_ok()
+        {
+            return;
+        }
+        self.popups.on_client_released(slot);
+    }
+
+    pub(crate) fn close_child_popups(&self, owner: Option<BrowserId>, stop_admission: bool) {
+        let slots = self.popups.collect_closes(owner, stop_admission);
+        if slots.is_empty() {
+            return;
+        }
+        if let Some(executor) = self.executor() {
+            for slot in slots {
+                let _ = executor.post_close(TaskPayload::ClosePopup { slot });
+            }
+        }
+    }
+
+    pub(crate) fn post_navigate_main_frame(&self, browser: BrowserId, url: String) {
+        if let Some(executor) = self.executor() {
+            let _ = executor.post(TaskPayload::NavigateMainFrame { browser, url });
+        }
+    }
+
+    pub(crate) fn open_managed_popup_client(
+        self: &Arc<Self>,
+        owner: BrowserId,
+        popup_id: i32,
+        policy: Arc<NativePolicy>,
+    ) -> Result<Client, EngineError> {
+        {
+            let state = self.lock();
+            if state.draining {
+                return Err(EngineError::Closing);
+            }
+            let Some(entry) = state.browsers.get(&owner) else {
+                return Err(EngineError::Closed);
+            };
+            if entry.cleanup_started || entry.session.snapshot().state != SessionState::Alive {
+                return Err(EngineError::Closing);
+            }
+        }
+        crate::popup_window::build_popup_client(self, owner, popup_id, policy)
     }
 
     pub(crate) fn set_draining(&self) {
@@ -1133,6 +1413,7 @@ impl UiRegistry {
         let mut ime_invalidated = false;
         for (browser, entry) in &mut state.browsers {
             entry.fast_mouse.set_ready(false);
+            entry.fast_osr_drag.set_ready(false);
             entry.fast_zoom.set_ready(false);
             // Drainage invalidates composition geometry for every instance,
             // including one that never admitted text input.
@@ -1154,6 +1435,7 @@ impl UiRegistry {
         }
         drop(state);
         self.post_auxiliary_closes(auxiliary_closes);
+        self.close_child_popups(None, true);
         if ime_invalidated {
             let _ = self.ui.wake();
         }
@@ -1430,6 +1712,22 @@ impl UiRegistry {
         }
     }
 
+    pub(crate) fn take_inbound_drag_active(&self, browser: BrowserId) -> bool {
+        if browser.runtime() != self.runtime {
+            return false;
+        }
+        let mut state = self.lock();
+        let Some(entry) = state.browsers.get_mut(&browser) else {
+            return false;
+        };
+        let shadow_was = entry.input_shadow.take_inbound_drag_active();
+        let live_was = entry
+            .input
+            .as_mut()
+            .is_some_and(crate::input::NativeInput::take_inbound_drag_active);
+        shadow_was || live_was
+    }
+
     pub(crate) fn browser_screen_point(
         &self,
         browser: BrowserId,
@@ -1634,6 +1932,7 @@ impl UiRegistry {
             + self.finds.pending()
             + self.prints.pending()
             + self.devtools.pending()
+            + self.popups.pending()
             + self.lock_evals().pending_count()
             + self.host_requests.pending_count()
             + self.pdf_exports.pending_count()
@@ -1708,6 +2007,7 @@ impl UiRegistry {
         let _ = self.sources.cancel(None, None, None);
         self.cancel_finds(None, None);
         self.request_auxiliary_close(None, None);
+        self.close_child_popups(None, true);
         self.cancel_all_evals(EvalError::Closed);
         let caps = self.host_capabilities();
         self.host_requests.cancel_all(&self.audit, &caps);
@@ -2881,6 +3181,7 @@ impl UiRegistry {
         let mut ime_cleared = false;
         let mut ax_tree = None;
         let mut cursor_slot = None;
+        let mut native_context_menu = None;
         let emit = {
             let mut state = self.lock();
             match state.browsers.get_mut(&browser) {
@@ -2905,6 +3206,7 @@ impl UiRegistry {
                     capture = entry.capture.clone();
                     ax_tree = Some(entry.ax_tree.clone());
                     cursor_slot = Some(entry.cursor_slot.clone());
+                    native_context_menu = Some(entry.native_context_menu.clone());
                     true
                 }
                 _ => false,
@@ -2915,6 +3217,9 @@ impl UiRegistry {
         }
         if let Some(cursor_slot) = cursor_slot {
             cursor_slot.clear();
+        }
+        if let Some(native_context_menu) = native_context_menu {
+            native_context_menu.clear();
         }
         if ime_cleared {
             let _ = self.ui.wake();
@@ -3124,7 +3429,17 @@ impl UiRegistry {
     /// the CEF UI sequence in both modes, so the reference is dropped here,
     /// after the lock is released and outside any host borrow.
     pub(crate) fn before_close(&self, browser: BrowserId) {
-        let (report, native, client, store, frame_wake, ime_cleared, ax_tree, cursor_slot) = {
+        let (
+            report,
+            native,
+            client,
+            store,
+            frame_wake,
+            ime_cleared,
+            ax_tree,
+            cursor_slot,
+            native_context_menu,
+        ) = {
             let mut state = self.lock();
             let Some(entry) = state.browsers.get_mut(&browser) else {
                 return;
@@ -3192,10 +3507,12 @@ impl UiRegistry {
                 ime_cleared,
                 entry.ax_tree.clone(),
                 entry.cursor_slot.clone(),
+                entry.native_context_menu.clone(),
             )
         };
         ax_tree.clear();
         cursor_slot.clear();
+        native_context_menu.clear();
         let _ = self.outbound_drags.take_active_for_browser(browser);
         // Do not guess that OnBeforeClose still owns a live menu manager.
         // Normal close/drain cancels earlier; unexpected survivors fault/leak.
@@ -3206,6 +3523,7 @@ impl UiRegistry {
         self.prints.browser_closed(browser);
         // Parent OnBeforeClose does not prove its DevTools has been destroyed.
         self.request_auxiliary_close(Some(browser), None);
+        self.close_child_popups(Some(browser), false);
         self.menu_bridge.remove(browser);
         wake_frames(&store, &self.ui, frame_wake);
         if ime_cleared {
@@ -3492,6 +3810,27 @@ impl UiRegistry {
             return Err(AttachmentError::AlreadyAttached);
         }
         entry.view_attachment_claimed = true;
+        entry.routing.set_view_attached(true);
+        let seed_created =
+            entry.created_reported || entry.session.snapshot().state == SessionState::Alive;
+        {
+            let mut view_events = self
+                .view_events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut initial = VecDeque::new();
+            if seed_created {
+                initial.push_back(BrowserEvent::Created);
+            }
+            view_events.insert(
+                browser,
+                ViewEventBuffer {
+                    events: initial,
+                    created_emitted: seed_created,
+                    terminal_emitted: false,
+                },
+            );
+        }
         let source: Arc<dyn FrameSource> = entry.store.clone();
         Ok((source, entry.session.surface_mode()))
     }
@@ -3628,6 +3967,7 @@ impl UiRegistry {
             && self.auxiliary_native.is_empty()
             && self.auxiliary_windows.is_empty()
             && !self.devtools.faulted()
+            && self.popups.is_clear()
             && self.lock_evals().pending_count() == 0
             && self.host_requests.is_clear()
             && self.pdf_exports.pending_count() == 0
@@ -3756,6 +4096,24 @@ impl UiRegistry {
             return Vec::new();
         };
         entry.ux_events.drain(..).collect()
+    }
+
+    pub(crate) fn take_view_events(&self, browser: BrowserId) -> Vec<BrowserEvent> {
+        if browser.runtime() != self.runtime {
+            return Vec::new();
+        }
+        let mut view_events = self
+            .view_events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(buf) = view_events.get_mut(&browser) else {
+            return Vec::new();
+        };
+        let drained: Vec<BrowserEvent> = buf.events.drain(..).collect();
+        if buf.terminal_emitted {
+            view_events.remove(&browser);
+        }
+        drained
     }
 
     pub(crate) fn take_js_events(&self, browser: BrowserId) -> Vec<BrowserEvent> {
@@ -3908,6 +4266,15 @@ impl UiRegistry {
                 }
                 1
             }
+            crate::js_bridge_native::RendererIpcAction::RenderEvent {
+                event,
+                required_ext_bit,
+            } => {
+                if !self.is_draining() && client_state.wants_extended_event(required_ext_bit) {
+                    self.navigation_event(browser, event);
+                }
+                1
+            }
         }
     }
 
@@ -3916,6 +4283,7 @@ impl UiRegistry {
         if terminated {
             self.invalidate_native_menu(browser);
             self.request_auxiliary_close(Some(browser), None);
+            self.close_child_popups(Some(browser), false);
         }
         let accepted = {
             let mut state = self.lock();
@@ -4152,6 +4520,7 @@ impl UiRegistry {
             }
         }
         if tick.exhausted {
+            #[cfg(feature = "test-support")]
             self.capture_failed(
                 browser,
                 EngineError::Capture {
@@ -5460,6 +5829,12 @@ impl UiRegistry {
                 }
                 self.drain_fast_mouse_moves(browser, true);
             }
+            TaskPayload::UpdateOsrDrag { browser } => {
+                if !on_ui {
+                    return;
+                }
+                self.apply_fast_osr_drag(browser);
+            }
             TaskPayload::ApplyZoom { browser } => {
                 if !on_ui {
                     return;
@@ -5980,6 +6355,43 @@ impl UiRegistry {
                     }
                 }
             }
+            TaskPayload::ClosePopup { slot } => {
+                if on_ui {
+                    self.popups.close_slot_on_ui(self, slot);
+                }
+            }
+            TaskPayload::PopupClientReleased { slot } => {
+                if on_ui {
+                    self.popups.on_client_released(slot);
+                }
+            }
+            TaskPayload::NavigateMainFrame { browser, url } => {
+                if on_ui {
+                    let target = {
+                        let state = self.lock();
+                        if state.draining {
+                            None
+                        } else {
+                            state.browsers.get(&browser).and_then(|entry| {
+                                (!entry.cleanup_started
+                                    && entry.session.snapshot().state == SessionState::Alive)
+                                    .then(|| (entry.native.clone(), entry.client_state.clone()))
+                            })
+                        }
+                    };
+                    if let Some((Some(native), Some(client_state))) = target
+                        && client_state.allows_navigation_for_script(&url, true)
+                    {
+                        client_state.approve_host_navigation(&url);
+                        if native.is_valid() != 0
+                            && let Some(frame) = native.main_frame()
+                        {
+                            self.audit.record();
+                            frame.load_url(Some(&CefString::from(url.as_str())));
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -6063,7 +6475,7 @@ impl UiRegistry {
             self.reject_create(browser, EngineError::NotReady);
             return;
         };
-        let (ax_tree, cursor_slot) = {
+        let (ax_tree, cursor_slot, native_context_menu, routing) = {
             // Mark the in-flight native creation before issuing it so a close
             // racing this task waits for OnAfterCreated instead of retiring the
             // instance as if no native browser existed. Re-check the state: a
@@ -6076,7 +6488,12 @@ impl UiRegistry {
                 return;
             }
             entry.create_issued = true;
-            (entry.ax_tree.clone(), entry.cursor_slot.clone())
+            (
+                entry.ax_tree.clone(),
+                entry.cursor_slot.clone(),
+                entry.native_context_menu.clone(),
+                entry.routing.clone(),
+            )
         };
         let Some(policy) = self.policy() else {
             self.reject_create(browser, EngineError::PolicyDenied);
@@ -6095,11 +6512,20 @@ impl UiRegistry {
             )
             .with_options(config.options.clone())
             .with_accessibility(ax_tree)
-            .with_cursor_slot(cursor_slot),
+            .with_cursor_slot(cursor_slot)
+            .with_native_context_menu(native_context_menu)
+            .with_routing(routing),
         );
         let native_cfg = config.options.surface_mode.native_child_hwnd();
         if let Some(ref cfg) = native_cfg
             && !crate::native_hwnd::is_valid_window(cfg.parent_hwnd)
+        {
+            self.reject_create(browser, EngineError::InvalidRequest);
+            return;
+        }
+        if native_cfg.is_none()
+            && let Some(parent_hwnd) = config.options.parent_hwnd
+            && !crate::native_hwnd::is_valid_window(parent_hwnd)
         {
             self.reject_create(browser, EngineError::InvalidRequest);
             return;
@@ -6130,12 +6556,10 @@ impl UiRegistry {
             BrowserClientBuilder::build_for_surface(client_state.clone(), native_cfg.is_some());
         let window_info = match native_cfg {
             Some(ref cfg) => crate::native_hwnd::build_child_window_info(cfg),
-            None => WindowInfo {
-                windowless_rendering_enabled: 1,
-                shared_texture_enabled: i32::from(shared_texture_enabled),
-                runtime_style: RuntimeStyle::ALLOY,
-                ..Default::default()
-            },
+            None => crate::native_hwnd::build_offscreen_window_info(
+                config.options.parent_hwnd,
+                shared_texture_enabled,
+            ),
         };
         let settings = build_browser_settings(&config.options, background_color);
         let mut extra_info = crate::js_bridge_native::build_browser_extra_info(
@@ -6198,6 +6622,9 @@ impl UiRegistry {
         if let BrowserCommand::FinishOutboundDrag(finish) = command {
             return self.submit_outbound_drag_finish(browser, executor, finish);
         }
+        if let BrowserCommand::FinishOsrDrag(finish) = command {
+            return self.submit_osr_drag_finish(browser, executor, finish);
+        }
         if matches!(&command, BrowserCommand::EvaluateScript { id, .. } if !self.eval_is_pending(*id))
         {
             return Err(EngineError::InvalidRequest);
@@ -6235,12 +6662,16 @@ impl UiRegistry {
             // before the reset completion runs. Own lock, wake after it.
             self.invalidate_ime(browser);
         }
-        if let BrowserCommand::Navigate(ref url) = command
-            && let Some(policy) = self.policy()
-            && !policy.rules.allows_host_navigation(url)
-        {
-            policy.deny(Some(browser), PolicyAction::Navigation);
-            return Err(EngineError::PolicyDenied);
+        match &command {
+            BrowserCommand::Navigate(url) | BrowserCommand::LoadUrlWithPostData { url, .. } => {
+                if let Some(policy) = self.policy()
+                    && !policy.rules.allows_host_navigation(url)
+                {
+                    policy.deny(Some(browser), PolicyAction::Navigation);
+                    return Err(EngineError::PolicyDenied);
+                }
+            }
+            _ => {}
         }
         let mut state = self.lock();
         if state.draining && !matches!(&command, BrowserCommand::Input(_)) {
@@ -6425,17 +6856,18 @@ impl UiRegistry {
                 &envelope.command,
                 BrowserCommand::MouseClick(_) | BrowserCommand::SetFocus(true)
             );
-        let (mut ledger, pre_moves) = if affects_input {
+        let (mut ledger, pre_moves, osr_drag_active) = if affects_input {
             let mut state = self.lock();
             let Some(entry) = state.browsers.get_mut(&browser) else {
                 return;
             };
+            let drag_active = entry.osr_drag_active.load(Ordering::Acquire);
             if entry.native_hwnd.is_some()
                 && matches!(&envelope.command, BrowserCommand::SetFocus(true))
             {
                 affects_input = false;
                 entry.input_mouse_cuts.remove(&id.sequence);
-                (None, Vec::new())
+                (None, Vec::new(), drag_active)
             } else {
                 if !entry.input_outstanding.contains(&id.sequence)
                     || !entry.session.has_pending_command(id)
@@ -6460,10 +6892,10 @@ impl UiRegistry {
                     .unwrap_or_default();
                 let ledger = entry.input.take();
                 entry.input_shadow = ledger.as_ref().expect("checked input gate").clone();
-                (ledger, pre_moves)
+                (ledger, pre_moves, drag_active)
             }
         } else {
-            (None, Vec::new())
+            (None, Vec::new(), false)
         };
         let accepted = self.take_command(envelope);
         if clears_before_dispatch && accepted.is_some() {
@@ -6490,12 +6922,13 @@ impl UiRegistry {
                         ledger_ref,
                         &host,
                         &self.audit,
+                        osr_drag_active,
                     );
                 }
                 if let (Some(input), Some(ledger)) = (&input_event, &mut ledger) {
                     native.host().ok_or(EngineError::Closed).and_then(|host| {
                         crate::input::validate_file_drag_viewport(input, viewport.get())?;
-                        ledger.dispatch(input, &host, &self.audit)
+                        ledger.dispatch_with_drag_gate(input, &host, &self.audit, osr_drag_active)
                     })
                 } else if let (Some(touch), Some(ledger)) = (&touch_event, &mut ledger) {
                     native
@@ -6503,10 +6936,20 @@ impl UiRegistry {
                         .ok_or(EngineError::Closed)
                         .and_then(|host| ledger.dispatch_touch(touch, &host, &self.audit))
                 } else if let (Some(drag), Some(ledger)) = (&drag_target, &mut ledger) {
-                    native
-                        .host()
-                        .ok_or(EngineError::Closed)
-                        .and_then(|host| ledger.dispatch_drag_target(drag, &host, &self.audit))
+                    let osr_drag_data = self.outbound_drags.cloned_drag_data_for_browser(browser);
+                    let res = native.host().ok_or(EngineError::Closed).and_then(|host| {
+                        ledger.dispatch_drag_target(drag, osr_drag_data, &host, &self.audit)
+                    });
+                    if res.is_ok()
+                        && matches!(
+                            drag,
+                            rust_cef_core::inbound_drag::InboundDragCommand::Leave
+                                | rust_cef_core::inbound_drag::InboundDragCommand::Drop { .. }
+                        )
+                    {
+                        self.reset_drag_target_op(browser);
+                    }
+                    res
                 } else {
                     command.execute(&mut NativeBrowserEngine {
                         browser,
@@ -6607,7 +7050,7 @@ impl UiRegistry {
     }
 
     fn drain_fast_mouse_moves(&self, browser: BrowserId, from_task: bool) {
-        let (batch, mut ledger, native) = {
+        let (batch, mut ledger, native, osr_drag_active) = {
             let mut state = self.lock();
             let draining = state.draining;
             let Some(entry) = state.browsers.get_mut(&browser) else {
@@ -6645,13 +7088,20 @@ impl UiRegistry {
                 return;
             };
             entry.input_shadow = ledger.clone();
-            (batch, ledger, entry.native.clone())
+            let drag_active = entry.osr_drag_active.load(Ordering::Acquire);
+            (batch, ledger, entry.native.clone(), drag_active)
         };
         let mut dispatched = 0u64;
         if let Some(native) = native
             && let Some(host) = native.host()
         {
-            dispatched = dispatch_fast_pointer_batch(batch, &mut ledger, &host, &self.audit);
+            dispatched = dispatch_fast_pointer_batch(
+                batch,
+                &mut ledger,
+                &host,
+                &self.audit,
+                osr_drag_active,
+            );
         }
         {
             let mut state = self.lock();
@@ -6662,6 +7112,73 @@ impl UiRegistry {
             }
         }
         self.finish_input_reset(browser);
+    }
+
+    fn apply_fast_osr_drag(&self, browser: BrowserId) {
+        let (sample, native, viewport) = {
+            let state = self.lock();
+            let draining = state.draining;
+            let Some(entry) = state.browsers.get(&browser) else {
+                return;
+            };
+            let snap = entry.session.snapshot();
+            let eligible = !draining
+                && !entry.cleanup_started
+                && !entry.session.surface_mode().is_native_child_hwnd()
+                && snap.state == SessionState::Alive
+                && snap.renderer.state != RendererState::Terminated
+                && !entry.session.input_reset_pending()
+                && !entry.session.input_retired();
+            let sample = entry.fast_osr_drag.take_for_task();
+            if !eligible {
+                return;
+            }
+            let Some(sample) = sample else {
+                return;
+            };
+            (sample, entry.native.clone(), entry.viewport.get())
+        };
+        let Some(native) = native else {
+            return;
+        };
+        let Some(host) = native.host() else {
+            return;
+        };
+        let Some((was_entered, allowed_ops, enter_data)) = self
+            .outbound_drags
+            .prepare_osr_drag_move(sample.drag_id, sample.in_view)
+        else {
+            return;
+        };
+        if sample.in_view {
+            let max_x = (viewport.width - 1).max(0);
+            let max_y = (viewport.height - 1).max(0);
+            let x = sample.x.clamp(0, max_x);
+            let y = sample.y.clamp(0, max_y);
+            let modifiers = rust_cef_core::keymap::EVENTFLAG_LEFT_MOUSE_BUTTON
+                | rust_cef_core::keymap::modifier_flags(
+                    sample.modifiers.shift,
+                    sample.modifiers.control,
+                    sample.modifiers.alt,
+                    sample.modifiers.platform,
+                );
+            let mouse_evt = MouseEvent { x, y, modifiers };
+            if !was_entered && let Some(mut data) = enter_data {
+                data.reset_file_contents();
+                self.audit.record();
+                host.drag_target_drag_enter(Some(&mut data), Some(&mouse_evt), allowed_ops);
+            }
+            self.audit.record();
+            host.drag_target_drag_over(Some(&mouse_evt), allowed_ops);
+        } else if was_entered {
+            self.audit.record();
+            host.drag_target_drag_leave();
+            self.update_drag_cursor(
+                browser,
+                rust_cef_core::outbound_drag::DragOperationMask::NONE,
+                true,
+            );
+        }
     }
 
     fn apply_fast_zoom(&self, browser: BrowserId) {
@@ -6887,6 +7404,7 @@ impl UiRegistry {
                 // close_sent unconsumed, and leave the Browser genuinely alive.
                 entry.session.close_requested();
                 entry.fast_mouse.set_ready(false);
+                entry.fast_osr_drag.set_ready(false);
                 entry.fast_zoom.set_ready(false);
                 if mode == CloseMode::Force {
                     entry.close_mode = Some(CloseMode::Force);
@@ -6907,6 +7425,7 @@ impl UiRegistry {
                 entry.force_sent = true;
                 entry.session.create_rejected();
                 entry.fast_mouse.set_ready(false);
+                entry.fast_osr_drag.set_ready(false);
                 entry.fast_zoom.set_ready(false);
                 entry.store.close();
                 if let Some(completion) = entry.close_completion.take() {
@@ -6918,6 +7437,7 @@ impl UiRegistry {
                 // must reach the native instance exactly once.
                 entry.session.close_requested();
                 entry.fast_mouse.set_ready(false);
+                entry.fast_osr_drag.set_ready(false);
                 entry.fast_zoom.set_ready(false);
                 entry.close_mode = Some(CloseMode::Force);
                 match entry.native.clone() {
@@ -6930,6 +7450,7 @@ impl UiRegistry {
             } else {
                 entry.session.close_requested();
                 entry.fast_mouse.set_ready(false);
+                entry.fast_osr_drag.set_ready(false);
                 entry.fast_zoom.set_ready(false);
                 entry.close_mode.get_or_insert(mode);
                 if entry.close_sent {
@@ -6957,12 +7478,20 @@ impl UiRegistry {
         match outcome {
             Outcome::Native(native) => {
                 self.request_auxiliary_close(Some(browser), None);
+                self.close_child_popups(Some(browser), false);
                 self.headless_cdp.detach_browser(true, browser);
                 let _ = self.sources.cancel(Some(browser), None, None);
                 self.cancel_finds(Some(browser), None);
-                if let Some(done) = self.outbound_drags.take_active_for_browser(browser)
+                self.clear_osr_drag_active(browser);
+                if let Some((done, native_drag)) = self.outbound_drags.take_active_for_browser(browser)
                     && let Some(host) = native.host()
                 {
+                    let target_left = self.take_inbound_drag_active(browser)
+                        || native_drag.as_ref().is_some_and(|nd| nd.target_entered);
+                    if target_left {
+                        self.audit.record();
+                        host.drag_target_drag_leave();
+                    }
                     self.audit.record();
                     host.drag_source_ended_at(
                         done.x,
@@ -6971,6 +7500,7 @@ impl UiRegistry {
                     );
                     self.audit.record();
                     host.drag_source_system_drag_ended();
+                    drop(native_drag);
                 }
                 // Still before native CloseBrowser: retain accounting through
                 // synchronous Cancel/dismissal and the last wrapper Release.
@@ -7054,6 +7584,9 @@ impl UiRegistry {
             );
             drop(renderers);
         }
+        for drag in self.outbound_drags.drain_all_native() {
+            std::mem::forget(drag);
+        }
         let (natives, clients, deferred_dialogs) = {
             let mut state = self.lock();
             let mut natives = Vec::new();
@@ -7084,11 +7617,17 @@ impl UiRegistry {
             client.capture.abandon();
         }
         drop(clients);
+        self.view_events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
     }
 
     /// Called after the barrier: clears remaining native/handler references.
     /// Any continuation still present is cancelled outside the lock.
     pub(crate) fn release_all_refs(&self, on_ui: bool) {
+        let drag_refs = self.outbound_drags.drain_all_native();
+        let popup_refs = self.popups.take_all_natives_for_shutdown();
         let (natives, clients) = {
             let mut state = self.lock();
             let mut natives = Vec::new();
@@ -7106,8 +7645,23 @@ impl UiRegistry {
         };
         // The last native references are dropped after the state lock, so a
         // release callback can never re-enter the registry from under it.
+        if on_ui {
+            drop(drag_refs);
+            drop(popup_refs);
+        } else {
+            for drag in drag_refs {
+                std::mem::forget(drag);
+            }
+            for popup in popup_refs {
+                std::mem::forget(popup);
+            }
+        }
         drop(natives);
         drop(clients);
+        self.view_events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
         self.cancel_all_requests(on_ui);
     }
 
@@ -7173,6 +7727,54 @@ impl UiRegistry {
     }
 
     fn emit(&self, browser: BrowserId, event: BrowserEvent) -> PublishResult {
+        if should_buffer_view_event(&event) {
+            let mut view_events = self
+                .view_events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(buf) = view_events.get_mut(&browser) {
+                let is_created = matches!(event, BrowserEvent::Created);
+                if is_created {
+                    if !buf.created_emitted {
+                        buf.created_emitted = true;
+                        if buf.events.len() >= MAX_VIEW_EVENTS {
+                            if let Some(idx) = buf.events.iter().position(|e| {
+                                !matches!(
+                                    e,
+                                    BrowserEvent::Created
+                                        | BrowserEvent::Closed
+                                        | BrowserEvent::CreateFailed(_)
+                                )
+                            }) {
+                                buf.events.remove(idx);
+                            } else {
+                                buf.events.pop_front();
+                            }
+                        }
+                        buf.events.push_back(event.clone());
+                    }
+                } else {
+                    if matches!(event, BrowserEvent::Closed | BrowserEvent::CreateFailed(_)) {
+                        buf.terminal_emitted = true;
+                    }
+                    if buf.events.len() >= MAX_VIEW_EVENTS {
+                        if let Some(idx) = buf.events.iter().position(|e| {
+                            !matches!(
+                                e,
+                                BrowserEvent::Created
+                                    | BrowserEvent::Closed
+                                    | BrowserEvent::CreateFailed(_)
+                            )
+                        }) {
+                            buf.events.remove(idx);
+                        } else {
+                            buf.events.pop_front();
+                        }
+                    }
+                    buf.events.push_back(event.clone());
+                }
+            }
+        }
         let sequence = self.seq.fetch_add(1, Ordering::Relaxed) + 1;
         let published = self.events.publish(BrowserEventEnvelope {
             browser,
@@ -7296,6 +7898,40 @@ impl BrowserEngine for NativeBrowserEngine<'_> {
                 self.audit.record();
                 frame.load_url(Some(&CefString::from(url.as_str())));
             }
+            BrowserCommand::LoadUrlWithPostData {
+                url,
+                post_data,
+                content_type,
+            } => {
+                if let Some(state) = self.client_state {
+                    state.approve_host_navigation(&url);
+                }
+                let frame = self.native.main_frame().ok_or(EngineError::NotReady)?;
+                let mut req = cef::request_create().ok_or(EngineError::Backend { code: None })?;
+                req.set_url(Some(&CefString::from(url.as_str())));
+                req.set_method(Some(&CefString::from("POST")));
+                let ct = content_type
+                    .as_deref()
+                    .unwrap_or("application/x-www-form-urlencoded");
+                req.set_header_by_name(
+                    Some(&CefString::from("Content-Type")),
+                    Some(&CefString::from(ct)),
+                    1,
+                );
+                if !post_data.is_empty() {
+                    let mut pd =
+                        cef::post_data_create().ok_or(EngineError::Backend { code: None })?;
+                    let mut elem = cef::post_data_element_create()
+                        .ok_or(EngineError::Backend { code: None })?;
+                    elem.set_to_bytes(post_data.len(), post_data.as_ptr());
+                    if pd.add_element(Some(&mut elem)) == 0 {
+                        return Err(EngineError::Backend { code: None });
+                    }
+                    req.set_post_data(Some(&mut pd));
+                }
+                self.audit.record();
+                frame.load_request(Some(&mut req));
+            }
             BrowserCommand::Back => {
                 self.audit.record();
                 self.native.go_back();
@@ -7384,6 +8020,9 @@ impl BrowserEngine for NativeBrowserEngine<'_> {
                     host.notify_screen_info_changed();
                 }
             }
+            BrowserCommand::SetClientOffset { x_dip, y_dip } => {
+                let _ = self.viewport.set_client_offset(x_dip, y_dip);
+            }
             BrowserCommand::MouseClick(click) => {
                 let mut target = NativeMouseClickTarget { host: &host };
                 dispatch_mouse_click(click, self.audit, &mut target);
@@ -7457,7 +8096,14 @@ impl BrowserEngine for NativeBrowserEngine<'_> {
                 )?;
             }
             BrowserCommand::FinishOutboundDrag(finish) => {
-                let done = self.registry.outbound_drags.complete(finish)?;
+                let (done, native_drag) = self.registry.outbound_drags.complete(finish)?;
+                self.registry.clear_osr_drag_active(self.browser);
+                let target_left = self.registry.take_inbound_drag_active(self.browser)
+                    || native_drag.as_ref().is_some_and(|nd| nd.target_entered);
+                if target_left {
+                    self.audit.record();
+                    host.drag_target_drag_leave();
+                }
                 self.audit.record();
                 host.drag_source_ended_at(
                     done.x,
@@ -7466,7 +8112,89 @@ impl BrowserEngine for NativeBrowserEngine<'_> {
                 );
                 self.audit.record();
                 host.drag_source_system_drag_ended();
+                self.registry.reset_drag_target_op(self.browser);
                 self.registry.clear_input_buttons(self.browser);
+                drop(native_drag);
+            }
+            BrowserCommand::FinishOsrDrag(finish) => {
+                let (done, mut native_drag) = self.registry.outbound_drags.complete(
+                    rust_cef_core::outbound_drag::OutboundDragFinish {
+                        drag_id: finish.drag_id,
+                        x: finish.x,
+                        y: finish.y,
+                        operation: rust_cef_core::outbound_drag::DragOperationMask::NONE,
+                    },
+                )?;
+                self.registry.clear_osr_drag_active(self.browser);
+                let target_op = self.registry.drag_target_operation(self.browser);
+                let allowed_mask = native_drag.as_ref().map_or(
+                    rust_cef_core::outbound_drag::DragOperationMask::EVERY,
+                    |nd| crate::outbound_drag::cef_mask_to_core(nd.allowed_ops),
+                );
+                let effective_op =
+                    rust_cef_core::outbound_drag::DragOperationMask(target_op.0 & allowed_mask.0);
+                let key_mods = rust_cef_core::keymap::modifier_flags(
+                    finish.modifiers.shift,
+                    finish.modifiers.control,
+                    finish.modifiers.alt,
+                    finish.modifiers.platform,
+                );
+                let vp = self.viewport.get();
+                let clamped_x = done.x.clamp(0, (vp.width - 1).max(0));
+                let clamped_y = done.y.clamp(0, (vp.height - 1).max(0));
+                let final_op = if finish.allow_drop
+                    && effective_op != rust_cef_core::outbound_drag::DragOperationMask::NONE
+                {
+                    let cef_allowed = native_drag.as_ref().map_or_else(
+                        || {
+                            crate::outbound_drag::core_mask_to_cef(
+                                rust_cef_core::outbound_drag::DragOperationMask::EVERY,
+                            )
+                        },
+                        |nd| nd.allowed_ops,
+                    );
+                    let over_evt = MouseEvent {
+                        x: clamped_x,
+                        y: clamped_y,
+                        modifiers: key_mods | rust_cef_core::keymap::EVENTFLAG_LEFT_MOUSE_BUTTON,
+                    };
+                    if let Some(nd) = native_drag.as_mut()
+                        && !nd.target_entered
+                        && let Some(mut data) = nd.drag_data.clone()
+                    {
+                        data.reset_file_contents();
+                        self.audit.record();
+                        host.drag_target_drag_enter(Some(&mut data), Some(&over_evt), cef_allowed);
+                        nd.target_entered = true;
+                    }
+                    self.audit.record();
+                    host.drag_target_drag_over(Some(&over_evt), cef_allowed);
+                    let drop_evt = MouseEvent {
+                        x: clamped_x,
+                        y: clamped_y,
+                        modifiers: key_mods,
+                    };
+                    self.audit.record();
+                    host.drag_target_drop(Some(&drop_evt));
+                    effective_op.preferred_single_op()
+                } else {
+                    if native_drag.as_ref().is_some_and(|nd| nd.target_entered) {
+                        self.audit.record();
+                        host.drag_target_drag_leave();
+                    }
+                    rust_cef_core::outbound_drag::DragOperationMask::NONE
+                };
+                self.audit.record();
+                host.drag_source_ended_at(
+                    clamped_x,
+                    clamped_y,
+                    crate::outbound_drag::core_mask_to_cef(final_op),
+                );
+                self.audit.record();
+                host.drag_source_system_drag_ended();
+                self.registry.reset_drag_target_op(self.browser);
+                self.registry.clear_input_buttons(self.browser);
+                drop(native_drag);
             }
             BrowserCommand::SetAccessibilityState(feature_state) => {
                 if let Some(state) = self.client_state {
@@ -7493,7 +8221,9 @@ pub(crate) struct RuntimeBrowserControl {
     executor: Arc<Executor>,
     registry: Arc<UiRegistry>,
     fast_mouse: Option<Arc<FastMouseMoveQueue>>,
+    fast_osr_drag: Option<Arc<FastOsrDragSlot>>,
     fast_zoom: Option<Arc<FastZoomSlot>>,
+    routing: Option<Arc<crate::client::PopupAndNavRoutingState>>,
     next_close: AtomicU64,
     active_close: Mutex<Option<CloseTicket>>,
 }
@@ -7504,21 +8234,28 @@ impl RuntimeBrowserControl {
         executor: Arc<Executor>,
         registry: Arc<UiRegistry>,
     ) -> Arc<Self> {
-        let (fast_mouse, fast_zoom) = {
+        let (fast_mouse, fast_osr_drag, fast_zoom, routing) = {
             let state = registry.lock();
-            state.browsers.get(&browser).map_or((None, None), |entry| {
-                (
-                    Some(Arc::clone(&entry.fast_mouse)),
-                    Some(Arc::clone(&entry.fast_zoom)),
-                )
-            })
+            state
+                .browsers
+                .get(&browser)
+                .map_or((None, None, None, None), |entry| {
+                    (
+                        Some(Arc::clone(&entry.fast_mouse)),
+                        Some(Arc::clone(&entry.fast_osr_drag)),
+                        Some(Arc::clone(&entry.fast_zoom)),
+                        Some(Arc::clone(&entry.routing)),
+                    )
+                })
         };
         Arc::new(Self {
             browser,
             executor,
             registry,
             fast_mouse,
+            fast_osr_drag,
             fast_zoom,
+            routing,
             next_close: AtomicU64::new(1),
             active_close: Mutex::new(None),
         })
@@ -7616,6 +8353,41 @@ impl BrowserControl for RuntimeBrowserControl {
         Ok(())
     }
 
+    fn submit_osr_drag_move_fast(
+        &self,
+        drag_id: rust_cef_core::outbound_drag::DragSessionId,
+        x: i32,
+        y: i32,
+        modifiers: MouseModifiers,
+        in_view: bool,
+    ) -> Result<(), EngineError> {
+        if drag_id.browser != self.browser {
+            return Err(EngineError::WrongRuntime);
+        }
+        if self.executor.is_stopped() {
+            return Err(EngineError::Closed);
+        }
+        let Some(slot) = self.fast_osr_drag.as_ref() else {
+            return Err(EngineError::Closed);
+        };
+        let should_post = slot.enqueue(FastOsrDragSample {
+            drag_id,
+            x,
+            y,
+            modifiers,
+            in_view,
+        })?;
+        if should_post
+            && let Err(err) = self.executor.post(TaskPayload::UpdateOsrDrag {
+                browser: self.browser,
+            })
+        {
+            slot.clear_scheduled();
+            return Err(err);
+        }
+        Ok(())
+    }
+
     fn snapshot(&self) -> BrowserSnapshot {
         self.registry.snapshot(self.browser)
     }
@@ -7634,6 +8406,10 @@ impl BrowserControl for RuntimeBrowserControl {
 
     fn take_js_events(&self) -> Vec<BrowserEvent> {
         self.registry.take_js_events(self.browser)
+    }
+
+    fn take_view_events(&self) -> Vec<BrowserEvent> {
+        self.registry.take_view_events(self.browser)
     }
 
     fn evaluate_script(
@@ -7683,6 +8459,103 @@ impl BrowserControl for RuntimeBrowserControl {
 
     fn drag_target_operation(&self) -> rust_cef_core::outbound_drag::DragOperationMask {
         self.registry.drag_target_operation(self.browser)
+    }
+
+    fn set_popup_policy(&self, policy: rust_cef_core::host_capabilities::PopupPolicy) {
+        if let Some(routing) = self.routing.as_ref() {
+            routing.set_popup_policy(policy);
+        }
+    }
+
+    fn popup_policy(&self) -> rust_cef_core::host_capabilities::PopupPolicy {
+        self.routing.as_ref().map_or(
+            rust_cef_core::host_capabilities::PopupPolicy::Auto,
+            |routing| routing.popup_policy(),
+        )
+    }
+
+    fn set_popup_filter(&self, filter: Option<rust_cef_core::host_capabilities::PopupFilter>) {
+        if let Some(routing) = self.routing.as_ref() {
+            routing.set_popup_filter(filter);
+        }
+    }
+
+    fn set_popup_ui_listener_active(&self, active: bool) {
+        if let Some(routing) = self.routing.as_ref() {
+            routing.set_popup_ui_listener_active(active);
+        }
+    }
+
+    fn set_navigation_filter(
+        &self,
+        filter: Option<rust_cef_core::host_capabilities::NavigationFilter>,
+    ) {
+        if let Some(routing) = self.routing.as_ref() {
+            routing.set_navigation_filter(filter);
+        }
+    }
+
+    fn set_extended_event_mask(&self, mask: u32) {
+        if let Some(routing) = self.routing.as_ref() {
+            routing.set_extended_event_mask(mask);
+        }
+    }
+
+    fn set_drag_enter_filter(
+        &self,
+        filter: Option<rust_cef_core::host_capabilities::DragEnterFilter>,
+    ) {
+        if let Some(routing) = self.routing.as_ref() {
+            routing.set_drag_enter_filter(filter);
+        }
+    }
+
+    fn set_focus_filter(&self, filter: Option<rust_cef_core::host_capabilities::SetFocusFilter>) {
+        if let Some(routing) = self.routing.as_ref() {
+            routing.set_focus_filter(filter);
+        }
+    }
+
+    fn set_pre_key_filter(&self, filter: Option<rust_cef_core::host_capabilities::PreKeyFilter>) {
+        if let Some(routing) = self.routing.as_ref() {
+            routing.set_pre_key_filter(filter);
+        }
+    }
+
+    fn set_key_event_filter(
+        &self,
+        filter: Option<rust_cef_core::host_capabilities::KeyEventFilter>,
+    ) {
+        if let Some(routing) = self.routing.as_ref() {
+            routing.set_key_event_filter(filter);
+        }
+    }
+
+    fn set_protocol_execution_filter(
+        &self,
+        filter: Option<rust_cef_core::host_capabilities::ProtocolExecutionFilter>,
+    ) {
+        if let Some(routing) = self.routing.as_ref() {
+            routing.set_protocol_execution_filter(filter);
+        }
+    }
+
+    fn set_browser_host_capabilities(
+        &self,
+        capabilities: Option<rust_cef_core::host_capabilities::HostCapabilities>,
+    ) {
+        if let Some(routing) = self.routing.as_ref() {
+            routing.set_browser_host_capabilities(capabilities);
+        }
+    }
+
+    fn set_browser_resource_interceptor(
+        &self,
+        interceptor: Option<Arc<dyn rust_cef_core::custom_schemes::ResourceInterceptor>>,
+    ) {
+        if let Some(routing) = self.routing.as_ref() {
+            routing.set_browser_resource_interceptor(interceptor);
+        }
     }
 }
 
@@ -11032,6 +11905,52 @@ mod tests {
                 delta_y: -50,
                 modifiers: plain,
             }
+        );
+    }
+
+    #[test]
+    fn view_events_seeding_bounded_eviction_and_terminal_cleanup_preserve_ux_events() {
+        let (r, _, _, _) = registry_with_posting(true);
+
+        // 1. Pre-attached Created seeds exactly once on claim_view_attachment; later duplicate Created is ignored.
+        let b1 = BrowserId::new(RuntimeGeneration::new(1), 210);
+        alive(&r, b1);
+        assert!(r.take_view_events(b1).is_empty());
+        r.claim_view_attachment(b1).unwrap();
+        r.emit(b1, BrowserEvent::Created);
+        assert_eq!(r.take_view_events(b1), vec![BrowserEvent::Created]);
+        assert!(r.take_view_events(b1).is_empty());
+
+        // 2. Attaching during Creating receives Created when emitted later, preserves Created/Closed under cap,
+        // and leaves ux_events MAX_UX_EVENTS=64 untouched.
+        let b2 = BrowserId::new(RuntimeGeneration::new(1), 211);
+        r.begin_create(b2, config()).unwrap();
+        r.claim_view_attachment(b2).unwrap();
+        assert!(r.take_view_events(b2).is_empty());
+        {
+            let mut st = r.lock();
+            st.browsers.get_mut(&b2).unwrap().session.after_created();
+        }
+        r.mark_created_reported(b2);
+        r.emit(b2, BrowserEvent::Created);
+        for i in 0..(MAX_VIEW_EVENTS + 10) {
+            r.navigation_event(b2, BrowserEvent::TitleChanged(format!("t-{i}")));
+        }
+        r.emit(b2, BrowserEvent::Closed);
+
+        let drained = r.take_view_events(b2);
+        assert_eq!(drained.len(), MAX_VIEW_EVENTS);
+        assert_eq!(drained.first(), Some(&BrowserEvent::Created));
+        assert_eq!(drained.last(), Some(&BrowserEvent::Closed));
+        // Terminal entry is removed on drain.
+        assert!(r.take_view_events(b2).is_empty());
+        // UX queue was never polluted by TitleChanged or Created/Closed and stays empty.
+        assert!(r.take_ux_events(b2).is_empty());
+
+        // Foreign runtime returns empty.
+        assert!(
+            r.take_view_events(BrowserId::new(RuntimeGeneration::new(2), 210))
+                .is_empty()
         );
     }
 }

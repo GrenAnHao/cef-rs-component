@@ -7,22 +7,34 @@
 use std::sync::atomic::AtomicU64;
 use std::sync::{
     Arc, Mutex, Weak,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering},
 };
 
 use cef::*;
 use rust_cef_core::{
     contracts::{
-        BrowserCursor, BrowserId, BrowserOptions, CefFeatureState, ConsoleSeverity, Viewport,
-        progress_to_per_mille, truncate_utf8_bytes,
+        BrowserCursor, BrowserId, BrowserKeyEvent, BrowserKeyEventKind, BrowserOptions,
+        CefFeatureState, ConsoleSeverity, DEFAULT_CONSOLE_MESSAGE_BYTES, FocusRequestSource,
+        Viewport, progress_to_per_mille, truncate_utf8_bytes,
     },
+    custom_schemes::ResourceInterceptor,
     frame_budget::FrameError,
     frame_store::frame_len,
+    host_capabilities::{
+        DragEnterFilter, FocusDecision, HostCapabilities, KeyEventDecision, KeyEventFilter,
+        NavigationDecision, NavigationFilter, NavigationRequest, PopupDecision, PopupFilter,
+        PopupPolicy, PopupRequest, PreKeyDecision, PreKeyFilter, ProtocolExecutionFilter,
+        SetFocusFilter,
+    },
     ime::{ImeRect, ImeReportedBounds},
     input::Utf16Range,
     mailbox::{FrameMailbox, SurfaceBounds},
     outbound_drag::OutboundDragPolicy,
-    ports::{BrowserEvent, FrameSink, PolicyAction, SurfaceKind, UiDispatcher},
+    ports::{
+        BrowserEvent, EXT_EVENT_AUTO_RESIZE, EXT_EVENT_CONSOLE, EXT_EVENT_DOCUMENT_AVAILABLE,
+        EXT_EVENT_MEDIA_ACCESS, EXT_EVENT_TOOLTIP, FrameSink, PolicyAction, SurfaceKind,
+        UiDispatcher,
+    },
 };
 
 use crate::{
@@ -39,6 +51,8 @@ const MAX_OSR_TEXTURE_DIMENSION: i32 = rust_cef_core::contracts::MAX_NATIVE_BOUN
 #[derive(Clone, Copy)]
 struct ViewportInner {
     viewport: Viewport,
+    parent_hwnd: Option<std::num::NonZeroUsize>,
+    client_offset_dip: (f32, f32),
     screen_origin: Option<(i32, i32)>,
     last_monitor: Option<MonitorRectPair>,
 }
@@ -48,22 +62,49 @@ pub(crate) struct ViewportState {
 }
 
 impl ViewportState {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn new(viewport: Viewport) -> Self {
+        Self::new_with_parent(viewport, None)
+    }
+
+    pub(crate) fn new_with_parent(
+        viewport: Viewport,
+        parent_hwnd: Option<std::num::NonZeroUsize>,
+    ) -> Self {
         Self {
             inner: Mutex::new(ViewportInner {
                 viewport,
+                parent_hwnd,
+                client_offset_dip: (0.0, 0.0),
                 screen_origin: None,
                 last_monitor: None,
             }),
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn snapshot(&self) -> (Viewport, Option<(i32, i32)>) {
         let guard = self
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         (guard.viewport, guard.screen_origin)
+    }
+
+    pub(crate) fn set_client_offset(&self, x_dip: f32, y_dip: f32) -> bool {
+        if !x_dip.is_finite() || !y_dip.is_finite() {
+            return false;
+        }
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let next = (x_dip, y_dip);
+        if guard.client_offset_dip == next {
+            return false;
+        }
+        guard.client_offset_dip = next;
+        true
     }
 
     pub(crate) fn get(&self) -> Viewport {
@@ -133,7 +174,39 @@ impl ViewportState {
     }
 
     pub(crate) fn screen_point(&self, view_x: i32, view_y: i32) -> Option<(i32, i32)> {
-        let (viewport, origin) = self.snapshot();
+        let (viewport, parent_hwnd, client_offset_dip, origin) = {
+            let guard = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (
+                guard.viewport,
+                guard.parent_hwnd,
+                guard.client_offset_dip,
+                guard.screen_origin,
+            )
+        };
+        if let Some(hwnd) = parent_hwnd
+            && viewport.scale.is_finite()
+            && viewport.scale > 0.0
+        {
+            let client_x_f = ((view_x as f32 + client_offset_dip.0) * viewport.scale).round();
+            let client_y_f = ((view_y as f32 + client_offset_dip.1) * viewport.scale).round();
+            if client_x_f.is_finite()
+                && client_y_f.is_finite()
+                && client_x_f >= i32::MIN as f32
+                && client_x_f <= i32::MAX as f32
+                && client_y_f >= i32::MIN as f32
+                && client_y_f <= i32::MAX as f32
+                && let Some(screen_pt) = crate::native_hwnd::client_to_screen(
+                    hwnd,
+                    client_x_f as i32,
+                    client_y_f as i32,
+                )
+            {
+                return Some(screen_pt);
+            }
+        }
         let (ox, oy) = origin?;
         let sx = ox.saturating_add((view_x as f32 * viewport.scale).round() as i32);
         let sy = oy.saturating_add((view_y as f32 * viewport.scale).round() as i32);
@@ -267,6 +340,218 @@ pub(crate) fn new_frame_mailbox(
     Ok(mailbox)
 }
 
+pub(crate) struct PopupAndNavRoutingState {
+    popup_policy: AtomicU8,
+    view_attached: AtomicBool,
+    popup_ui_listener_active: AtomicBool,
+    extended_event_mask: AtomicU32,
+    popup_filter: Mutex<Option<PopupFilter>>,
+    navigation_filter: Mutex<Option<NavigationFilter>>,
+    drag_enter_filter: Mutex<Option<DragEnterFilter>>,
+    focus_filter: Mutex<Option<SetFocusFilter>>,
+    pre_key_filter: Mutex<Option<PreKeyFilter>>,
+    key_event_filter: Mutex<Option<KeyEventFilter>>,
+    protocol_execution_filter: Mutex<Option<ProtocolExecutionFilter>>,
+    browser_host_capabilities: Mutex<Option<HostCapabilities>>,
+    browser_resource_interceptor: Mutex<Option<Arc<dyn ResourceInterceptor>>>,
+}
+
+impl PopupAndNavRoutingState {
+    pub(crate) fn new(policy: PopupPolicy) -> Self {
+        Self {
+            popup_policy: AtomicU8::new(policy as u8),
+            view_attached: AtomicBool::new(false),
+            popup_ui_listener_active: AtomicBool::new(false),
+            extended_event_mask: AtomicU32::new(0),
+            popup_filter: Mutex::new(None),
+            navigation_filter: Mutex::new(None),
+            drag_enter_filter: Mutex::new(None),
+            focus_filter: Mutex::new(None),
+            pre_key_filter: Mutex::new(None),
+            key_event_filter: Mutex::new(None),
+            protocol_execution_filter: Mutex::new(None),
+            browser_host_capabilities: Mutex::new(None),
+            browser_resource_interceptor: Mutex::new(None),
+        }
+    }
+
+    pub(crate) fn set_popup_policy(&self, policy: PopupPolicy) {
+        self.popup_policy.store(policy as u8, Ordering::Release);
+    }
+
+    pub(crate) fn popup_policy(&self) -> PopupPolicy {
+        match self.popup_policy.load(Ordering::Acquire) {
+            1 => PopupPolicy::Deny,
+            2 => PopupPolicy::AllowNativePopup,
+            3 => PopupPolicy::NavigateCurrentTab,
+            _ => PopupPolicy::Auto,
+        }
+    }
+
+    pub(crate) fn set_view_attached(&self, attached: bool) {
+        self.view_attached.store(attached, Ordering::Release);
+    }
+
+    pub(crate) fn effective_popup_policy(&self) -> PopupPolicy {
+        match self.popup_policy() {
+            PopupPolicy::Auto => {
+                if self.view_attached.load(Ordering::Acquire) {
+                    PopupPolicy::AllowNativePopup
+                } else {
+                    PopupPolicy::Deny
+                }
+            }
+            other => other,
+        }
+    }
+
+    pub(crate) fn set_popup_ui_listener_active(&self, active: bool) {
+        self.popup_ui_listener_active
+            .store(active, Ordering::Release);
+    }
+
+    pub(crate) fn is_popup_ui_listener_active(&self) -> bool {
+        self.popup_ui_listener_active.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn set_extended_event_mask(&self, mask: u32) {
+        self.extended_event_mask.store(mask, Ordering::Release);
+    }
+
+    pub(crate) fn extended_event_mask(&self) -> u32 {
+        self.extended_event_mask.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn set_popup_filter(&self, filter: Option<PopupFilter>) {
+        *self
+            .popup_filter
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = filter;
+    }
+
+    pub(crate) fn popup_filter(&self) -> Option<PopupFilter> {
+        self.popup_filter
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    pub(crate) fn set_navigation_filter(&self, filter: Option<NavigationFilter>) {
+        *self
+            .navigation_filter
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = filter;
+    }
+
+    pub(crate) fn navigation_filter(&self) -> Option<NavigationFilter> {
+        self.navigation_filter
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    pub(crate) fn set_drag_enter_filter(&self, filter: Option<DragEnterFilter>) {
+        *self
+            .drag_enter_filter
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = filter;
+    }
+
+    pub(crate) fn drag_enter_filter(&self) -> Option<DragEnterFilter> {
+        self.drag_enter_filter
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    pub(crate) fn set_focus_filter(&self, filter: Option<SetFocusFilter>) {
+        *self
+            .focus_filter
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = filter;
+    }
+
+    pub(crate) fn focus_filter(&self) -> Option<SetFocusFilter> {
+        self.focus_filter
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    pub(crate) fn set_pre_key_filter(&self, filter: Option<PreKeyFilter>) {
+        *self
+            .pre_key_filter
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = filter;
+    }
+
+    pub(crate) fn pre_key_filter(&self) -> Option<PreKeyFilter> {
+        self.pre_key_filter
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    pub(crate) fn set_key_event_filter(&self, filter: Option<KeyEventFilter>) {
+        *self
+            .key_event_filter
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = filter;
+    }
+
+    pub(crate) fn key_event_filter(&self) -> Option<KeyEventFilter> {
+        self.key_event_filter
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    pub(crate) fn set_protocol_execution_filter(&self, filter: Option<ProtocolExecutionFilter>) {
+        *self
+            .protocol_execution_filter
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = filter;
+    }
+
+    pub(crate) fn protocol_execution_filter(&self) -> Option<ProtocolExecutionFilter> {
+        self.protocol_execution_filter
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    pub(crate) fn set_browser_host_capabilities(&self, capabilities: Option<HostCapabilities>) {
+        *self
+            .browser_host_capabilities
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = capabilities;
+    }
+
+    pub(crate) fn browser_host_capabilities(&self) -> Option<HostCapabilities> {
+        self.browser_host_capabilities
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    pub(crate) fn set_browser_resource_interceptor(
+        &self,
+        interceptor: Option<Arc<dyn ResourceInterceptor>>,
+    ) {
+        *self
+            .browser_resource_interceptor
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = interceptor;
+    }
+
+    pub(crate) fn browser_resource_interceptor(&self) -> Option<Arc<dyn ResourceInterceptor>> {
+        self.browser_resource_interceptor
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
 pub(crate) struct BrowserClientState {
     pub(crate) browser: BrowserId,
     pub(crate) viewport: Arc<ViewportState>,
@@ -290,11 +575,13 @@ pub(crate) struct BrowserClientState {
     pub(crate) options: Arc<BrowserOptions>,
     cursor: Mutex<BrowserCursor>,
     pub(crate) cursor_slot: rust_cef_core::cursor::CursorSlot,
+    pub(crate) native_context_menu: rust_cef_core::menu::NativeContextMenuSlot,
     last_tooltip: Mutex<String>,
     last_status: Mutex<String>,
     first_frame_logged: AtomicBool,
     frame_stats_count: std::sync::atomic::AtomicU64,
     frame_stats_copy_us_sum: std::sync::atomic::AtomicU64,
+    pub(crate) routing: Arc<PopupAndNavRoutingState>,
     #[cfg(feature = "test-support")]
     probe_console_kinds: AtomicU64,
     #[cfg(feature = "test-support")]
@@ -354,11 +641,13 @@ impl BrowserClientState {
             options: Arc::new(BrowserOptions::default()),
             cursor: Mutex::new(BrowserCursor::Arrow),
             cursor_slot: rust_cef_core::cursor::CursorSlot::new(),
+            native_context_menu: rust_cef_core::menu::NativeContextMenuSlot::new(),
             last_tooltip: Mutex::new(String::new()),
             last_status: Mutex::new(String::new()),
             first_frame_logged: AtomicBool::new(false),
             frame_stats_count: std::sync::atomic::AtomicU64::new(0),
             frame_stats_copy_us_sum: std::sync::atomic::AtomicU64::new(0),
+            routing: Arc::new(PopupAndNavRoutingState::new(PopupPolicy::Auto)),
             accessibility: crate::accessibility::RuntimeAccessibilityState::new(false),
             policy,
         }
@@ -382,6 +671,19 @@ impl BrowserClientState {
         cursor_slot: rust_cef_core::cursor::CursorSlot,
     ) -> Self {
         self.cursor_slot = cursor_slot;
+        self
+    }
+
+    pub(crate) fn with_native_context_menu(
+        mut self,
+        native_context_menu: rust_cef_core::menu::NativeContextMenuSlot,
+    ) -> Self {
+        self.native_context_menu = native_context_menu;
+        self
+    }
+
+    pub(crate) fn with_routing(mut self, routing: Arc<PopupAndNavRoutingState>) -> Self {
+        self.routing = routing;
         self
     }
 
@@ -659,35 +961,65 @@ impl BrowserClientState {
             .clear();
     }
 
+    pub(crate) fn wants_extended_event(&self, bit: u32) -> bool {
+        self.options.enable_extended_events || (self.routing.extended_event_mask() & bit) != 0
+    }
+
+    pub(crate) fn effective_host_capabilities(&self) -> HostCapabilities {
+        match self.routing.browser_host_capabilities() {
+            Some(custom) => custom.merge_fallback(&self.policy.host_capabilities()),
+            None => self.policy.host_capabilities(),
+        }
+    }
+
+    pub(crate) fn effective_resource_interceptor(&self) -> Option<Arc<dyn ResourceInterceptor>> {
+        self.routing
+            .browser_resource_interceptor()
+            .or_else(|| self.policy.interceptor())
+    }
+
     pub(crate) fn allows_navigation_for_script(&self, url: &str, main: bool) -> bool {
         self.allows_navigation(url, main)
     }
 
-    pub(crate) fn handle_popup_request(
-        &self,
-        target_url: Option<&CefString>,
-        target_frame_name: Option<&CefString>,
-        target_disposition: WindowOpenDisposition,
-        user_gesture: ::std::os::raw::c_int,
-    ) {
-        if let Some(svc) = self.policy.host_capabilities().popup {
-            let target_url = target_url.map(ToString::to_string).unwrap_or_default();
-            let target_frame_name = target_frame_name
-                .map(ToString::to_string)
-                .unwrap_or_default();
-            let policy_allowed = self.allows_navigation(&target_url, true);
+    pub(crate) fn deny_disallowed_url(&self, url: &str) {
+        let external = url::Url::parse(url).is_ok_and(|parsed| {
+            !matches!(
+                parsed.scheme(),
+                "http" | "https" | "data" | "about" | "file" | "javascript" | "blob"
+            ) && !self.policy.rules.is_custom_scheme(parsed.scheme())
+        });
+        self.deny(if external {
+            PolicyAction::ExternalProtocol
+        } else {
+            PolicyAction::Navigation
+        });
+    }
+
+    pub(crate) fn resolve_popup_decision(&self, request: PopupRequest) -> (PopupDecision, bool) {
+        if let Some(svc) = self.effective_host_capabilities().popup {
             let registry = self.registry.upgrade();
             let _guard = registry.as_ref().map(|r| r.host_requests.enter_callback());
-            svc.on_popup_request(rust_cef_core::host_capabilities::PopupRequest {
-                browser: self.browser,
-                target_url,
-                target_frame_name,
-                disposition: map_window_disposition(target_disposition),
-                user_gesture: user_gesture != 0,
-                policy_allowed,
-            });
-        } else {
-            self.deny(PolicyAction::Popup);
+            let decision = svc.decide_popup(request);
+            return (decision, false);
+        }
+        if let Some(filter) = self.routing.popup_filter() {
+            return (filter(&request), false);
+        }
+        if self.routing.is_popup_ui_listener_active() {
+            self.navigation_event(BrowserEvent::PopupRequested(request));
+            let _ = self.ui.wake();
+            return (PopupDecision::Cancel, false);
+        }
+        match self.routing.effective_popup_policy() {
+            PopupPolicy::Auto | PopupPolicy::Deny => (PopupDecision::Cancel, true),
+            PopupPolicy::AllowNativePopup => (
+                PopupDecision::AllowNativePopup {
+                    no_javascript_access: false,
+                },
+                false,
+            ),
+            PopupPolicy::NavigateCurrentTab => (PopupDecision::NavigateCurrentTab, false),
         }
     }
 
@@ -695,7 +1027,11 @@ impl BrowserClientState {
         if !self.active.load(Ordering::Acquire) {
             return false;
         }
-        if self.policy.rules.allows_page_navigation(url) {
+        if self.policy.rules.allows_page_navigation(url)
+            || self.policy.rules.allows_open_web_blob(url)
+            || self.policy.rules.allows_open_web_data(url)
+            || self.policy.rules.allows_open_web_blank(url, !main, false)
+        {
             return true;
         }
         main && self
@@ -705,9 +1041,21 @@ impl BrowserClientState {
             .contains(url)
     }
 
+    fn allows_popup_target(&self, url: &str) -> bool {
+        self.allows_navigation(url, true)
+            || (self.active.load(Ordering::Acquire)
+                && self.policy.rules.allows_open_web_blank(url, false, true))
+    }
+
     pub(crate) fn allows_resource(&self, url: &str, main_navigation: bool) -> bool {
         self.active.load(Ordering::Acquire)
             && (self.policy.rules.allows_network(url)
+                || self.policy.rules.allows_open_web_blob(url)
+                || self.policy.rules.allows_open_web_data(url)
+                || self
+                    .policy
+                    .rules
+                    .allows_open_web_blank(url, !main_navigation, false)
                 || (main_navigation
                     && self
                         .approved_data
@@ -716,7 +1064,7 @@ impl BrowserClientState {
                         .contains(url)))
     }
 
-    fn navigation_event(&self, event: BrowserEvent) {
+    pub(crate) fn navigation_event(&self, event: BrowserEvent) {
         if let Some(registry) = self.registry.upgrade() {
             registry.navigation_event(self.browser, event);
         }
@@ -780,9 +1128,12 @@ wrap_render_handler! {
             if !self.state.active.load(Ordering::Acquire) {
                 return 0;
             }
-            let (Some(_browser), Some(drag_data), Some(registry)) =
+            let (Some(browser), Some(drag_data), Some(registry)) =
                 (browser, drag_data, self.state.registry.upgrade())
             else {
+                return 0;
+            };
+            let Some(host) = browser.host() else {
                 return 0;
             };
             let scale = self.state.viewport.get().scale;
@@ -790,10 +1141,23 @@ wrap_render_handler! {
             if payload.is_empty() {
                 return 0;
             }
+            let Some(cloned_drag_data) = ImplDragData::clone(drag_data) else {
+                return 0;
+            };
+            cloned_drag_data.reset_file_contents();
             let mask = crate::outbound_drag::cef_mask_to_core(allowed_ops);
             i32::from(
                 registry
-                    .begin_outbound_drag(self.state.browser, payload, mask, x, y)
+                    .begin_outbound_drag_osr(
+                        self.state.browser,
+                        &host,
+                        payload,
+                        mask,
+                        allowed_ops,
+                        cloned_drag_data,
+                        x,
+                        y,
+                    )
                     .is_ok(),
             )
         }
@@ -853,11 +1217,11 @@ wrap_render_handler! {
             screen_info: Option<&mut ScreenInfo>,
         ) -> ::std::os::raw::c_int {
             let Some(screen_info) = screen_info else { return 0 };
-            let (viewport, screen_origin) = self.state.viewport.snapshot();
+            let viewport = self.state.viewport.get();
             screen_info.device_scale_factor = viewport.scale;
             screen_info.depth = 32;
             screen_info.depth_per_component = 8;
-            if let Some((ox, oy)) = screen_origin
+            if let Some((ox, oy)) = self.state.viewport.screen_point(0, 0)
                 && let Some((monitor_rect, work_rect)) =
                     monitor_screen_rects(ox, oy, viewport.scale)
             {
@@ -1040,38 +1404,106 @@ wrap_render_handler! {
                 return;
             }
             if let Err(error) = crate::capture::validate_accelerated(info) {
-                #[cfg(feature="test-support")]
-                if matches!(&error,rust_cef_core::ports::EngineError::Capture {kind:rust_cef_core::ports::CaptureFailureKind::IncompleteFrame,..}) {
-                    // The pure validator has not mutated Source. Observe only
-                    // this refusal path, never prolong old pixels on success.
-                    let before=(self.state.store.snapshot(),self.state.recovery.diagnostics(),self.state.capture.diagnostics());
-                    let after=self.state.store.snapshot();
-                    let recovery=self.state.recovery.diagnostics();
-                    let capture=self.state.capture.diagnostics();
-                    let identity=|frame:&Arc<rust_cef_core::ports::OwnedFrame>| {
-                        (frame.info.surface_generation,frame.info.sequence,frame.info.width,frame.info.height)
-                    };
-                    let rect=|r:&cef::Rect| (r.x,r.y,r.width,r.height);
-                    let witness=crate::test_support::NativeFrameRejection {
-                        browser:format!("{:?}",self.state.browser),surface:if surface==SurfaceKind::View {"View"} else {"Popup"},
-                        thread:crate::executor::current_thread_id(),
-                        failure_ordinal:before.2.failures.saturating_add(1),
-                        frame_sha256:before.0.view.frame.as_ref().and_then(|frame|{frame.cpu_pixels().map(|px|{use sha2::Digest as _;format!("{:x}",sha2::Sha256::digest(px.as_slice()))})}),
-                        coded:(info.extra.coded_size.width,info.extra.coded_size.height),
-                        visible:rect(&info.extra.visible_rect),content:rect(&info.extra.content_rect),
-                        source_generation_before:before.0.view.generation,source_generation_after:after.view.generation,
-                        frame_before:before.0.view.frame.as_ref().map(identity),frame_after:after.view.frame.as_ref().map(identity),
-                        same_frame:match (&before.0.view.frame,&after.view.frame) {(Some(a),Some(b))=>Arc::ptr_eq(a,b),(None,None)=>true,_=>false},
-                        recovery_status_before:before.1.status,recovery_status_after:recovery.status,
-                        target_generation:before.1.generation,target:(before.1.expected_width,before.1.expected_height),
-                        acks_before:before.1.acks,acks_after:recovery.acks,
-                        native_io_before:(before.2.opens,before.2.copies,before.2.maps,before.2.unmaps),
-                        native_io_after:(capture.opens,capture.copies,capture.maps,capture.unmaps),
-                    };
-                    let mut probe=self.state.frame_probe.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                    if probe.native_rejections.len()<32 {probe.native_rejections.push(witness);} else {probe.native_rejections_overflow=true;}
+                #[cfg(feature = "test-support")]
+                {
+                    if matches!(
+                        &error,
+                        rust_cef_core::ports::EngineError::Capture {
+                            kind: rust_cef_core::ports::CaptureFailureKind::IncompleteFrame,
+                            ..
+                        }
+                    ) {
+                        // The pure validator has not mutated Source. Observe only
+                        // this refusal path, never prolong old pixels on success.
+                        let before = (
+                            self.state.store.snapshot(),
+                            self.state.recovery.diagnostics(),
+                            self.state.capture.diagnostics(),
+                        );
+                        let after = self.state.store.snapshot();
+                        let recovery = self.state.recovery.diagnostics();
+                        let capture = self.state.capture.diagnostics();
+                        let identity = |frame: &Arc<rust_cef_core::ports::OwnedFrame>| {
+                            (
+                                frame.info.surface_generation,
+                                frame.info.sequence,
+                                frame.info.width,
+                                frame.info.height,
+                            )
+                        };
+                        let rect = |r: &cef::Rect| (r.x, r.y, r.width, r.height);
+                        let witness = crate::test_support::NativeFrameRejection {
+                            browser: format!("{:?}", self.state.browser),
+                            surface: if surface == SurfaceKind::View { "View" } else { "Popup" },
+                            thread: crate::executor::current_thread_id(),
+                            failure_ordinal: before.2.failures.saturating_add(1),
+                            frame_sha256: before.0.view.frame.as_ref().and_then(|frame| {
+                                frame.cpu_pixels().map(|px| {
+                                    use sha2::Digest as _;
+                                    format!("{:x}", sha2::Sha256::digest(px.as_slice()))
+                                })
+                            }),
+                            coded: (info.extra.coded_size.width, info.extra.coded_size.height),
+                            visible: rect(&info.extra.visible_rect),
+                            content: rect(&info.extra.content_rect),
+                            source_generation_before: before.0.view.generation,
+                            source_generation_after: after.view.generation,
+                            frame_before: before.0.view.frame.as_ref().map(identity),
+                            frame_after: after.view.frame.as_ref().map(identity),
+                            same_frame: match (&before.0.view.frame, &after.view.frame) {
+                                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                                (None, None) => true,
+                                _ => false,
+                            },
+                            recovery_status_before: before.1.status,
+                            recovery_status_after: recovery.status,
+                            target_generation: before.1.generation,
+                            target: (before.1.expected_width, before.1.expected_height),
+                            acks_before: before.1.acks,
+                            acks_after: recovery.acks,
+                            native_io_before: (
+                                before.2.opens,
+                                before.2.copies,
+                                before.2.maps,
+                                before.2.unmaps,
+                            ),
+                            native_io_after: (
+                                capture.opens,
+                                capture.copies,
+                                capture.maps,
+                                capture.unmaps,
+                            ),
+                        };
+                        let mut probe = self
+                            .state
+                            .frame_probe
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if probe.native_rejections.len() < 32 {
+                            probe.native_rejections.push(witness);
+                        } else {
+                            probe.native_rejections_overflow = true;
+                        }
+                    }
+                    self.report_engine_failure(error);
+                    return;
                 }
-                self.report_engine_failure(error); return;
+                #[cfg(not(feature = "test-support"))]
+                {
+                    if matches!(
+                        &error,
+                        rust_cef_core::ports::EngineError::Capture {
+                            kind: rust_cef_core::ports::CaptureFailureKind::IncompleteFrame,
+                            code: None,
+                        }
+                    ) {
+                        // Drop Chromium's transient letterboxed intermediate texture silently so
+                        // external callers keep the previous complete frame without fault noise.
+                        return;
+                    }
+                    self.report_engine_failure(error);
+                    return;
+                }
             }
             let rect = &info.extra.visible_rect;
             let token = match self.state.store.capture_token(surface, rect.width as u32, rect.height as u32) {
@@ -1222,26 +1654,102 @@ wrap_life_span_handler! {
             &self,
             _browser: Option<&mut Browser>,
             _frame: Option<&mut Frame>,
-            _popup_id: ::std::os::raw::c_int,
+            popup_id: ::std::os::raw::c_int,
             target_url: Option<&CefString>,
             target_frame_name: Option<&CefString>,
             target_disposition: WindowOpenDisposition,
             user_gesture: ::std::os::raw::c_int,
-            _popup_features: Option<&PopupFeatures>,
-            _window_info: Option<&mut WindowInfo>,
-            _client: Option<&mut Option<Client>>,
-            _settings: Option<&mut BrowserSettings>,
+            popup_features: Option<&PopupFeatures>,
+            window_info: Option<&mut WindowInfo>,
+            client: Option<&mut Option<Client>>,
+            settings: Option<&mut BrowserSettings>,
             _extra_info: Option<&mut Option<DictionaryValue>>,
-            _no_javascript_access: Option<&mut ::std::os::raw::c_int>,
+            no_javascript_access: Option<&mut ::std::os::raw::c_int>,
         ) -> ::std::os::raw::c_int {
-            self.state.handle_popup_request(
-                target_url,
-                target_frame_name,
-                target_disposition,
-                user_gesture,
-            );
-            // Unmanaged popup windows are never created.
-            1
+            let url = target_url.map(ToString::to_string).unwrap_or_default();
+            let frame_name = target_frame_name
+                .map(ToString::to_string)
+                .unwrap_or_default();
+            let policy_allowed = self.state.allows_popup_target(&url);
+            let request = PopupRequest {
+                browser: self.state.browser,
+                target_url: url.clone(),
+                target_frame_name: frame_name.clone(),
+                disposition: map_window_disposition(target_disposition),
+                user_gesture: user_gesture != 0,
+                policy_allowed,
+            };
+            let (decision, record_policy_deny) = self.state.resolve_popup_decision(request);
+            match decision {
+                PopupDecision::Cancel => {
+                    if record_policy_deny {
+                        self.state.deny(PolicyAction::Popup);
+                    }
+                    1
+                }
+                PopupDecision::NavigateCurrentTab => {
+                    if !policy_allowed {
+                        self.state.deny_disallowed_url(&url);
+                    } else if let Some(registry) = self.state.registry.upgrade() {
+                        registry.post_navigate_main_frame(self.state.browser, url);
+                    }
+                    1
+                }
+                PopupDecision::AllowNativePopup {
+                    no_javascript_access: disable_js,
+                } => {
+                    if !policy_allowed {
+                        self.state.deny_disallowed_url(&url);
+                        return 1;
+                    }
+                    let (Some(registry), Some(win_info), Some(client_slot)) =
+                        (self.state.registry.upgrade(), window_info, client)
+                    else {
+                        return 1;
+                    };
+                    let title = if !frame_name.is_empty() && !frame_name.starts_with('_') {
+                        frame_name.as_str()
+                    } else if !url.trim().is_empty() {
+                        url.as_str()
+                    } else {
+                        "GPUI CEF Popup"
+                    };
+                    let Ok(popup_client) = registry.open_managed_popup_client(
+                        self.state.browser,
+                        popup_id,
+                        self.state.policy.clone(),
+                    ) else {
+                        return 1;
+                    };
+                    *win_info =
+                        crate::popup_window::build_popup_window_info(popup_features, title);
+                    if let Some(s) = settings {
+                        s.windowless_frame_rate = 0;
+                        if s.background_color == 0 {
+                            s.background_color = 0xFFFF_FFFF;
+                        }
+                    }
+                    if disable_js
+                        && let Some(no_js) = no_javascript_access
+                    {
+                        *no_js = 1;
+                    }
+                    *client_slot = Some(popup_client);
+                    0
+                }
+            }
+        }
+
+        fn on_before_popup_aborted(
+            &self,
+            _browser: Option<&mut Browser>,
+            popup_id: ::std::os::raw::c_int,
+        ) {
+            if let Some(registry) = self.state.registry.upgrade() {
+                registry
+                    .popups
+                    .mark_aborted_by_popup_id(self.state.browser, popup_id);
+            }
         }
 
         fn on_after_created(&self, browser: Option<&mut Browser>) {
@@ -1411,7 +1919,8 @@ wrap_display_handler! {
         }
 
         fn on_tooltip(&self, _browser: Option<&mut Browser>, text: Option<&mut CefString>) -> i32 {
-            if !self.state.options.enable_tooltip_events {
+            let wants_event = self.state.wants_extended_event(EXT_EVENT_TOOLTIP);
+            if !self.state.options.enable_tooltip_events && !wants_event {
                 return 0;
             }
             let raw = text.map(|t| t.to_string()).unwrap_or_default();
@@ -1433,7 +1942,7 @@ wrap_display_handler! {
                 self.state
                     .navigation_event(BrowserEvent::TooltipChanged(bounded));
             }
-            1
+            i32::from(self.state.options.enable_tooltip_events)
         }
 
         fn on_status_message(&self, _browser: Option<&mut Browser>, value: Option<&CefString>) {
@@ -1463,6 +1972,40 @@ wrap_display_handler! {
                 .navigation_event(BrowserEvent::LoadingProgressChanged(progress_to_per_mille(
                     progress,
                 )));
+        }
+
+        fn on_auto_resize(
+            &self,
+            _browser: Option<&mut Browser>,
+            new_size: Option<&Size>,
+        ) -> ::std::os::raw::c_int {
+            if !self.state.wants_extended_event(EXT_EVENT_AUTO_RESIZE) {
+                return 0;
+            }
+            let Some(size) = new_size else {
+                return 0;
+            };
+            self.state.navigation_event(BrowserEvent::AutoResized {
+                width: size.width,
+                height: size.height,
+            });
+            1
+        }
+
+        fn on_media_access_change(
+            &self,
+            _browser: Option<&mut Browser>,
+            has_video_access: ::std::os::raw::c_int,
+            has_audio_access: ::std::os::raw::c_int,
+        ) {
+            if !self.state.wants_extended_event(EXT_EVENT_MEDIA_ACCESS) {
+                return;
+            }
+            self.state
+                .navigation_event(BrowserEvent::MediaAccessChanged {
+                    has_video: has_video_access != 0,
+                    has_audio: has_audio_access != 0,
+                });
         }
 
         fn on_cursor_change(
@@ -1506,14 +2049,19 @@ wrap_display_handler! {
             _source: Option<&CefString>,
             line: i32,
         ) -> i32 {
-            let emit_event = self.state.options.console_policy.enabled;
+            let emit_event = self.state.options.console_policy.enabled
+                || self.state.wants_extended_event(EXT_EVENT_CONSOLE);
             let raw_msg = if emit_event || cfg!(feature = "test-support") {
                 message.map(ToString::to_string)
             } else {
                 None
             };
             if emit_event {
-                let max_bytes = self.state.options.console_policy.max_message_bytes;
+                let max_bytes = if self.state.options.console_policy.enabled {
+                    self.state.options.console_policy.max_message_bytes
+                } else {
+                    DEFAULT_CONSOLE_MESSAGE_BYTES
+                };
                 let bounded = truncate_utf8_bytes(raw_msg.as_deref().unwrap_or_default(), max_bytes);
                 self.state.navigation_event(BrowserEvent::ConsoleMessage {
                     severity: map_log_severity(level),
@@ -1563,7 +2111,7 @@ wrap_display_handler! {
             }
             #[cfg(not(feature = "test-support"))]
             {
-                i32::from(emit_event)
+                i32::from(self.state.options.console_policy.enabled)
             }
         }
     }
@@ -1580,7 +2128,17 @@ wrap_focus_handler! {
                 .navigation_event(BrowserEvent::FocusTaken { next: next != 0 });
         }
 
-        fn on_set_focus(&self, _browser: Option<&mut Browser>, _source: FocusSource) -> i32 {
+        fn on_set_focus(&self, _browser: Option<&mut Browser>, source: FocusSource) -> i32 {
+            if let Some(filter) = self.state.routing.focus_filter() {
+                let mapped = if source == FocusSource::NAVIGATION {
+                    FocusRequestSource::Navigation
+                } else if source == FocusSource::SYSTEM {
+                    FocusRequestSource::System
+                } else {
+                    FocusRequestSource::Unknown(source.get_raw())
+                };
+                return i32::from(filter(self.state.browser, mapped) == FocusDecision::Cancel);
+            }
             // Allow focus to be set by default (matches CefSharp ClientAdapter::OnSetFocus).
             0
         }
@@ -1588,6 +2146,29 @@ wrap_focus_handler! {
         fn on_got_focus(&self, _browser: Option<&mut Browser>) {
             self.state.navigation_event(BrowserEvent::GotFocus);
         }
+    }
+}
+
+pub(crate) fn map_cef_key_event(event: &KeyEvent) -> BrowserKeyEvent {
+    let kind = if event.type_ == KeyEventType::RAWKEYDOWN {
+        BrowserKeyEventKind::RawKeyDown
+    } else if event.type_ == KeyEventType::KEYDOWN {
+        BrowserKeyEventKind::KeyDown
+    } else if event.type_ == KeyEventType::KEYUP {
+        BrowserKeyEventKind::KeyUp
+    } else if event.type_ == KeyEventType::CHAR {
+        BrowserKeyEventKind::Char
+    } else {
+        BrowserKeyEventKind::Unknown(event.type_.get_raw())
+    };
+    BrowserKeyEvent {
+        kind,
+        windows_key_code: event.windows_key_code,
+        native_key_code: event.native_key_code,
+        modifiers: event.modifiers,
+        is_system_key: event.is_system_key != 0,
+        character: event.character,
+        unmodified_character: event.unmodified_character,
     }
 }
 
@@ -1602,25 +2183,50 @@ wrap_keyboard_handler! {
             _browser: Option<&mut Browser>,
             event: Option<&KeyEvent>,
             _os_event: Option<&mut cef::sys::MSG>,
-            _is_keyboard_shortcut: Option<&mut i32>,
+            is_keyboard_shortcut: Option<&mut i32>,
         ) -> i32 {
             let Some(event) = event else {
                 return 0;
             };
-            if event.type_ != KeyEventType::RAWKEYDOWN && event.type_ != KeyEventType::KEYDOWN {
-                return 0;
-            }
-            if let Some(id) = self
-                .state
-                .options
-                .shortcut_filter
-                .match_key(event.windows_key_code, event.modifiers)
+            if (event.type_ == KeyEventType::RAWKEYDOWN || event.type_ == KeyEventType::KEYDOWN)
+                && let Some(id) = self
+                    .state
+                    .options
+                    .shortcut_filter
+                    .match_key(event.windows_key_code, event.modifiers)
             {
                 self.state
                     .navigation_event(BrowserEvent::HostShortcutTriggered { id });
                 return 1;
             }
+            if let Some(filter) = self.state.routing.pre_key_filter() {
+                let mapped = map_cef_key_event(event);
+                match filter(self.state.browser, &mapped) {
+                    PreKeyDecision::Handled => return 1,
+                    PreKeyDecision::PassAsShortcut => {
+                        if let Some(flag) = is_keyboard_shortcut {
+                            *flag = 1;
+                        }
+                        return 0;
+                    }
+                    PreKeyDecision::PassThrough => {}
+                }
+            }
             0
+        }
+
+        fn on_key_event(
+            &self,
+            _browser: Option<&mut Browser>,
+            event: Option<&KeyEvent>,
+            _os_event: Option<&mut cef::sys::MSG>,
+        ) -> ::std::os::raw::c_int {
+            let (Some(event), Some(filter)) = (event, self.state.routing.key_event_filter())
+            else {
+                return 0;
+            };
+            let mapped = map_cef_key_event(event);
+            i32::from(filter(self.state.browser, &mapped) == KeyEventDecision::Handled)
         }
     }
 }
@@ -1716,7 +2322,7 @@ wrap_request_handler! {
             _browser: Option<&mut Browser>,
             frame: Option<&mut Frame>,
             request: Option<&mut Request>,
-            _user_gesture: ::std::os::raw::c_int,
+            user_gesture: ::std::os::raw::c_int,
             is_redirect: ::std::os::raw::c_int,
         ) -> ::std::os::raw::c_int {
             let Some(frame) = frame else { self.state.deny(PolicyAction::Navigation); return 1; };
@@ -1724,14 +2330,22 @@ wrap_request_handler! {
             let url = CefString::from(&request.url()).to_string();
             let main = frame.is_main() != 0;
             if !self.state.allows_navigation(&url, main) {
-                let external = url::Url::parse(&url).is_ok_and(|parsed| {
-                    !matches!(
-                        parsed.scheme(),
-                        "http" | "https" | "data" | "about" | "file" | "javascript" | "blob"
-                    ) && !self.state.policy.rules.is_custom_scheme(parsed.scheme())
-                });
-                self.state.deny(if external { PolicyAction::ExternalProtocol } else { PolicyAction::Navigation });
+                self.state.deny_disallowed_url(&url);
                 return 1;
+            }
+            if let Some(filter) = self.state.routing.navigation_filter() {
+                let req = NavigationRequest {
+                    browser: self.state.browser,
+                    url: url.clone(),
+                    method: CefString::from(&request.method()).to_string(),
+                    is_main_frame: main,
+                    is_redirect: is_redirect != 0,
+                    user_gesture: user_gesture != 0,
+                    transition_type: request.transition_type().get_raw() as u32,
+                };
+                if filter(&req) == NavigationDecision::Cancel {
+                    return 1;
+                }
             }
             self.state.navigation_observation(BrowserEvent::NavigationRequested {
                 is_main_frame: main,
@@ -1748,9 +2362,34 @@ wrap_request_handler! {
             target_disposition: WindowOpenDisposition,
             user_gesture: ::std::os::raw::c_int,
         ) -> ::std::os::raw::c_int {
-            self.state
-                .handle_popup_request(target_url, None, target_disposition, user_gesture);
-            1
+            let url = target_url.map(ToString::to_string).unwrap_or_default();
+            let policy_allowed = self.state.allows_popup_target(&url);
+            let request = PopupRequest {
+                browser: self.state.browser,
+                target_url: url.clone(),
+                target_frame_name: String::new(),
+                disposition: map_window_disposition(target_disposition),
+                user_gesture: user_gesture != 0,
+                policy_allowed,
+            };
+            let (decision, record_policy_deny) = self.state.resolve_popup_decision(request);
+            match decision {
+                PopupDecision::Cancel => {
+                    if record_policy_deny {
+                        self.state.deny(PolicyAction::Popup);
+                    }
+                    1
+                }
+                PopupDecision::NavigateCurrentTab
+                | PopupDecision::AllowNativePopup { .. } => {
+                    if !policy_allowed {
+                        self.state.deny_disallowed_url(&url);
+                        1
+                    } else {
+                        0
+                    }
+                }
+            }
         }
 
         fn resource_request_handler(&self, _browser: Option<&mut Browser>, frame: Option<&mut Frame>,
@@ -1772,7 +2411,7 @@ wrap_request_handler! {
             scheme: Option<&CefString>,
             callback: Option<&mut AuthCallback>,
         ) -> ::std::os::raw::c_int {
-            if let Some(svc) = self.state.policy.host_capabilities().auth {
+            if let Some(svc) = self.state.effective_host_capabilities().auth {
                 let (Some(registry), Some(callback)) = (self.state.registry.upgrade(), callback)
                 else {
                     return 0;
@@ -1840,7 +2479,7 @@ wrap_request_handler! {
             _ssl_info: Option<&mut Sslinfo>,
             callback: Option<&mut Callback>,
         ) -> ::std::os::raw::c_int {
-            if let Some(svc) = self.state.policy.host_capabilities().certificate {
+            if let Some(svc) = self.state.effective_host_capabilities().certificate {
                 let (Some(registry), Some(callback)) = (self.state.registry.upgrade(), callback)
                 else {
                     return 0;
@@ -1873,6 +2512,13 @@ wrap_request_handler! {
             }
         }
 
+        fn on_document_available_in_main_frame(&self, _browser: Option<&mut Browser>) {
+            if self.state.wants_extended_event(EXT_EVENT_DOCUMENT_AVAILABLE) {
+                self.state
+                    .navigation_event(BrowserEvent::DocumentAvailableInMainFrame);
+            }
+        }
+
         fn on_select_client_certificate(
             &self,
             _browser: Option<&mut Browser>,
@@ -1882,7 +2528,7 @@ wrap_request_handler! {
             certificates: Option<&[Option<X509Certificate>]>,
             callback: Option<&mut SelectClientCertificateCallback>,
         ) -> ::std::os::raw::c_int {
-            if let Some(svc) = self.state.policy.host_capabilities().certificate {
+            if let Some(svc) = self.state.effective_host_capabilities().certificate {
                 let Some(registry) = self.state.registry.upgrade() else {
                     if let Some(callback) = callback {
                         self.state.audit_native();
@@ -2007,6 +2653,59 @@ wrap_print_handler! {
     }
 }
 
+// Explicit passthrough `CefContextMenuHandler` used when the host has not bound
+// a custom menu bridge. Leaves CEF's default menu model intact and returns `0`
+// (`false`) from `run_context_menu` and `on_context_menu_command` so CEF
+// renders and executes its native OS/Views context menu directly.
+#[cfg(any(test, not(feature = "test-support")))]
+wrap_context_menu_handler! {
+    pub(crate) struct NativeContextMenuHandler {
+        state: Arc<BrowserClientState>,
+    }
+    impl ContextMenuHandler {
+        fn on_before_context_menu(
+            &self,
+            _browser: Option<&mut Browser>,
+            _frame: Option<&mut Frame>,
+            _params: Option<&mut ContextMenuParams>,
+            _model: Option<&mut cef::MenuModel>,
+        ) {
+            // Do not call `model.clear()`: keep CEF's default menu items intact.
+        }
+
+        fn run_context_menu(
+            &self,
+            _browser: Option<&mut Browser>,
+            _frame: Option<&mut Frame>,
+            _params: Option<&mut ContextMenuParams>,
+            _model: Option<&mut cef::MenuModel>,
+            _callback: Option<&mut RunContextMenuCallback>,
+        ) -> ::std::os::raw::c_int {
+            self.state.native_context_menu.mark_opened();
+            0
+        }
+
+        fn on_context_menu_command(
+            &self,
+            _browser: Option<&mut Browser>,
+            _frame: Option<&mut Frame>,
+            _params: Option<&mut ContextMenuParams>,
+            _command_id: ::std::os::raw::c_int,
+            _event_flags: EventFlags,
+        ) -> ::std::os::raw::c_int {
+            0
+        }
+
+        fn on_context_menu_dismissed(
+            &self,
+            _browser: Option<&mut Browser>,
+            _frame: Option<&mut Frame>,
+        ) {
+            self.state.native_context_menu.mark_dismissed();
+        }
+    }
+}
+
 wrap_client! {
     pub(crate) struct BrowserClientBuilder {
         render: Option<RenderHandler>,
@@ -2016,6 +2715,9 @@ wrap_client! {
         keyboard: KeyboardHandler,
         load: LoadHandler,
         request: RequestHandler,
+        drag: DragHandler,
+        frame: FrameHandler,
+        audio: AudioHandler,
         js: JsdialogHandler,
         file: DialogHandler,
         download: DownloadHandler,
@@ -2052,6 +2754,23 @@ wrap_client! {
         fn request_handler(&self) -> Option<RequestHandler> {
             Some(self.request.clone())
         }
+
+        fn drag_handler(&self) -> Option<DragHandler> {
+            Some(self.drag.clone())
+        }
+
+        fn frame_handler(&self) -> Option<FrameHandler> {
+            Some(self.frame.clone())
+        }
+
+        fn audio_handler(&self) -> Option<AudioHandler> {
+            self.menu_state
+                .effective_host_capabilities()
+                .audio
+                .is_some()
+                .then(|| self.audio.clone())
+        }
+
         fn jsdialog_handler(&self) -> Option<JsdialogHandler> { Some(self.js.clone()) }
         fn dialog_handler(&self) -> Option<DialogHandler> { Some(self.file.clone()) }
         fn download_handler(&self) -> Option<DownloadHandler> { Some(self.download.clone()) }
@@ -2118,11 +2837,14 @@ impl BrowserClientBuilder {
         let focus = RuntimeFocusHandler::new(state.clone());
         let keyboard = RuntimeKeyboardHandler::new(state.clone());
         let load = RuntimeLoadHandler::new(state.clone());
+        let drag = crate::client_handlers::RuntimeDragHandler::new(state.clone());
+        let frame = crate::client_handlers::RuntimeFrameHandler::new(state.clone());
+        let audio = crate::client_handlers::new_audio_handler(state.clone());
         let capabilities = crate::policy_handlers::PolicyHandlers::new(state.clone());
         #[cfg(feature = "test-support")]
         let menu = Some(crate::menu_probe::MenuProbeHandler::new(state.clone()));
         #[cfg(not(feature = "test-support"))]
-        let menu = None;
+        let menu = Some(NativeContextMenuHandler::new(state.clone()));
         let request = RuntimeRequestHandler::new(state.clone());
         BrowserClientBuilder::new(
             render,
@@ -2132,6 +2854,9 @@ impl BrowserClientBuilder {
             keyboard,
             load,
             request,
+            drag,
+            frame,
+            audio,
             capabilities.js,
             capabilities.file,
             capabilities.download,
@@ -2939,5 +3664,446 @@ mod tests {
 
         assert_eq!(observers.frames.load(Ordering::Relaxed), 0);
         assert_eq!(observers.failures.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn viewport_state_screen_point_uses_client_offset_scale_and_client_to_screen() {
+        #[allow(clashing_extern_declarations)]
+        #[link(name = "user32")]
+        unsafe extern "system" {
+            fn CreateWindowExW(
+                ex_style: u32,
+                class_name: *const u16,
+                window_name: *const u16,
+                style: u32,
+                x: i32,
+                y: i32,
+                width: i32,
+                height: i32,
+                parent: isize,
+                menu: isize,
+                instance: isize,
+                param: *mut std::ffi::c_void,
+            ) -> isize;
+            fn DestroyWindow(hwnd: isize) -> i32;
+        }
+        const WS_POPUP: u32 = 0x8000_0000;
+        let class: Vec<u16> = "STATIC\0".encode_utf16().collect();
+        let raw = unsafe {
+            CreateWindowExW(
+                0,
+                class.as_ptr(),
+                std::ptr::null(),
+                WS_POPUP,
+                200,
+                160,
+                600,
+                400,
+                0,
+                0,
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_ne!(raw, 0);
+        struct Guard(isize);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                unsafe {
+                    let _ = DestroyWindow(self.0);
+                }
+            }
+        }
+        let _guard = Guard(raw);
+        let hwnd = std::num::NonZeroUsize::new(raw as usize).unwrap();
+
+        let vp = ViewportState::new_with_parent(
+            Viewport {
+                width: 800,
+                height: 600,
+                scale: 1.5,
+            },
+            Some(hwnd),
+        );
+        assert!(vp.set_client_offset(10.0, 44.0));
+        assert!(!vp.set_client_offset(10.0, 44.0));
+        assert!(!vp.set_client_offset(f32::NAN, 10.0));
+
+        // Expected client physical coords: round((100 + 10) * 1.5) = 165, round((50 + 44) * 1.5) = 141.
+        let expected = crate::native_hwnd::client_to_screen(hwnd, 165, 141).unwrap();
+        assert_eq!(vp.screen_point(100, 50), Some(expected));
+    }
+
+    #[test]
+    fn native_context_menu_handler_passes_through_without_intercepting() {
+        let (_registry, state, _observers) = frame_fixture();
+        assert!(!state.native_context_menu.is_open());
+        let handler = NativeContextMenuHandler::new(state.clone());
+        handler.on_before_context_menu(None, None, None, None);
+        assert_eq!(handler.run_context_menu(None, None, None, None, None), 0);
+        assert!(state.native_context_menu.is_open());
+        assert_eq!(
+            handler.on_context_menu_command(None, None, None, 113, EventFlags::default()),
+            0
+        );
+        handler.on_context_menu_dismissed(None, None);
+        assert!(!state.native_context_menu.is_open());
+        assert!(
+            state
+                .native_context_menu
+                .was_active_within(std::time::Duration::from_millis(400))
+        );
+    }
+
+    #[test]
+    fn decoupled_popup_routing_matches_cefsharp_defaults_and_overrides() {
+        use rust_cef_core::host_capabilities::{
+            NavigationDecision, PopupDecision, PopupDisposition, PopupPolicy, PopupRequest,
+        };
+        let (registry, base_state, observers) = frame_fixture();
+        let policy = NativePolicy::new(
+            Arc::new(
+                crate::policy::CompiledPolicy::compile(
+                    &rust_cef_core::contracts::TrustedContentPolicy {
+                        allowed_origins: vec!["https://allowed.local".into()],
+                        allow_embedded_data: true,
+                    },
+                )
+                .unwrap(),
+            ),
+            Arc::downgrade(&registry),
+        );
+        let state = Arc::new(BrowserClientState::new(
+            base_state.browser,
+            base_state.viewport.clone(),
+            base_state.store.clone(),
+            observers.clone(),
+            observers,
+            Arc::downgrade(&registry),
+            policy,
+            "https://allowed.local/",
+        ));
+        let make_req = |url: &str| PopupRequest {
+            browser: state.browser,
+            target_url: url.into(),
+            target_frame_name: "_blank".into(),
+            disposition: PopupDisposition::NewForegroundTab,
+            user_gesture: true,
+            policy_allowed: true,
+        };
+
+        // 1. Headless unattached Auto -> Cancel + PolicyAction::Popup denial.
+        assert_eq!(
+            state.resolve_popup_decision(make_req("https://allowed.local/a")),
+            (PopupDecision::Cancel, true)
+        );
+
+        // 2. View attached with Auto -> AllowNativePopup (CefSharp default).
+        state.routing.set_view_attached(true);
+        assert_eq!(
+            state.resolve_popup_decision(make_req("https://allowed.local/a")),
+            (
+                PopupDecision::AllowNativePopup {
+                    no_javascript_access: false
+                },
+                false
+            )
+        );
+
+        // 3. Explicit NavigateCurrentTab policy -> NavigateCurrentTab.
+        state.routing.set_popup_policy(PopupPolicy::NavigateCurrentTab);
+        assert_eq!(
+            state.resolve_popup_decision(make_req("https://allowed.local/a")),
+            (PopupDecision::NavigateCurrentTab, false)
+        );
+
+        // 4. Binding on_popup UI listener overrides default policy -> Cancel without denial + queues event.
+        state.routing.set_popup_policy(PopupPolicy::Auto);
+        state.routing.set_popup_ui_listener_active(true);
+        assert_eq!(
+            state.resolve_popup_decision(make_req("https://allowed.local/b")),
+            (PopupDecision::Cancel, false)
+        );
+
+        // 5. Synchronous PopupFilter overrides UI listener and policy.
+        state.routing.set_popup_filter(Some(Arc::new(|req| {
+            if req.target_url.ends_with("/tab") {
+                PopupDecision::NavigateCurrentTab
+            } else {
+                PopupDecision::AllowNativePopup {
+                    no_javascript_access: true,
+                }
+            }
+        })));
+        assert_eq!(
+            state.resolve_popup_decision(make_req("https://allowed.local/tab")),
+            (PopupDecision::NavigateCurrentTab, false)
+        );
+        assert_eq!(
+            state.resolve_popup_decision(make_req("https://allowed.local/win")),
+            (
+                PopupDecision::AllowNativePopup {
+                    no_javascript_access: true
+                },
+                false
+            )
+        );
+
+        // 6. on_open_urlfrom_tab follows resolved decision (NavigateCurrentTab -> 0, disallowed -> 1).
+        state.routing.set_popup_filter(None);
+        state.routing.set_popup_ui_listener_active(false);
+        state.routing.set_popup_policy(PopupPolicy::NavigateCurrentTab);
+        let req_handler = RuntimeRequestHandler::new(state.clone());
+        let ok_url = CefString::from("https://allowed.local/midclick");
+        let bad_url = CefString::from("https://blocked.invalid/midclick");
+        assert_eq!(
+            req_handler.on_open_urlfrom_tab(
+                None,
+                None,
+                Some(&ok_url),
+                WindowOpenDisposition::NEW_BACKGROUND_TAB,
+                1
+            ),
+            0
+        );
+        assert_eq!(
+            req_handler.on_open_urlfrom_tab(
+                None,
+                None,
+                Some(&bad_url),
+                WindowOpenDisposition::NEW_BACKGROUND_TAB,
+                1
+            ),
+            1
+        );
+
+        // 7. NavigationFilter can inspect/cancel otherwise policy-allowed navigations.
+        state.routing.set_navigation_filter(Some(Arc::new(|nav| {
+            if nav.url.ends_with("/stop") {
+                NavigationDecision::Cancel
+            } else {
+                NavigationDecision::Allow
+            }
+        })));
+        let nav_filter = state.routing.navigation_filter().unwrap();
+        assert_eq!(
+            nav_filter(&NavigationRequest {
+                browser: state.browser,
+                url: "https://allowed.local/stop".into(),
+                method: "GET".into(),
+                is_main_frame: true,
+                is_redirect: false,
+                user_gesture: true,
+                transition_type: 0,
+            }),
+            NavigationDecision::Cancel
+        );
+
+        // 8. Open-web policy allows subframe blanks/blobs and JS empty popup targets
+        // while keeping strict single-origin policies fail-closed.
+        assert!(!state.allows_popup_target(""));
+        assert!(!state.allows_popup_target("about:blank"));
+        assert!(!state.allows_navigation("about:blank", false));
+        assert!(!state.allows_resource("blob:https://allowed.local/id", false));
+
+        let (open_registry, open_base, open_observers) = frame_fixture();
+        let open_policy = NativePolicy::new(
+            Arc::new(
+                crate::policy::CompiledPolicy::compile(
+                    &rust_cef_core::contracts::TrustedContentPolicy::allow_all_http_https(true),
+                )
+                .unwrap(),
+            ),
+            Arc::downgrade(&open_registry),
+        );
+        let open_state = BrowserClientState::new(
+            open_base.browser,
+            open_base.viewport.clone(),
+            open_base.store.clone(),
+            open_observers.clone(),
+            open_observers,
+            Arc::downgrade(&open_registry),
+            open_policy,
+            "https://cn.bing.com/search?q=gpui+rust",
+        );
+        assert!(open_state.allows_popup_target(""));
+        assert!(open_state.allows_popup_target("about:blank"));
+        assert!(open_state.allows_navigation("about:blank", false));
+        assert!(open_state.allows_navigation("about:srcdoc", false));
+        assert!(!open_state.allows_navigation("about:srcdoc", true));
+        assert!(open_state.allows_resource("blob:https://cn.bing.com/abc", false));
+        assert!(!open_state.allows_resource("blob:null/abc", false));
+    }
+
+    #[test]
+    fn focus_keyboard_drag_opt_in_audio_and_per_browser_capabilities_work() {
+        use rust_cef_core::contracts::{BrowserKeyEventKind, FocusRequestSource};
+        use rust_cef_core::host_capabilities::{
+            AudioStreamService, DragEnterDecision, FocusDecision, KeyEventDecision, PopupDecision,
+            PopupRequest, PopupService, PreKeyDecision,
+        };
+        use rust_cef_core::ports::EXT_EVENT_DRAGGABLE_REGIONS;
+
+        let (registry, state, _observers) = frame_fixture();
+        let _ = cef::api_hash(cef::sys::CEF_API_VERSION_LAST, 0);
+
+        // 1. FocusHandler: allows by default, cancels only when filter rejects.
+        let focus = RuntimeFocusHandler::new(state.clone());
+        assert_eq!(focus.on_set_focus(None, FocusSource::NAVIGATION), 0);
+        state.routing.set_focus_filter(Some(Arc::new(|_, src| {
+            if src == FocusRequestSource::Navigation {
+                FocusDecision::Cancel
+            } else {
+                FocusDecision::Allow
+            }
+        })));
+        assert_eq!(focus.on_set_focus(None, FocusSource::NAVIGATION), 1);
+        assert_eq!(focus.on_set_focus(None, FocusSource::SYSTEM), 0);
+
+        // 2. KeyboardHandler: PreKeyEvent shortcut/handled and OnKeyEvent handled.
+        let kbd = RuntimeKeyboardHandler::new(state.clone());
+        let key = KeyEvent {
+            size: std::mem::size_of::<KeyEvent>(),
+            type_: KeyEventType::KEYDOWN,
+            modifiers: 0,
+            windows_key_code: 0x41,
+            native_key_code: 30,
+            is_system_key: 0,
+            character: b'a' as u16,
+            unmodified_character: b'a' as u16,
+            focus_on_editable_field: 1,
+        };
+        let mut is_shortcut = 0;
+        assert_eq!(
+            kbd.on_pre_key_event(None, Some(&key), None, Some(&mut is_shortcut)),
+            0
+        );
+        assert_eq!(is_shortcut, 0);
+        state
+            .routing
+            .set_pre_key_filter(Some(Arc::new(|_, ev| {
+                assert_eq!(ev.kind, BrowserKeyEventKind::KeyDown);
+                if ev.windows_key_code == 0x41 {
+                    PreKeyDecision::PassAsShortcut
+                } else {
+                    PreKeyDecision::Handled
+                }
+            })));
+        assert_eq!(
+            kbd.on_pre_key_event(None, Some(&key), None, Some(&mut is_shortcut)),
+            0
+        );
+        assert_eq!(is_shortcut, 1);
+
+        let key_handled = KeyEvent {
+            windows_key_code: 0x42,
+            ..key
+        };
+        assert_eq!(
+            kbd.on_pre_key_event(None, Some(&key_handled), None, None),
+            1
+        );
+        state.routing.set_key_event_filter(Some(Arc::new(|_, ev| {
+            if ev.windows_key_code == 0x42 {
+                KeyEventDecision::Handled
+            } else {
+                KeyEventDecision::PassThrough
+            }
+        })));
+        assert_eq!(kbd.on_key_event(None, Some(&key), None), 0);
+        assert_eq!(kbd.on_key_event(None, Some(&key_handled), None), 1);
+
+        // 3. DragHandler: default allow, filter can cancel, draggable regions gate on EXT_EVENT.
+        let drag = crate::client_handlers::RuntimeDragHandler::new(state.clone());
+        let drag_copy =
+            crate::outbound_drag::core_mask_to_cef(rust_cef_core::outbound_drag::DragOperationMask::COPY);
+        assert_eq!(drag.on_drag_enter(None, None, drag_copy), 0);
+        let expected_browser = state.browser;
+        state.routing.set_drag_enter_filter(Some(Arc::new(move |info| {
+            assert_eq!(info.browser, expected_browser);
+            DragEnterDecision::Cancel
+        })));
+        assert_eq!(drag.on_drag_enter(None, None, drag_copy), 1);
+        assert!(!state.wants_extended_event(EXT_EVENT_DRAGGABLE_REGIONS));
+        let region = DraggableRegion {
+            bounds: Rect {
+                x: 1,
+                y: 2,
+                width: 100,
+                height: 24,
+            },
+            draggable: 1,
+        };
+        drag.on_draggable_regions_changed(None, None, Some(&[region]));
+        assert!(registry.take_view_events(state.browser).is_empty());
+
+        state
+            .routing
+            .set_extended_event_mask(EXT_EVENT_DRAGGABLE_REGIONS);
+        assert!(state.wants_extended_event(EXT_EVENT_DRAGGABLE_REGIONS));
+
+        // 4. Opt-in AudioHandler: None when audio is unset, Some when set (per-browser or runtime).
+        let client = BrowserClientBuilder::build(state.clone());
+        assert!(client.audio_handler().is_none());
+        assert!(client.drag_handler().is_some());
+        assert!(client.frame_handler().is_some());
+
+        struct TestAudio;
+        impl AudioStreamService for TestAudio {}
+        state
+            .routing
+            .set_browser_host_capabilities(Some(HostCapabilities {
+                audio: Some(Arc::new(TestAudio)),
+                ..Default::default()
+            }));
+        assert!(client.audio_handler().is_some());
+
+        // 5. Per-browser HostCapabilities popup override merges with runtime fallback.
+        struct RuntimePopup;
+        impl PopupService for RuntimePopup {
+            fn decide_popup(&self, _request: PopupRequest) -> PopupDecision {
+                PopupDecision::NavigateCurrentTab
+            }
+        }
+        state.policy.set_host_capabilities(HostCapabilities {
+            popup: Some(Arc::new(RuntimePopup)),
+            ..Default::default()
+        });
+        let sample_popup = PopupRequest {
+            browser: state.browser,
+            target_url: "https://allowed.local/next".into(),
+            target_frame_name: "_blank".into(),
+            disposition: rust_cef_core::host_capabilities::PopupDisposition::NewWindow,
+            user_gesture: true,
+            policy_allowed: true,
+        };
+        assert_eq!(
+            state.resolve_popup_decision(sample_popup.clone()),
+            (PopupDecision::NavigateCurrentTab, false)
+        );
+        struct BrowserPopup;
+        impl PopupService for BrowserPopup {
+            fn decide_popup(&self, _request: PopupRequest) -> PopupDecision {
+                PopupDecision::AllowNativePopup {
+                    no_javascript_access: true,
+                }
+            }
+        }
+        state
+            .routing
+            .set_browser_host_capabilities(Some(HostCapabilities {
+                popup: Some(Arc::new(BrowserPopup)),
+                audio: Some(Arc::new(TestAudio)),
+                ..Default::default()
+            }));
+        assert_eq!(
+            state.resolve_popup_decision(sample_popup),
+            (
+                PopupDecision::AllowNativePopup {
+                    no_javascript_access: true
+                },
+                false
+            )
+        );
     }
 }

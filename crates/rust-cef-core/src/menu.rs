@@ -5,9 +5,82 @@
 //! for one submenu layer, checkability and owned context. Never silently flatten
 //! new structures into this compatibility type or retain native model pointers.
 
-use std::{collections::BTreeSet, num::NonZeroUsize};
+use std::{
+    collections::BTreeSet,
+    num::NonZeroUsize,
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+    time::{Duration, Instant},
+};
 
 use crate::contracts::BrowserId;
+
+fn native_menu_epoch() -> Instant {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    *EPOCH.get_or_init(Instant::now)
+}
+
+fn monotonic_ms_nonzero() -> u64 {
+    let elapsed = native_menu_epoch().elapsed().as_millis();
+    let ms = u64::try_from(elapsed).unwrap_or(u64::MAX - 1);
+    ms.saturating_add(1)
+}
+
+#[derive(Debug, Default)]
+struct NativeContextMenuState {
+    open: AtomicBool,
+    last_dismissed_ms: AtomicU64,
+}
+
+/// Lock-free native CEF context-menu lifecycle slot shared between CEF UI
+/// callbacks (`run_context_menu` / `on_context_menu_dismissed`) and the GPUI view.
+#[derive(Clone, Debug, Default)]
+pub struct NativeContextMenuSlot {
+    inner: Arc<NativeContextMenuState>,
+}
+
+impl NativeContextMenuSlot {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn mark_opened(&self) {
+        self.inner.open.store(true, Ordering::Release);
+    }
+
+    pub fn mark_dismissed(&self) {
+        // Store the dismissal timestamp before clearing `open` so concurrent UI
+        // readers never see `open == false && last_dismissed_ms == 0`.
+        self.inner
+            .last_dismissed_ms
+            .store(monotonic_ms_nonzero(), Ordering::Release);
+        self.inner.open.store(false, Ordering::Release);
+    }
+
+    pub fn is_open(&self) -> bool {
+        self.inner.open.load(Ordering::Acquire)
+    }
+
+    pub fn was_active_within(&self, window: Duration) -> bool {
+        if self.is_open() {
+            return true;
+        }
+        let dismissed_ms = self.inner.last_dismissed_ms.load(Ordering::Acquire);
+        if dismissed_ms == 0 {
+            return false;
+        }
+        let now_ms = monotonic_ms_nonzero();
+        let window_ms = u64::try_from(window.as_millis()).unwrap_or(u64::MAX);
+        now_ms.saturating_sub(dismissed_ms) <= window_ms
+    }
+
+    pub fn clear(&self) {
+        self.inner.open.store(false, Ordering::Release);
+        self.inner.last_dismissed_ms.store(0, Ordering::Release);
+    }
+}
 
 /// A menu opening, distinct from beforeunload and other continuation domains.
 /// The full Browser identity includes the Runtime generation; sequence zero is
@@ -304,5 +377,30 @@ mod tests {
         };
         assert_eq!(menu.label_of(10), Some("Inspect"));
         assert_eq!(menu.label_of(99), None);
+    }
+
+    #[test]
+    fn native_context_menu_slot_tracks_open_dismiss_and_window() {
+        let slot = NativeContextMenuSlot::new();
+        assert!(!slot.is_open());
+        assert!(!slot.was_active_within(Duration::from_millis(400)));
+
+        slot.mark_opened();
+        assert!(slot.is_open());
+        assert!(slot.was_active_within(Duration::from_millis(0)));
+
+        slot.mark_dismissed();
+        assert!(!slot.is_open());
+        assert!(slot.was_active_within(Duration::from_millis(400)));
+
+        std::thread::sleep(Duration::from_millis(25));
+        assert!(!slot.was_active_within(Duration::from_millis(5)));
+        assert!(slot.was_active_within(Duration::from_millis(400)));
+
+        slot.mark_opened();
+        assert!(slot.is_open());
+        slot.clear();
+        assert!(!slot.is_open());
+        assert!(!slot.was_active_within(Duration::from_millis(400)));
     }
 }

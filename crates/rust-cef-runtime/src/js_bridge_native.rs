@@ -5,19 +5,26 @@
 use std::collections::BTreeSet;
 
 use cef::*;
-use rust_cef_core::contracts::{BrowserId, BrowserOptions, truncate_utf8_bytes};
+use rust_cef_core::contracts::{
+    BrowserId, BrowserOptions, FocusedDomNodeInfo, JsUncaughtExceptionInfo,
+    MAX_DOM_IDENTIFIER_BYTES, MAX_EXCEPTION_SOURCE_BYTES, MAX_FRAME_ID_BYTES, truncate_utf8_bytes,
+};
 use rust_cef_core::js_bridge::{
     EvalError, EvalOutcome, EvalRequestId, JsFrameScope, MAX_EVAL_ERROR_MESSAGE_BYTES,
     MAX_JS_JSON_DEPTH, MAX_JS_PAYLOAD_BYTES, validate_bounded_json, validate_script,
 };
-use rust_cef_core::ports::EngineError;
+use rust_cef_core::ports::{
+    BrowserEvent, EXT_EVENT_FOCUSED_NODE, EXT_EVENT_UNCAUGHT_EXCEPTION, EXT_EVENT_V8_CONTEXT,
+    EngineError,
+};
 
 use crate::client::BrowserClientState;
 use crate::executor::NativeAudit;
 use crate::helper_app::{
     EXTRA_BROWSER_LOCAL, EXTRA_JS_BRIDGE_ENABLED, EXTRA_JS_BRIDGE_MAX_BYTES,
-    EXTRA_JS_BRIDGE_ORIGINS, EXTRA_RUNTIME_GEN, MSG_EVAL_REQUEST, MSG_EVAL_RESPONSE,
-    MSG_HOST_MESSAGE, MSG_POST_MESSAGE,
+    EXTRA_JS_BRIDGE_ORIGINS, EXTRA_RUNTIME_GEN, MSG_CONTEXT_CREATED, MSG_CONTEXT_RELEASED,
+    MSG_EVAL_REQUEST, MSG_EVAL_RESPONSE, MSG_FOCUSED_NODE_CHANGED, MSG_HOST_MESSAGE,
+    MSG_POST_MESSAGE, MSG_UNCAUGHT_EXCEPTION,
 };
 use crate::policy::CompiledPolicy;
 
@@ -30,6 +37,10 @@ pub(crate) enum RendererIpcAction {
         id: EvalRequestId,
         outcome: EvalOutcome,
     },
+    RenderEvent {
+        event: BrowserEvent,
+        required_ext_bit: u32,
+    },
 }
 
 pub(crate) fn allowed_bridge_origins(
@@ -41,6 +52,18 @@ pub(crate) fn allowed_bridge_origins(
     }
     let mut set = BTreeSet::new();
     for raw in &options.js_bridge.allowed_origins {
+        if raw.trim() == raw && raw.eq_ignore_ascii_case("https://*") {
+            if policy.allows_https_wildcard() {
+                set.insert("https://*".into());
+            }
+            continue;
+        }
+        if raw.trim() == raw && raw.eq_ignore_ascii_case("http://*") {
+            if policy.allows_http_wildcard() {
+                set.insert("http://*".into());
+            }
+            continue;
+        }
         if let Some(canonical) = policy.canonical_origin_for(raw)
             && policy.allows_canonical_origin(&canonical)
         {
@@ -48,6 +71,12 @@ pub(crate) fn allowed_bridge_origins(
         }
     }
     set
+}
+
+fn origin_is_bridge_permitted(permitted: &BTreeSet<String>, origin: &str) -> bool {
+    permitted.contains(origin)
+        || (origin.starts_with("https://") && permitted.contains("https://*"))
+        || (origin.starts_with("http://") && permitted.contains("http://*"))
 }
 
 pub(crate) fn build_browser_extra_info(
@@ -129,11 +158,7 @@ fn resolve_verified_frame(
 fn frame_origin_allowed(state: &BrowserClientState, frame: &Frame) -> Option<String> {
     let url = CefString::from(&frame.url()).to_string();
     let is_main = frame.is_main() != 0;
-    let allowed = if is_main {
-        state.allows_navigation_for_script(&url, true)
-    } else {
-        state.policy.rules.allows_network(&url)
-    };
+    let allowed = state.allows_navigation_for_script(&url, is_main);
     if !allowed {
         return None;
     }
@@ -196,7 +221,7 @@ pub(crate) fn send_post_js_message(
         .canonical_origin_for(&url)
         .ok_or(EngineError::PolicyDenied)?;
     let permitted = allowed_bridge_origins(&client.options, &client.policy.rules);
-    if !permitted.contains(&origin) {
+    if !origin_is_bridge_permitted(&permitted, &origin) {
         return Err(EngineError::PolicyDenied);
     }
     let Some(mut msg) = process_message_create(Some(&CefString::from(MSG_HOST_MESSAGE))) else {
@@ -298,7 +323,7 @@ pub(crate) fn parse_renderer_process_message(
                 return None;
             }
             let permitted = allowed_bridge_origins(&state.options, &state.policy.rules);
-            if !permitted.contains(&actual_origin) {
+            if !origin_is_bridge_permitted(&permitted, &actual_origin) {
                 return None;
             }
             let payload_json = CefString::from(&args.string(3)).to_string();
@@ -368,6 +393,124 @@ pub(crate) fn parse_renderer_process_message(
                     sequence: seq,
                 },
                 outcome,
+            })
+        }
+        MSG_CONTEXT_CREATED | MSG_CONTEXT_RELEASED => {
+            if args.size() < 4 {
+                return None;
+            }
+            let rt = CefString::from(&args.string(0))
+                .to_string()
+                .parse::<u64>()
+                .ok()?;
+            let br = CefString::from(&args.string(1))
+                .to_string()
+                .parse::<u64>()
+                .ok()?;
+            if rt != expected_browser.runtime().value() || br != expected_browser.local() {
+                return None;
+            }
+            let frame_id = truncate_utf8_bytes(
+                &CefString::from(&args.string(2)).to_string(),
+                MAX_FRAME_ID_BYTES,
+            );
+            let is_main_frame = args.bool(3) != 0;
+            let event = if name == MSG_CONTEXT_CREATED {
+                BrowserEvent::ContextCreated {
+                    frame_id,
+                    is_main_frame,
+                }
+            } else {
+                BrowserEvent::ContextReleased {
+                    frame_id,
+                    is_main_frame,
+                }
+            };
+            Some(RendererIpcAction::RenderEvent {
+                event,
+                required_ext_bit: EXT_EVENT_V8_CONTEXT,
+            })
+        }
+        MSG_FOCUSED_NODE_CHANGED => {
+            if args.size() < 9 {
+                return None;
+            }
+            let rt = CefString::from(&args.string(0))
+                .to_string()
+                .parse::<u64>()
+                .ok()?;
+            let br = CefString::from(&args.string(1))
+                .to_string()
+                .parse::<u64>()
+                .ok()?;
+            if rt != expected_browser.runtime().value() || br != expected_browser.local() {
+                return None;
+            }
+            let has_node = args.bool(2) != 0;
+            let info = if has_node {
+                Some(FocusedDomNodeInfo {
+                    frame_id: truncate_utf8_bytes(
+                        &CefString::from(&args.string(3)).to_string(),
+                        MAX_FRAME_ID_BYTES,
+                    ),
+                    is_main_frame: args.bool(4) != 0,
+                    tag_name: truncate_utf8_bytes(
+                        &CefString::from(&args.string(5)).to_string(),
+                        MAX_DOM_IDENTIFIER_BYTES,
+                    ),
+                    element_id: truncate_utf8_bytes(
+                        &CefString::from(&args.string(6)).to_string(),
+                        MAX_DOM_IDENTIFIER_BYTES,
+                    ),
+                    input_type: truncate_utf8_bytes(
+                        &CefString::from(&args.string(7)).to_string(),
+                        MAX_DOM_IDENTIFIER_BYTES,
+                    ),
+                    is_editable: args.bool(8) != 0,
+                })
+            } else {
+                None
+            };
+            Some(RendererIpcAction::RenderEvent {
+                event: BrowserEvent::FocusedNodeChanged(info),
+                required_ext_bit: EXT_EVENT_FOCUSED_NODE,
+            })
+        }
+        MSG_UNCAUGHT_EXCEPTION => {
+            if args.size() < 8 {
+                return None;
+            }
+            let rt = CefString::from(&args.string(0))
+                .to_string()
+                .parse::<u64>()
+                .ok()?;
+            let br = CefString::from(&args.string(1))
+                .to_string()
+                .parse::<u64>()
+                .ok()?;
+            if rt != expected_browser.runtime().value() || br != expected_browser.local() {
+                return None;
+            }
+            let info = JsUncaughtExceptionInfo {
+                frame_id: truncate_utf8_bytes(
+                    &CefString::from(&args.string(2)).to_string(),
+                    MAX_FRAME_ID_BYTES,
+                ),
+                is_main_frame: args.bool(3) != 0,
+                message: truncate_utf8_bytes(
+                    &CefString::from(&args.string(4)).to_string(),
+                    MAX_EXCEPTION_SOURCE_BYTES,
+                ),
+                source_url: truncate_utf8_bytes(
+                    &CefString::from(&args.string(5)).to_string(),
+                    MAX_EXCEPTION_SOURCE_BYTES,
+                ),
+                line: args.int(6),
+                column: args.int(7),
+            };
+            Some(RendererIpcAction::RenderEvent {
+                event: BrowserEvent::UncaughtJsException(info),
+                required_ext_bit: EXT_EVENT_UNCAUGHT_EXCEPTION,
             })
         }
         _ => None,

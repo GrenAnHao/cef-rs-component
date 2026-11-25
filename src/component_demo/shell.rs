@@ -9,6 +9,7 @@ use std::{
     collections::{BTreeMap, VecDeque},
     future::Future,
     io::Write as _,
+    ops::Range,
     path::{Path, PathBuf},
     rc::Rc,
     sync::{
@@ -20,15 +21,16 @@ use std::{
 };
 
 use gpui::{
-    AnyElement, App, AppContext as _, AsyncApp, Bounds, Context, Entity, FocusHandle,
-    Focusable as _, InteractiveElement as _, IntoElement, KeyDownEvent, MouseButton,
-    ParentElement as _, Render, Styled as _, Window, WindowBounds, WindowHandle, WindowOptions,
-    div, px, rgb, size,
+    AnyElement, App, AppContext as _, AsyncApp, Bounds, Context, Entity, EntityInputHandler,
+    FocusHandle, Focusable as _, InteractiveElement as _, IntoElement, KeyDownEvent, MouseButton,
+    MouseDownEvent, MouseMoveEvent, ParentElement as _, Pixels, Point, Render,
+    StatefulInteractiveElement as _, Styled as _, Subscription, UTF16Selection, Window, WindowBounds, WindowHandle, WindowOptions, div, px, rgb,
+    size,
 };
 use rust_cef_gpui::{
     CefBrowser, ContextMenuConfig, ContextMenuRegistration, ContextMenuServices,
-    DefaultMenuPresenter, NativeCefBrowser, PdfExportStatus, PdfExportTicket, Runtime,
-    RuntimeServices, ViewDiagnostics,
+    DefaultMenuPresenter, NativeCefBrowser, NativeDropTargetServices, PdfExportStatus,
+    PdfExportTicket, Runtime, RuntimeServices, ViewDiagnostics,
     contracts::{
         BrowserConfig, BrowserId, BrowserOptions, BrowserSurfaceMode, CefFeatureState,
         NativeChildHwndConfig, NavigationSnapshot, PixelRect, ProfileStorage, RuntimeConfig,
@@ -49,17 +51,23 @@ use rust_cef_gpui::{
     outbound_drag_contracts::OutboundDragPolicy,
     ports::{
         BrowserCommand, BrowserEvent, BrowserEventEnvelope, BrowserEventSink, BrowserHandle,
-        CaptureFailureKind, CloseMode, EngineError, FrameSink, OwnedFrame, PublishResult,
-        UiDispatcher as _,
+        CloseMode, FrameSink, OwnedFrame, PublishResult, UiDispatcher as _,
     },
     runtime::{ShutdownStatus, StartError},
 };
 
 use crate::cli::{Config, HostMode};
+use crate::cef_example::{
+    model::TextBuffer,
+    text_input::{
+        KeyEditOutcome, TextFieldLayoutCache, TextFieldRenderSpec, TextFieldTheme,
+        apply_editor_key_down, child_hwnd_owns_win32_focus, ensure_parent_window_win32_focus,
+        render_text_field_box,
+    },
+};
 
 pub(super) const MAX_SHELL_TABS: usize = 8;
 const MAX_DOWNLOAD_HISTORY: usize = 8;
-const MAX_INPUT_BYTES: usize = 512;
 const STARTUP_BUDGET: Duration = Duration::from_secs(30);
 const DRAIN_BUDGET: Duration = Duration::from_secs(15);
 const PUMP_PERIOD: Duration = Duration::from_millis(4);
@@ -328,15 +336,6 @@ pub(super) fn escape_js_string(raw: &str) -> String {
     out
 }
 
-fn truncate_appended(buf: &mut String, text: &str, max_bytes: usize) {
-    for ch in text.chars() {
-        if buf.len() + ch.len_utf8() > max_bytes {
-            break;
-        }
-        buf.push(ch);
-    }
-}
-
 #[derive(Clone)]
 enum ShellView {
     Osr(Entity<CefBrowser>),
@@ -482,6 +481,14 @@ struct ShellRoot {
     actions: Rc<RefCell<Vec<ShellAction>>>,
     wake: Arc<UiWakeSender>,
     focus: FocusHandle,
+    input_focus: FocusHandle,
+    address_buf: TextBuffer,
+    find_buf: TextBuffer,
+    address_cache: Rc<RefCell<TextFieldLayoutCache>>,
+    find_cache: Rc<RefCell<TextFieldLayoutCache>>,
+    dragging_shell_input: Option<(bool, Point<Pixels>, bool)>,
+    #[allow(dead_code)]
+    focus_out_sub: Option<Subscription>,
     smoke_find_ok: bool,
 }
 
@@ -500,78 +507,238 @@ impl ShellRoot {
         }
     }
 
+    fn active_editing_address(&self) -> Option<bool> {
+        if self.model.address_focused {
+            Some(true)
+        } else if self.model.find_focused && self.model.find_open {
+            Some(false)
+        } else {
+            None
+        }
+    }
+
+    fn active_input_mut(&mut self) -> Option<(bool, &mut TextBuffer, Rc<RefCell<TextFieldLayoutCache>>)> {
+        if self.model.address_focused {
+            Some((true, &mut self.address_buf, self.address_cache.clone()))
+        } else if self.model.find_focused && self.model.find_open {
+            Some((false, &mut self.find_buf, self.find_cache.clone()))
+        } else {
+            None
+        }
+    }
+
+    fn sync_model_from_active_buffer(&mut self) {
+        if self.model.address_focused {
+            self.model.address_draft = self.address_buf.text.clone();
+        } else if self.model.find_focused {
+            self.model.find_query = self.find_buf.text.clone();
+        }
+    }
+
+    fn blur_active_input(&mut self, cx: &mut Context<Self>) {
+        self.dragging_shell_input = None;
+        if self.model.address_focused {
+            self.address_buf.unmark();
+            self.address_buf.scroll_x = 0.0;
+            self.address_cache.borrow_mut().reset_scroll();
+            self.model.address_focused = false;
+            cx.notify();
+        } else if self.model.find_focused {
+            self.find_buf.unmark();
+            self.model.find_focused = false;
+            cx.notify();
+        }
+    }
+
+    fn focus_browser_or_root(&self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(view) = self
+            .model
+            .active_tab
+            .and_then(|id| self.views.get(&id))
+            .cloned()
+        {
+            let h = view.focus_handle(cx);
+            window.focus(&h, cx);
+        } else {
+            window.focus(&self.focus, cx);
+        }
+    }
+
+    fn focus_shell_input_on_mouse_down(
+        &mut self,
+        editing_address: bool,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.stop_propagation();
+        ensure_parent_window_win32_focus(window);
+        let was_active = self.input_focus.is_focused(window)
+            && ((editing_address && self.model.address_focused)
+                || (!editing_address && self.model.find_focused));
+        if editing_address {
+            if !self.model.address_focused && self.address_buf.text != self.model.address_draft {
+                self.address_buf.set_from_external(&self.model.address_draft);
+            }
+            if self.model.find_focused {
+                self.find_buf.unmark();
+            }
+            self.model.address_focused = true;
+            self.model.find_focused = false;
+        } else {
+            if !self.model.find_focused && self.find_buf.text != self.model.find_query {
+                self.find_buf.set_from_external(&self.model.find_query);
+            }
+            if self.model.address_focused {
+                self.address_buf.unmark();
+            }
+            self.model.find_focused = true;
+            self.model.address_focused = false;
+        }
+
+        let handle = self.input_focus.clone();
+        window.focus(&handle, cx);
+        window.request_virtual_keyboard();
+
+        let (buf, cache) = if editing_address {
+            (&mut self.address_buf, self.address_cache.clone())
+        } else {
+            (&mut self.find_buf, self.find_cache.clone())
+        };
+        let cache_ref = cache.borrow();
+        buf.scroll_x = cache_ref.scroll_x;
+        buf.scroll_y = cache_ref.scroll_y;
+        let idx = cache_ref.index_for_point(&buf.text, event.position, false);
+        drop(cache_ref);
+
+        if event.click_count >= 3 {
+            buf.select_line_at(idx, false);
+            self.dragging_shell_input = None;
+        } else if event.click_count == 2 {
+            buf.select_word_at(idx);
+            self.dragging_shell_input = None;
+        } else if !was_active && !buf.text.is_empty() {
+            buf.focus_select_all();
+            self.dragging_shell_input = Some((editing_address, event.position, true));
+        } else if event.modifiers.shift {
+            buf.select_to(idx);
+            self.dragging_shell_input = Some((editing_address, event.position, false));
+        } else {
+            buf.move_to(idx);
+            self.dragging_shell_input = Some((editing_address, event.position, false));
+        }
+        window.notify_text_selection_changed(&handle);
+        cx.notify();
+    }
+
+    fn handle_shell_drag_move(
+        &mut self,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((editing_address, down_pos, pending_select_all)) = self.dragging_shell_input else {
+            return;
+        };
+        let (buf, cache) = if editing_address {
+            (&mut self.address_buf, self.address_cache.clone())
+        } else {
+            (&mut self.find_buf, self.find_cache.clone())
+        };
+        if pending_select_all {
+            let moved_far = (f32::from(position.x) - f32::from(down_pos.x)).abs() > 3.0
+                || (f32::from(position.y) - f32::from(down_pos.y)).abs() > 3.0;
+            if !moved_far {
+                return;
+            }
+            let start_idx = cache.borrow().index_for_point(&buf.text, down_pos, false);
+            buf.move_to(start_idx);
+            self.dragging_shell_input = Some((editing_address, down_pos, false));
+        }
+        let idx = cache.borrow().index_for_point(&buf.text, position, false);
+        buf.select_to(idx);
+        buf.scroll_x = cache.borrow().scroll_x;
+        window.notify_text_selection_changed(&self.input_focus);
+        cx.notify();
+    }
+
     fn handle_key_down(
         &mut self,
         event: &KeyDownEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.model.address_focused && !self.model.find_focused {
-            return;
+        if (self.model.address_focused || self.model.find_focused)
+            && !self.input_focus.is_focused(window)
+        {
+            self.blur_active_input(cx);
         }
-        let editing_address = self.model.address_focused;
+        let Some(editing_address) = self.active_editing_address() else {
+            return;
+        };
+        let mods = &event.keystroke.modifiers;
         let key = event.keystroke.key.as_str();
         match key {
-            "backspace" => {
-                if editing_address {
-                    self.model.address_draft.pop();
-                } else {
-                    self.model.find_query.pop();
-                }
-                cx.notify();
-            }
             "enter" => {
                 if editing_address {
-                    let target = self.model.address_draft.clone();
+                    let target = self.address_buf.text.clone();
+                    self.model.address_draft = target.clone();
+                    self.dragging_shell_input = None;
                     self.model.address_focused = false;
+                    self.address_cache.borrow_mut().reset_scroll();
+                    self.focus_browser_or_root(window, cx);
                     self.emit(ShellAction::NavigateActive(target));
                 } else {
-                    let forward = !event.keystroke.modifiers.shift;
+                    self.model.find_query = self.find_buf.text.clone();
+                    let forward = !mods.shift;
                     self.emit(ShellAction::FindStep { forward });
                 }
                 cx.notify();
+                cx.stop_propagation();
             }
             "escape" => {
+                self.dragging_shell_input = None;
                 if editing_address {
                     self.model.address_focused = false;
+                    self.address_cache.borrow_mut().reset_scroll();
                     if let Some(meta) = self.model.active_meta() {
-                        self.model.address_draft = meta.url.clone();
+                        let url = meta.url.clone();
+                        self.model.address_draft = url.clone();
+                        self.address_buf.set_from_external(&url);
                     }
                 } else {
                     self.model.find_focused = false;
                     self.emit(ShellAction::CloseFind);
                 }
-                if let Some(view) = self
-                    .model
-                    .active_tab
-                    .and_then(|id| self.views.get(&id))
-                    .cloned()
-                {
-                    let handle = view.focus_handle(cx);
-                    window.focus(&handle, cx);
-                }
+                self.focus_browser_or_root(window, cx);
                 cx.notify();
+                cx.stop_propagation();
             }
             _ => {
-                if event.keystroke.modifiers.control
-                    || event.keystroke.modifiers.alt
-                    || event.keystroke.modifiers.platform
-                {
+                let Some((_, buf, cache)) = self.active_input_mut() else {
                     return;
-                }
-                let text = event
-                    .keystroke
-                    .key_char
-                    .as_deref()
-                    .filter(|s| !s.is_empty() && !s.chars().any(char::is_control))
-                    .or_else(|| (key.chars().count() == 1).then_some(key));
-                if let Some(ch) = text {
-                    if editing_address {
-                        truncate_appended(&mut self.model.address_draft, ch, MAX_INPUT_BYTES);
-                    } else {
-                        truncate_appended(&mut self.model.find_query, ch, MAX_INPUT_BYTES);
+                };
+                let cache_ref = cache.borrow();
+                buf.scroll_x = cache_ref.scroll_x;
+                let outcome = apply_editor_key_down(buf, &cache_ref, event, false, cx);
+                drop(cache_ref);
+                self.sync_model_from_active_buffer();
+                match outcome {
+                    KeyEditOutcome::HandledChanged => {
+                        window.notify_text_input_changed(&self.input_focus);
+                        cx.notify();
+                        cx.stop_propagation();
                     }
-                    cx.notify();
+                    KeyEditOutcome::HandledNoChange => {
+                        window.notify_text_selection_changed(&self.input_focus);
+                        cx.notify();
+                        cx.stop_propagation();
+                    }
+                    KeyEditOutcome::NotHandled => {
+                        if mods.control || mods.alt || mods.platform {
+                            cx.stop_propagation();
+                        }
+                    }
                 }
             }
         }
@@ -588,12 +755,17 @@ impl ShellRoot {
             .id(id)
             .px(px(7.0))
             .py(px(2.0))
+            .rounded(px(2.0))
             .bg(rgb(bg_hex))
+            .hover(|s| s.opacity(0.9))
+            .active(|s| s.opacity(0.75))
             .text_color(rgb(0xf9fafb))
             .text_size(px(12.0))
+            .cursor_pointer()
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _, window, cx| {
+                    cx.stop_propagation();
                     on_click(this, window, cx);
                 }),
             )
@@ -601,8 +773,164 @@ impl ShellRoot {
     }
 }
 
+impl EntityInputHandler for ShellRoot {
+    fn text_for_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        adjusted_range: &mut Option<Range<usize>>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<String> {
+        let (_, buf, _) = self.active_input_mut()?;
+        let range = buf.range_from_utf16(&range_utf16);
+        adjusted_range.replace(buf.range_to_utf16(&range));
+        Some(buf.text[range].to_owned())
+    }
+
+    fn selected_text_range(
+        &mut self,
+        _ignore_disabled_input: bool,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        let (_, buf, _) = self.active_input_mut()?;
+        Some(UTF16Selection {
+            range: buf.range_to_utf16(&buf.selected_range),
+            reversed: buf.selection_reversed,
+        })
+    }
+
+    fn marked_text_range(
+        &self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Range<usize>> {
+        let editing_address = self.active_editing_address()?;
+        let buf = if editing_address {
+            &self.address_buf
+        } else {
+            &self.find_buf
+        };
+        buf.marked_range.as_ref().map(|r| buf.range_to_utf16(r))
+    }
+
+    fn unmark_text(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let focus = self.input_focus.clone();
+        if let Some((_, buf, _)) = self.active_input_mut() {
+            buf.unmark();
+        }
+        window.notify_text_input_changed(&focus);
+        cx.notify();
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        range: Option<Range<usize>>,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let focus = self.input_focus.clone();
+        if let Some((_, buf, _)) = self.active_input_mut() {
+            buf.replace_in_utf16_range(range, text, false);
+        }
+        self.sync_model_from_active_buffer();
+        window.notify_text_input_changed(&focus);
+        cx.notify();
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        range: Option<Range<usize>>,
+        new_text: &str,
+        new_selected_range: Option<Range<usize>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let focus = self.input_focus.clone();
+        if let Some((_, buf, _)) = self.active_input_mut() {
+            buf.replace_and_mark_in_utf16_range(range, new_text, new_selected_range, false);
+        }
+        self.sync_model_from_active_buffer();
+        window.notify_text_input_changed(&focus);
+        cx.notify();
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        _bounds: Bounds<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        let (_, buf, cache) = self.active_input_mut()?;
+        let utf8 = buf.range_from_utf16(&range_utf16);
+        cache.borrow().bounds_for_utf8_range(utf8)
+    }
+
+    fn selection_bounds_for_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        bounds: Bounds<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<Bounds<Pixels>> {
+        self.bounds_for_range(range_utf16, bounds, window, cx)
+            .into_iter()
+            .collect()
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        point: Point<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        let (_, buf, cache) = self.active_input_mut()?;
+        let utf8 = cache.borrow().index_for_point(&buf.text, point, false);
+        Some(buf.offset_to_utf16(utf8))
+    }
+
+    fn set_selected_text_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let focus = self.input_focus.clone();
+        if let Some((_, buf, _)) = self.active_input_mut() {
+            let utf8 = buf.range_from_utf16(&range_utf16);
+            buf.selected_range = utf8;
+            buf.selection_reversed = false;
+            buf.touch();
+        }
+        window.notify_text_selection_changed(&focus);
+        cx.notify();
+    }
+
+    fn text_length_utf16(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> Option<usize> {
+        self.active_input_mut().map(|(_, buf, _)| buf.text_len_utf16())
+    }
+}
+
 impl Render for ShellRoot {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.host_mode == HostMode::NativeHwnd
+            && (self.model.address_focused || self.model.find_focused)
+            && child_hwnd_owns_win32_focus(window)
+        {
+            self.dragging_shell_input = None;
+            self.model.address_focused = false;
+            self.model.find_focused = false;
+            self.address_cache.borrow_mut().reset_scroll();
+        }
+        if !self.model.address_focused && self.address_buf.text != self.model.address_draft {
+            self.address_buf.set_from_external(&self.model.address_draft);
+        }
+        if !self.model.find_focused && self.find_buf.text != self.model.find_query {
+            self.find_buf.set_from_external(&self.model.find_query);
+        }
+
         let menu = self
             .menu_presenter
             .as_ref()
@@ -710,12 +1038,7 @@ impl Render for ShellRoot {
         };
         let muted = active_meta.as_ref().is_some_and(|m| m.audio_muted);
         let devtools_open = active_meta.as_ref().is_some_and(|m| m.devtools_open);
-
-        let address_display = if self.model.address_draft.is_empty() {
-            "app://demo/index.html".to_owned()
-        } else {
-            self.model.address_draft.clone()
-        };
+        let addr_focused = self.model.address_focused && self.input_focus.is_focused(window);
 
         let nav_bar = div()
             .flex()
@@ -755,38 +1078,44 @@ impl Render for ShellRoot {
                 |this, _, _| this.emit(ShellAction::StopLoading),
                 cx,
             ))
-            .child(
-                div()
-                    .id("shell-address-input")
-                    .flex_1()
-                    .px(px(8.0))
-                    .py(px(3.0))
-                    .bg(rgb(if self.model.address_focused {
-                        0x0f172a
-                    } else {
-                        0x111827
-                    }))
-                    .text_color(rgb(0xe5e7eb))
-                    .text_size(px(12.0))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _, window, cx| {
-                            this.model.address_focused = true;
-                            this.model.find_focused = false;
-                            let handle = this.focus.clone();
-                            window.focus(&handle, cx);
-                            cx.notify();
-                        }),
-                    )
-                    .child(address_display),
-            )
+            .child(render_text_field_box(
+                TextFieldRenderSpec {
+                    id: "shell-address-input",
+                    host: cx.entity(),
+                    focus_handle: self.input_focus.clone(),
+                    buffer: &self.address_buf,
+                    cache: self.address_cache.clone(),
+                    placeholder: "app://demo/index.html",
+                    focused: addr_focused,
+                    multiline: false,
+                    font_size_px: 12.0,
+                    pad_x_px: 8.0,
+                    pad_y_px: 3.0,
+                    height_px: Some(24.0),
+                    rounded_px: 3.0,
+                    flex_1: true,
+                    theme: TextFieldTheme::shell_dark(),
+                },
+                |this, event, window, cx| {
+                    this.focus_shell_input_on_mouse_down(true, event, window, cx);
+                },
+                cx,
+            ))
             .child(Self::pill(
                 "shell-go",
                 "Go",
                 0x2563eb,
-                |this, _, cx| {
+                |this, window, cx| {
+                    this.dragging_shell_input = None;
                     this.model.address_focused = false;
-                    let url = this.model.address_draft.clone();
+                    this.address_cache.borrow_mut().reset_scroll();
+                    let url = if this.address_buf.text.is_empty() {
+                        this.model.address_draft.clone()
+                    } else {
+                        this.address_buf.text.clone()
+                    };
+                    this.model.address_draft = url.clone();
+                    this.focus_browser_or_root(window, cx);
                     this.emit(ShellAction::NavigateActive(url));
                     cx.notify();
                 },
@@ -857,9 +1186,16 @@ impl Render for ShellRoot {
                     0x374151
                 },
                 |this, window, cx| {
+                    let will_open = !this.model.find_open;
                     this.emit(ShellAction::ToggleFind);
-                    let handle = this.focus.clone();
-                    window.focus(&handle, cx);
+                    if will_open {
+                        ensure_parent_window_win32_focus(window);
+                        let handle = this.input_focus.clone();
+                        window.focus(&handle, cx);
+                    } else {
+                        this.blur_active_input(cx);
+                        this.focus_browser_or_root(window, cx);
+                    }
                 },
                 cx,
             ))
@@ -898,6 +1234,37 @@ impl Render for ShellRoot {
         let mut root = div()
             .id("shell-root")
             .track_focus(&self.focus)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| {
+                    if this.model.address_focused || this.model.find_focused {
+                        let root_focus = this.focus.clone();
+                        window.focus(&root_focus, cx);
+                        this.blur_active_input(cx);
+                    }
+                }),
+            )
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
+                if this.dragging_shell_input.is_some() {
+                    this.handle_shell_drag_move(event.position, window, cx);
+                }
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    if this.dragging_shell_input.take().is_some() {
+                        cx.notify();
+                    }
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    if this.dragging_shell_input.take().is_some() {
+                        cx.notify();
+                    }
+                }),
+            )
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 this.handle_key_down(event, window, cx);
             }))
@@ -919,12 +1286,8 @@ impl Render for ShellRoot {
                 .child(div().p(px(16.0)).child(self.model.status_banner.clone()))
         };
 
+        let find_focused = self.model.find_focused && self.input_focus.is_focused(window);
         let find_bar = self.model.find_open.then(|| {
-            let query_display = if self.model.find_query.is_empty() {
-                "<click & type query>".to_owned()
-            } else {
-                self.model.find_query.clone()
-            };
             let result_text = self
                 .model
                 .find_last_result
@@ -943,27 +1306,29 @@ impl Render for ShellRoot {
                 .text_size(px(12.0))
                 .child("Find:")
                 .child(
-                    div()
-                        .id("shell-find-input")
-                        .px(px(8.0))
-                        .py(px(2.0))
-                        .min_w(px(160.0))
-                        .bg(rgb(if self.model.find_focused {
-                            0x0f172a
-                        } else {
-                            0x111827
-                        }))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _, window, cx| {
-                                this.model.find_focused = true;
-                                this.model.address_focused = false;
-                                let handle = this.focus.clone();
-                                window.focus(&handle, cx);
-                                cx.notify();
-                            }),
-                        )
-                        .child(query_display),
+                    div().w(px(180.0)).child(render_text_field_box(
+                        TextFieldRenderSpec {
+                            id: "shell-find-input",
+                            host: cx.entity(),
+                            focus_handle: self.input_focus.clone(),
+                            buffer: &self.find_buf,
+                            cache: self.find_cache.clone(),
+                            placeholder: "<click & type query>",
+                            focused: find_focused,
+                            multiline: false,
+                            font_size_px: 12.0,
+                            pad_x_px: 8.0,
+                            pad_y_px: 2.0,
+                            height_px: Some(22.0),
+                            rounded_px: 3.0,
+                            flex_1: false,
+                            theme: TextFieldTheme::shell_dark(),
+                        },
+                        |this, event, window, cx| {
+                            this.focus_shell_input_on_mouse_down(false, event, window, cx);
+                        },
+                        cx,
+                    )),
                 )
                 .child(Self::pill(
                     "shell-find-next",
@@ -1214,10 +1579,8 @@ impl BrowserEventSink for ShellObservations {
             BrowserEvent::Closed => {
                 self.closed.fetch_add(1, Ordering::Release);
             }
-            BrowserEvent::CaptureFailed(EngineError::Capture {
-                kind: CaptureFailureKind::IncompleteFrame,
-                code: None,
-            }) if !self.strict_capture => {}
+            BrowserEvent::CaptureFailed(ref err)
+                if !self.strict_capture && err.is_recoverable_capture() => {}
             fault @ (BrowserEvent::CreateFailed(_)
             | BrowserEvent::CaptureFailed(_)
             | BrowserEvent::RendererTerminated { .. }) => {
@@ -1500,20 +1863,27 @@ fn spawn_tab(
             max_message_bytes: MAX_JS_PAYLOAD_BYTES,
             ..Default::default()
         });
-    if config.host_mode == HostMode::NativeHwnd {
-        let parent_hwnd =
-            parent_hwnd.ok_or("shell window HWND unavailable for native child mode")?;
-        options =
-            options.with_surface_mode(BrowserSurfaceMode::NativeChildHwnd(NativeChildHwndConfig {
-                parent_hwnd,
-                initial_bounds: PixelRect {
-                    x: 0,
-                    y: (64.0 * scale).round() as i32,
-                    width: (width as f32 * scale).round().max(1.0) as u32,
-                    height: (height as f32 * scale).round().max(1.0) as u32,
+    match config.host_mode {
+        HostMode::Osr => {
+            let parent_hwnd = parent_hwnd.ok_or("shell window HWND unavailable for OSR mode")?;
+            options = options.with_parent_hwnd(parent_hwnd);
+        }
+        HostMode::NativeHwnd => {
+            let parent_hwnd =
+                parent_hwnd.ok_or("shell window HWND unavailable for native child mode")?;
+            options = options.with_surface_mode(BrowserSurfaceMode::NativeChildHwnd(
+                NativeChildHwndConfig {
+                    parent_hwnd,
+                    initial_bounds: PixelRect {
+                        x: 0,
+                        y: (64.0 * scale).round() as i32,
+                        width: (width as f32 * scale).round().max(1.0) as u32,
+                        height: (height as f32 * scale).round().max(1.0) as u32,
+                    },
+                    activate_on_creation: false,
                 },
-                activate_on_creation: false,
-            }));
+            ));
+        }
     }
 
     let (handle, attachment, mode) = {
@@ -1717,9 +2087,15 @@ async fn drive_shell(
             root_cache_path: config.cache_root.clone(),
             thread_mode: config.mode,
             default_profile: ProfileStorage::Memory,
-            content_policy: TrustedContentPolicy {
-                allowed_origins: vec!["app://demo".into()],
-                allow_embedded_data: true,
+            content_policy: if config.custom_url.is_some() {
+                let mut policy = TrustedContentPolicy::allow_all_http_https(true);
+                policy.allowed_origins.push("app://demo".into());
+                policy
+            } else {
+                TrustedContentPolicy {
+                    allowed_origins: vec!["app://demo".into()],
+                    allow_embedded_data: true,
+                }
             },
             settings: {
                 let mut settings = shell_demo_settings();
@@ -1787,6 +2163,7 @@ async fn drive_shell(
         Rc<RefCell<DefaultMenuPresenter>>,
         u64,
     )> = None;
+    let mut drop_target_owned: Option<(NativeDropTargetServices, u64)> = None;
     let mut next_tab_id = 1u64;
     let mut active_pdf: Option<PdfExportTicket> = None;
     let mut pdf_path: Option<PathBuf> = None;
@@ -1834,6 +2211,10 @@ async fn drive_shell(
     }
 
     let mut run_error: Option<String> = None;
+    let initial_url = config
+        .custom_url
+        .clone()
+        .unwrap_or_else(|| START_URL.into());
     if !close.get() {
         match spawn_tab(
             cx,
@@ -1841,7 +2222,7 @@ async fn drive_shell(
             root,
             &config,
             next_tab_id,
-            START_URL.into(),
+            initial_url,
             &mut accounting,
             &mut tabs,
         ) {
@@ -1884,6 +2265,17 @@ async fn drive_shell(
                     }
                 }
                 next_tab_id += 1;
+                if config.host_mode == HostMode::Osr
+                    && let ShellView::Osr(ref tab1_osr) = tab1_view
+                    && let Ok(Ok(ds)) = root.update(cx, |_, window, cx| {
+                        let nz1 = std::num::NonZeroUsize::new(1).expect("non-zero drop route");
+                        let mut ds = NativeDropTargetServices::new(nz1)?;
+                        ds.attach(tab1_osr, window, cx)?;
+                        Ok::<_, rust_cef_gpui::NativeDropTargetError>(ds)
+                    })
+                {
+                    drop_target_owned = Some((ds, 1));
+                }
             }
             Err(e) => run_error = Some(e),
         }
@@ -2109,7 +2501,9 @@ async fn drive_shell(
                         {
                             let _ = tab.handle.submit(BrowserCommand::Navigate(clean.clone()));
                             let _ = root.update(cx, |r, _, cx| {
-                                r.model.address_draft = clean;
+                                r.model.address_draft = clean.clone();
+                                r.address_buf.set_from_external(&clean);
+                                r.address_cache.borrow_mut().reset_scroll();
                                 r.model.status_banner = "Navigating…".into();
                                 cx.notify();
                             });
@@ -2196,10 +2590,22 @@ async fn drive_shell(
                     });
                 }
                 ShellAction::ToggleFind => {
-                    let _ = root.update(cx, |root, _, cx| {
+                    let _ = root.update(cx, |root, window, cx| {
                         root.model.find_open = !root.model.find_open;
                         root.model.find_focused = root.model.find_open;
                         root.model.address_focused = false;
+                        root.dragging_shell_input = None;
+                        if root.model.find_focused {
+                            root.find_buf.set_from_external(&root.model.find_query);
+                            root.find_buf.focus_select_all();
+                            ensure_parent_window_win32_focus(window);
+                            let h = root.input_focus.clone();
+                            window.focus(&h, cx);
+                            window.notify_text_selection_changed(&h);
+                        } else {
+                            root.blur_active_input(cx);
+                            root.focus_browser_or_root(window, cx);
+                        }
                         cx.notify();
                     });
                 }
@@ -2230,10 +2636,12 @@ async fn drive_shell(
                     }
                 }
                 ShellAction::CloseFind => {
-                    let _ = root.update(cx, |root, _, cx| {
+                    let _ = root.update(cx, |root, window, cx| {
                         root.model.find_open = false;
                         root.model.find_focused = false;
                         root.model.find_last_result = None;
+                        root.dragging_shell_input = None;
+                        root.focus_browser_or_root(window, cx);
                         cx.notify();
                     });
                 }
@@ -2396,6 +2804,40 @@ async fn drive_shell(
                     pres.borrow_mut().update(&update, window, cx)
                 });
             });
+        }
+        if config.host_mode == HostMode::Osr {
+            let active_osr = root
+                .update(cx, |r, _, _| {
+                    let id = r.model.active_tab?;
+                    match r.views.get(&id)? {
+                        ShellView::Osr(v) => Some((id, v.clone())),
+                        ShellView::Native(_) => None,
+                    }
+                })
+                .ok()
+                .flatten();
+            match (&drop_target_owned, active_osr) {
+                (Some((_, cur_id)), Some((next_id, _))) if *cur_id == next_id => {}
+                (_, Some((next_id, view))) => {
+                    if let Some((mut prev, _)) = drop_target_owned.take() {
+                        let _ = prev.retire();
+                    }
+                    if let Ok(Ok(ds)) = root.update(cx, |_, window, cx| {
+                        let nz1 = std::num::NonZeroUsize::new(1).expect("non-zero drop route");
+                        let mut ds = NativeDropTargetServices::new(nz1)?;
+                        ds.attach(&view, window, cx)?;
+                        Ok::<_, rust_cef_gpui::NativeDropTargetError>(ds)
+                    }) {
+                        drop_target_owned = Some((ds, next_id));
+                    }
+                }
+                (Some(_), None) => {
+                    if let Some((mut prev, _)) = drop_target_owned.take() {
+                        let _ = prev.retire();
+                    }
+                }
+                (None, None) => {}
+            }
         }
 
         // Smoke orchestration for `--browser-shell true --smoke-ms ...`
@@ -2605,6 +3047,9 @@ async fn drive_shell(
     }
 
     // Orderly all-tab teardown while the window is still open.
+    if let Some((mut ds, _)) = drop_target_owned.take() {
+        let _ = ds.retire();
+    }
     drop(menus_owned);
     let remaining_ids: Vec<u64> = tabs.keys().copied().collect();
     for id in remaining_ids {
@@ -2771,18 +3216,32 @@ pub(super) fn run(config: Config) -> i32 {
                     false
                 });
                 let host_mode = config.host_mode;
-                cx.new(|cx| ShellRoot {
-                    model: ShellModel {
-                        status_banner: "Starting GPUI-CEF Browser Shell…".into(),
-                        ..ShellModel::default()
-                    },
-                    host_mode,
-                    views: BTreeMap::new(),
-                    menu_presenter: None,
-                    actions: actions_root,
-                    wake: wake_root,
-                    focus: cx.focus_handle(),
-                    smoke_find_ok: false,
+                cx.new(|cx| {
+                    let input_focus = cx.focus_handle();
+                    let focus_out_sub =
+                        cx.on_focus_out(&input_focus, window, |this: &mut ShellRoot, _, _, cx| {
+                            this.blur_active_input(cx);
+                        });
+                    ShellRoot {
+                        model: ShellModel {
+                            status_banner: "Starting GPUI-CEF Browser Shell…".into(),
+                            ..ShellModel::default()
+                        },
+                        host_mode,
+                        views: BTreeMap::new(),
+                        menu_presenter: None,
+                        actions: actions_root,
+                        wake: wake_root,
+                        focus: cx.focus_handle(),
+                        input_focus,
+                        address_buf: TextBuffer::default(),
+                        find_buf: TextBuffer::default(),
+                        address_cache: Rc::new(RefCell::new(TextFieldLayoutCache::default())),
+                        find_cache: Rc::new(RefCell::new(TextFieldLayoutCache::default())),
+                        dragging_shell_input: None,
+                        focus_out_sub: Some(focus_out_sub),
+                        smoke_find_ok: false,
+                    }
                 })
             },
         ) {
@@ -2809,6 +3268,7 @@ pub(super) fn run(config: Config) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rust_cef_gpui::ports::{CaptureFailureKind, EngineError};
     use rust_cef_core::contracts::RuntimeGeneration;
     use rust_cef_core::host_capabilities::PopupDisposition;
 
@@ -2942,5 +3402,37 @@ mod tests {
         shell_demo_settings()
             .validate()
             .expect("valid shell demo settings");
+    }
+
+    #[test]
+    fn shell_observations_ignores_recoverable_resize_captures_only_in_interactive_mode() {
+        let browser = BrowserId::new(RuntimeGeneration::new(1), 1);
+        let env = |kind: CaptureFailureKind, code: Option<i32>| BrowserEventEnvelope {
+            browser,
+            sequence: 1,
+            event: BrowserEvent::CaptureFailed(EngineError::Capture { kind, code }),
+        };
+
+        let interactive = ShellObservations::new(false);
+        interactive.publish(env(CaptureFailureKind::IncompleteFrame, None));
+        interactive.publish(env(CaptureFailureKind::ResizeExhausted, None));
+        interactive.publish(env(CaptureFailureKind::Busy, None));
+        assert!(
+            interactive
+                .first_fault
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_none()
+        );
+
+        let strict = ShellObservations::new(true);
+        strict.publish(env(CaptureFailureKind::IncompleteFrame, None));
+        assert!(
+            strict
+                .first_fault
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_some()
+        );
     }
 }

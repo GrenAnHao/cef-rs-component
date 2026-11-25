@@ -32,6 +32,8 @@ pub use rust_cef_runtime::{attachment, runtime};
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 pub mod composition;
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+pub mod events;
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 pub mod find_view;
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 pub mod menu;
@@ -46,6 +48,8 @@ pub use composition::{
     CompositionError, DispatchFailure, DispatchFailureKind, DispatchReport, InputRetryReport,
     UiComposition,
 };
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+pub use events::*;
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 pub use find_view::{FindServices, FindUiError, FindUiStatus, FindUiUpdate};
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
@@ -98,8 +102,9 @@ pub use ole_drop::{NativeDropTargetDiagnostics, NativeDropTargetError, NativeDro
 pub mod native_view;
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 pub use native_view::{
-    NativeCefBrowser, NativeEvalCompletedCallback, NativeJsMessageCallback, NativeShortcutCallback,
-    NativeTakeFocusCallback, NativeViewDiagnostics, recommended_windowless_frame_rate, window_hwnd,
+    NativeCefBrowser, NativeEvalCompletedCallback, NativeJsMessageCallback,
+    NativeNavigationCallback, NativePopupCallback, NativeShortcutCallback, NativeTakeFocusCallback,
+    NativeViewDiagnostics, recommended_windowless_frame_rate, window_hwnd,
 };
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 mod view;
@@ -107,9 +112,9 @@ mod view;
 pub use input::{InputCallback, InputCallbackDiagnostics, InputCallbackGate, InputDiagnostics};
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 pub use view::{
-    CefBrowser, EvalCompletedCallback, JsMessageCallback, OutboundDragCallback, PopupDiagnostics,
-    ShortcutCallback, TakeFocusCallback, ViewDiagnostics, ViewError, ZoomGateStats,
-    cursor_style_for,
+    CefBrowser, EvalCompletedCallback, JsMessageCallback, NavigationCallback, OutboundDragCallback,
+    PopupCallback, PopupDiagnostics, ShortcutCallback, TakeFocusCallback, ViewDiagnostics,
+    ViewError, ZoomGateStats, cursor_style_for,
 };
 
 /// Test-only frame-probe surface for validation builds; never a stable API.

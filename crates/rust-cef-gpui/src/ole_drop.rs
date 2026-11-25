@@ -348,22 +348,26 @@ impl ComDropTarget {
     }
 
     fn effective_drop_effect(&self, allowed: DragOperationMask, requested_win32: u32) -> u32 {
-        let cef_op = self.handle.drag_target_operation();
-        let allowed_win32 = core_to_win32_effect(allowed) & requested_win32;
-        let cef_win32 = core_to_win32_effect(cef_op);
-        let combined = cef_win32 & allowed_win32;
-        if combined != 0 {
-            combined
-        } else if cef_op != DragOperationMask::NONE {
-            0
-        } else if (allowed_win32 & DROPEFFECT_COPY) != 0 {
-            DROPEFFECT_COPY
-        } else if (allowed_win32 & DROPEFFECT_LINK) != 0 {
-            DROPEFFECT_LINK
-        } else if (allowed_win32 & DROPEFFECT_MOVE) != 0 {
-            DROPEFFECT_MOVE
-        } else {
-            DROPEFFECT_NONE
+        negotiate_drop_effect(
+            self.handle.drag_target_operation(),
+            allowed,
+            requested_win32,
+        )
+    }
+
+    fn wait_commands_flushed(&self, max_wait: Duration) {
+        if let Some(pump) = &self.pump {
+            pump();
+            return;
+        }
+        let deadline = Instant::now() + max_wait;
+        while self
+            .handle
+            .input_snapshot()
+            .is_ok_and(|snap| snap.inflight > 0)
+            && Instant::now() < deadline
+        {
+            std::thread::yield_now();
         }
     }
 
@@ -372,7 +376,8 @@ impl ComDropTarget {
             pump();
             return;
         }
-        // In Threaded mode, wait up to a few ms on DragEnter/Over if CEF hasn't reported
+        self.wait_commands_flushed(Duration::from_millis(6));
+        // In Threaded mode, wait up to a few ms on DragEnter if CEF hasn't reported
         // `UpdateDragCursor` yet so the initial drop cursor matches page targets.
         let deadline = Instant::now() + Duration::from_millis(6);
         while self.handle.drag_target_operation() == DragOperationMask::NONE
@@ -539,9 +544,7 @@ unsafe extern "system" fn dt_drag_over(
                             allowed_ops: allowed,
                         },
                     ));
-                    if let Some(pump) = &target.pump {
-                        pump();
-                    }
+                    target.wait_commands_flushed(Duration::from_millis(3));
                 }
                 let effect = target.effective_drop_effect(allowed, requested);
                 unsafe {
@@ -630,7 +633,9 @@ unsafe extern "system" fn dt_drop(
                             modifiers,
                             allowed_ops: allowed,
                         }));
+                target.pump_briefly();
             }
+            let effect = target.effective_drop_effect(allowed, requested);
             let _ = target
                 .handle
                 .submit(BrowserCommand::DragTarget(InboundDragCommand::Drop {
@@ -638,7 +643,7 @@ unsafe extern "system" fn dt_drop(
                     y: vy,
                     modifiers,
                 }));
-            let effect = target.effective_drop_effect(allowed, requested);
+            target.wait_commands_flushed(Duration::from_millis(12));
             unsafe {
                 *pdw_effect = effect;
                 target.helper_drop(data_obj, pt, effect);
@@ -687,6 +692,25 @@ pub(crate) fn win32_to_core_effect(effect: u32) -> DragOperationMask {
         mask |= DRAG_OP_LINK;
     }
     DragOperationMask(mask)
+}
+
+pub(crate) fn negotiate_drop_effect(
+    cef_op: DragOperationMask,
+    allowed: DragOperationMask,
+    requested_win32: u32,
+) -> u32 {
+    let allowed_win32 = core_to_win32_effect(allowed) & requested_win32;
+    let cef_win32 = core_to_win32_effect(cef_op);
+    let combined = cef_win32 & allowed_win32;
+    if (combined & DROPEFFECT_COPY) != 0 {
+        DROPEFFECT_COPY
+    } else if (combined & DROPEFFECT_LINK) != 0 {
+        DROPEFFECT_LINK
+    } else if (combined & DROPEFFECT_MOVE) != 0 {
+        DROPEFFECT_MOVE
+    } else {
+        DROPEFFECT_NONE
+    }
 }
 
 pub(crate) fn core_to_win32_effect(mask: DragOperationMask) -> u32 {
@@ -1049,6 +1073,43 @@ mod tests {
         );
         let mods = key_state_to_modifiers(MK_SHIFT | MK_CONTROL);
         assert!(mods.shift && mods.control && !mods.alt);
+    }
+
+    #[test]
+    fn negotiate_drop_effect_respects_cef_none_and_picks_canonical_single_effect() {
+        let requested_all = DROPEFFECT_COPY | DROPEFFECT_MOVE | DROPEFFECT_LINK;
+        assert_eq!(
+            negotiate_drop_effect(
+                DragOperationMask::NONE,
+                DragOperationMask::EVERY,
+                requested_all
+            ),
+            DROPEFFECT_NONE
+        );
+        assert_eq!(
+            negotiate_drop_effect(
+                DragOperationMask(DRAG_OP_COPY | DRAG_OP_LINK),
+                DragOperationMask::EVERY,
+                requested_all
+            ),
+            DROPEFFECT_COPY
+        );
+        assert_eq!(
+            negotiate_drop_effect(
+                DragOperationMask(DRAG_OP_COPY | DRAG_OP_LINK),
+                DragOperationMask::LINK,
+                DROPEFFECT_LINK
+            ),
+            DROPEFFECT_LINK
+        );
+        assert_eq!(
+            negotiate_drop_effect(
+                DragOperationMask::MOVE,
+                DragOperationMask(DRAG_OP_COPY | DRAG_OP_MOVE),
+                DROPEFFECT_COPY | DROPEFFECT_MOVE
+            ),
+            DROPEFFECT_MOVE
+        );
     }
 
     #[test]

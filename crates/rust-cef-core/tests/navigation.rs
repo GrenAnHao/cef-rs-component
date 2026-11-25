@@ -183,3 +183,102 @@ fn terminal_sessions_ignore_late_page_observations() {
     );
     assert_eq!(session.snapshot(), before);
 }
+
+#[test]
+fn extended_frame_drag_and_render_events_are_admitted_without_altering_nav_state() {
+    use rust_cef_core::contracts::{
+        DraggableRegionRect, FocusedDomNodeInfo, FrameLifecycleInfo, JsUncaughtExceptionInfo,
+        ResourceLoadCompleteInfo, ResourceResponseInfo,
+    };
+    let mut session = session();
+    session.after_created();
+    let baseline = session.snapshot().navigation;
+    for event in [
+        BrowserEvent::DraggableRegionsChanged(vec![DraggableRegionRect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 32,
+            draggable: true,
+        }]),
+        BrowserEvent::AutoResized {
+            width: 640,
+            height: 480,
+        },
+        BrowserEvent::MediaAccessChanged {
+            has_video: true,
+            has_audio: false,
+        },
+        BrowserEvent::DocumentAvailableInMainFrame,
+        BrowserEvent::FrameCreated(FrameLifecycleInfo {
+            frame_id: "1".into(),
+            name: "main".into(),
+            url: "http://127.0.0.1/a".into(),
+            is_main: true,
+        }),
+        BrowserEvent::FrameAttached {
+            frame: FrameLifecycleInfo {
+                frame_id: "1".into(),
+                name: "main".into(),
+                url: "http://127.0.0.1/a".into(),
+                is_main: true,
+            },
+            reattached: false,
+        },
+        BrowserEvent::FrameDetached {
+            frame_id: "2".into(),
+            is_main: false,
+        },
+        BrowserEvent::MainFrameChanged {
+            old_frame_id: None,
+            new_frame: Some(FrameLifecycleInfo {
+                frame_id: "1".into(),
+                name: "main".into(),
+                url: "http://127.0.0.1/a".into(),
+                is_main: true,
+            }),
+        },
+        BrowserEvent::ContextCreated {
+            frame_id: "1".into(),
+            is_main_frame: true,
+        },
+        BrowserEvent::ContextReleased {
+            frame_id: "1".into(),
+            is_main_frame: true,
+        },
+        BrowserEvent::FocusedNodeChanged(Some(FocusedDomNodeInfo {
+            frame_id: "1".into(),
+            is_main_frame: true,
+            tag_name: "INPUT".into(),
+            element_id: "q".into(),
+            input_type: "text".into(),
+            is_editable: true,
+        })),
+        BrowserEvent::UncaughtJsException(JsUncaughtExceptionInfo {
+            frame_id: "1".into(),
+            is_main_frame: true,
+            message: "boom".into(),
+            source_url: "http://127.0.0.1/a".into(),
+            line: 3,
+            column: 7,
+        }),
+        BrowserEvent::ResourceResponseObserved(ResourceResponseInfo {
+            url: "http://127.0.0.1/a".into(),
+            method: "GET".into(),
+            is_main_frame: true,
+            status_code: 200,
+            mime_type: "text/html".into(),
+        }),
+        BrowserEvent::ResourceLoadCompleted(ResourceLoadCompleteInfo {
+            url: "http://127.0.0.1/a".into(),
+            method: "GET".into(),
+            is_main_frame: true,
+            status_code: 200,
+            ok: true,
+            received_content_length: 128,
+        }),
+    ] {
+        assert!(session.apply_navigation_observation(&event, None));
+    }
+    assert_eq!(session.snapshot().navigation, baseline);
+}

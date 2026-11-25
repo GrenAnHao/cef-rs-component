@@ -1,0 +1,150 @@
+//! Standalone CSS stylesheet for `https://cefsharp.example/home.html` and
+//! `BindingTest.html`, matching Bootstrap Docs + CefSharp purple palette.
+*, *::before, *::after { box-sizing: border-box; }
+body {
+  margin: 0;
+  font-family: "Helvetica Neue", Helvetica, Arial, "Segoe UI", sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+  color: #333;
+  background: #fff;
+}
+.container {
+  max-width: 1120px;
+  margin: 0 auto;
+  padding: 0 24px;
+}
+.bs-docs-nav {
+  background: #463265;
+  border-bottom: 1px solid #3c2a57;
+  min-height: 50px;
+  display: flex;
+  align-items: center;
+}
+.nav-inner {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 24px;
+}
+.navbar-brand {
+  color: #fff;
+  text-decoration: none;
+  font-size: 18px;
+  font-weight: 500;
+}
+.nav-links {
+  display: flex;
+  gap: 4px;
+}
+.nav-links a {
+  color: #cdbfe3;
+  text-decoration: none;
+  padding: 15px 14px;
+  display: inline-block;
+}
+.nav-links a:hover, .nav-links a.active {
+  color: #fff;
+  background: rgba(0, 0, 0, 0.16);
+}
+.bs-header {
+  background: linear-gradient(135deg, #563d7c 0%, #6f5499 100%);
+  color: #cdbfe3;
+  padding: 46px 0 42px;
+  margin-bottom: 28px;
+}
+.bs-header h1 {
+  margin: 0 0 10px;
+  font-size: 46px;
+  font-weight: 500;
+  color: #fff;
+}
+.bs-header p {
+  margin: 0;
+  font-size: 20px;
+  font-weight: 300;
+  max-width: 760px;
+  line-height: 1.4;
+}
+.bs-docs-container { padding-bottom: 48px; }
+.doc-grid {
+  display: flex;
+  gap: 32px;
+  align-items: flex-start;
+}
+.bs-sidebar {
+  width: 220px;
+  flex-shrink: 0;
+  background: #f7f5fa;
+  border-radius: 5px;
+  padding: 10px 0;
+}
+.bs-sidenav, .bs-sidenav ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.bs-sidenav a {
+  display: block;
+  padding: 5px 18px;
+  font-size: 13px;
+  color: #716b7a;
+  text-decoration: none;
+}
+.bs-sidenav a.active, .bs-sidenav a:hover {
+  color: #563d7c;
+  font-weight: 700;
+  border-left: 2px solid #563d7c;
+  padding-left: 16px;
+}
+.bs-sidenav ul a {
+  padding-left: 30px;
+  font-size: 12px;
+}
+.doc-main { flex: 1; min-width: 0; }
+.bs-docs-section { margin-bottom: 36px; }
+.page-header {
+  padding-bottom: 8px;
+  margin: 8px 0 18px;
+  border-bottom: 1px solid #eee;
+}
+.page-header h2 {
+  margin: 0;
+  font-size: 28px;
+  font-weight: 500;
+}
+.lead { font-size: 18px; font-weight: 300; color: #444; }
+pre {
+  background: #f5f5f5;
+  border: 1px solid #ccc;
+  border-radius: 4px;
+  padding: 10px 14px;
+  overflow-x: auto;
+  font-size: 13px;
+}
+code {
+  font-family: Consolas, "Courier New", monospace;
+  background: #f3effa;
+  color: #563d7c;
+  padding: 1px 4px;
+  border-radius: 3px;
+}
+pre code { background: transparent; color: #222; padding: 0; }
+.quick-links { display: flex; flex-wrap: wrap; gap: 8px; }
+.pill-btn {
+  display: inline-block;
+  padding: 6px 12px;
+  background: #5e35b1;
+  color: #fff;
+  text-decoration: none;
+  border-radius: 3px;
+  font-size: 13px;
+}
+.pill-btn:hover { background: #4527a0; }
+.card-box {
+  padding: 14px;
+  border: 1px solid #ddd;
+  border-radius: 4px;
+  background: #f9f9fb;
+  margin: 12px 0;
+}

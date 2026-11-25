@@ -442,6 +442,7 @@ pub fn run(
         cookie_access: Some(adapter.clone()),
         cdp_observer: Some(adapter.clone()),
         file_dialog: None,
+        audio: None,
     })
     .map_err(|e| format!("set_host_capabilities: {e:?}"))?;
 

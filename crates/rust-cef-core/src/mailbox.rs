@@ -735,6 +735,11 @@ impl FrameMailbox {
         self.lock().update()
     }
 
+    /// Pure query whether an unconsumed update is currently queued (`dirty`).
+    pub fn has_pending_update(&self) -> bool {
+        self.lock().dirty
+    }
+
     /// Disarms the matching ticket but keeps `dirty`, so the next update can
     /// retry the host wake (or the host can call `take_update` explicitly).
     pub fn wake_failed(&self, ticket: WakeTicket) -> bool {
@@ -764,6 +769,10 @@ impl crate::ports::FrameSource for FrameMailbox {
 
     fn snapshot(&self) -> FrameUpdate {
         FrameMailbox::snapshot(self)
+    }
+
+    fn has_pending_update(&self) -> bool {
+        FrameMailbox::has_pending_update(self)
     }
 }
 

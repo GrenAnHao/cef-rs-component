@@ -315,7 +315,10 @@ wrap_context_menu_handler! {
             self.state.menu_probe.built();
         }
         fn run_context_menu(&self,browser:Option<&mut Browser>,frame:Option<&mut Frame>,params:Option<&mut ContextMenuParams>,model:Option<&mut cef::MenuModel>,callback:Option<&mut RunContextMenuCallback>)->i32 {
-            if !self.state.menu_probe.enabled(){return 0;}
+            if !self.state.menu_probe.enabled(){
+                self.state.native_context_menu.mark_opened();
+                return 0;
+            }
             let probe=&self.state.menu_probe;
             let Some(callback)=callback else{probe.fail("missing native continuation");return 1};
             let id=probe.begin();
@@ -358,6 +361,10 @@ wrap_context_menu_handler! {
             probe.returned(id);1
         }
         fn on_context_menu_dismissed(&self,_browser:Option<&mut Browser>,_frame:Option<&mut Frame>){
+            if !self.state.menu_probe.enabled(){
+                self.state.native_context_menu.mark_dismissed();
+                return;
+            }
             if self.state.menu_probe.was_used(){
                 if self.state.menu_probe.deferred(){
                     if let Some(registry)=self.state.registry.upgrade(){

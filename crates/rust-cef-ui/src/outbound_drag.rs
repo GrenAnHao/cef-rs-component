@@ -48,6 +48,10 @@ impl OutboundDragState {
         self.last_cursor
     }
 
+    pub fn current_cursor(&self) -> DragOperationMask {
+        self.last_cursor.unwrap_or(DragOperationMask::NONE)
+    }
+
     /// Promotes a queued outbound drag to in-flight unless another drag is already running.
     pub fn take_pending(&mut self) -> Option<OutboundDragStart> {
         if self.in_flight.is_some() {

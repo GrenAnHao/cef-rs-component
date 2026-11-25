@@ -910,9 +910,14 @@ impl Runtime {
         let (source, surface_mode) = self.registry.claim_view_attachment(browser)?;
         let ax_tree = self.registry.ax_tree_slot(browser).unwrap_or_default();
         let cursor_slot = self.registry.cursor_slot(browser).unwrap_or_default();
+        let native_context_menu = self
+            .registry
+            .native_context_menu_slot(browser)
+            .unwrap_or_default();
         Ok(BrowserAttachment::new(browser, handle.clone(), source)
             .with_ax_tree(ax_tree)
             .with_cursor_slot(cursor_slot)
+            .with_native_context_menu(native_context_menu)
             .with_surface_mode(surface_mode))
     }
 
@@ -1678,6 +1683,11 @@ impl Runtime {
             .map_err(BrowserCreateError::Core)?;
         match config.options.surface_mode {
             BrowserSurfaceMode::Offscreen => {
+                if let Some(parent_hwnd) = config.options.parent_hwnd
+                    && !crate::native_hwnd::is_valid_window(parent_hwnd)
+                {
+                    return Err(BrowserCreateError::Core(CreateError::InvalidOptions));
+                }
                 if config.viewport.width <= 0 || config.viewport.height <= 0 {
                     return Err(BrowserCreateError::InvalidConfig(
                         "viewport must have positive dimensions",
@@ -2970,6 +2980,7 @@ mod tests {
                 locale: Some("zh-CN".into()),
                 accept_language_list: Some("zh-CN,en".into()),
                 background_color: Some(0xFF112233),
+                uncaught_exception_stack_size: Some(8),
                 allowlisted_switches: vec![],
                 ..Default::default()
             },
@@ -2980,6 +2991,7 @@ mod tests {
         assert_eq!(cef_settings.locale.to_string(), "zh-CN");
         assert_eq!(cef_settings.accept_language_list.to_string(), "zh-CN,en");
         assert_eq!(cef_settings.background_color, 0xFF112233);
+        assert_eq!(cef_settings.uncaught_exception_stack_size, 8);
         assert_eq!(cef_settings.windowless_rendering_enabled, 1);
 
         let mut disabled_config = config;
@@ -3228,6 +3240,9 @@ fn build_settings(
             .map(CefString::from)
             .unwrap_or_default(),
         background_color: config.settings.background_color.unwrap_or(0),
+        uncaught_exception_stack_size: i32::from(
+            config.settings.uncaught_exception_stack_size.unwrap_or(0),
+        ),
         ..Default::default()
     }
 }

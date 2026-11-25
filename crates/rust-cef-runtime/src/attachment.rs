@@ -10,6 +10,7 @@ use rust_cef_core::{
     accessibility::AxTreeSlot,
     contracts::{BrowserId, BrowserSurfaceMode},
     cursor::CursorSlot,
+    menu::NativeContextMenuSlot,
     ports::{BrowserHandle, CloseMode, EngineError, FrameSource},
 };
 
@@ -37,6 +38,7 @@ pub struct BrowserAttachment {
     source: Arc<dyn FrameSource>,
     ax_tree: AxTreeSlot,
     cursor_slot: CursorSlot,
+    native_context_menu: NativeContextMenuSlot,
     surface_mode: BrowserSurfaceMode,
 }
 
@@ -52,6 +54,7 @@ impl BrowserAttachment {
             source,
             ax_tree: AxTreeSlot::new(),
             cursor_slot: CursorSlot::new(),
+            native_context_menu: NativeContextMenuSlot::new(),
             surface_mode: BrowserSurfaceMode::Offscreen,
         }
     }
@@ -63,6 +66,14 @@ impl BrowserAttachment {
 
     pub(crate) fn with_cursor_slot(mut self, cursor_slot: CursorSlot) -> Self {
         self.cursor_slot = cursor_slot;
+        self
+    }
+
+    pub(crate) fn with_native_context_menu(
+        mut self,
+        native_context_menu: NativeContextMenuSlot,
+    ) -> Self {
+        self.native_context_menu = native_context_menu;
         self
     }
 
@@ -89,6 +100,10 @@ impl BrowserAttachment {
 
     pub fn cursor_slot(&self) -> &CursorSlot {
         &self.cursor_slot
+    }
+
+    pub fn native_context_menu(&self) -> &NativeContextMenuSlot {
+        &self.native_context_menu
     }
 
     pub fn surface_mode(&self) -> BrowserSurfaceMode {

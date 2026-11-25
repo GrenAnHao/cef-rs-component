@@ -1065,13 +1065,67 @@ impl UiRegistry {
                 };
                 match (target_url, client_state.as_ref()) {
                     (Some(url), Some(state)) => {
-                        let url_cef = CefString::from(url);
-                        state.handle_popup_request(
-                            Some(&url_cef),
-                            None,
-                            WindowOpenDisposition::NEW_FOREGROUND_TAB,
-                            1,
-                        );
+                        let policy_allowed = state.allows_navigation_for_script(url, true);
+                        let request = rust_cef_core::host_capabilities::PopupRequest {
+                            browser: scope.browser,
+                            target_url: url.to_string(),
+                            target_frame_name: String::new(),
+                            disposition: rust_cef_core::host_capabilities::PopupDisposition::NewForegroundTab,
+                            user_gesture: true,
+                            policy_allowed,
+                        };
+                        let (decision, record_policy_deny) = state.resolve_popup_decision(request);
+                        match decision {
+                            rust_cef_core::host_capabilities::PopupDecision::Cancel => {
+                                if record_policy_deny {
+                                    state.deny(rust_cef_core::ports::PolicyAction::Popup);
+                                }
+                            }
+                            rust_cef_core::host_capabilities::PopupDecision::NavigateCurrentTab => {
+                                if !policy_allowed {
+                                    state.deny_disallowed_url(url);
+                                } else {
+                                    self.post_navigate_main_frame(scope.browser, url.to_string());
+                                }
+                            }
+                            rust_cef_core::host_capabilities::PopupDecision::AllowNativePopup {
+                                ..
+                            } => {
+                                if !policy_allowed {
+                                    state.deny_disallowed_url(url);
+                                } else if let Some(registry) = scope.registry.upgrade()
+                                    && let Ok(mut popup_client) = registry.open_managed_popup_client(
+                                        scope.browser,
+                                        -1,
+                                        state.policy.clone(),
+                                    )
+                                {
+                                    let win_info = crate::popup_window::build_popup_window_info(
+                                        None,
+                                        "GPUI CEF Popup",
+                                    );
+                                    let mut settings = BrowserSettings::default();
+                                    settings.windowless_frame_rate = 0;
+                                    let mut req_ctx =
+                                        browser.host().and_then(|h| h.request_context());
+                                    let url_cef = CefString::from(url);
+                                    self.menu_audit().record();
+                                    let accepted = browser_host_create_browser(
+                                        Some(&win_info),
+                                        Some(&mut popup_client),
+                                        Some(&url_cef),
+                                        Some(&settings),
+                                        None,
+                                        req_ctx.as_mut(),
+                                    );
+                                    drop(req_ctx);
+                                    drop(popup_client);
+                                    if accepted == 0 {
+                                        registry.popups.mark_aborted_by_popup_id(scope.browser, -1);
+                                    }
+                                }
+                            }
+                        }
                         scope.note_action();
                     }
                     _ => scope.fail(format!("synthesized menu command {command_id} unavailable")),
@@ -1298,7 +1352,11 @@ wrap_context_menu_handler! {
                  let devtools_configured=registry.devtools.is_configured();
                  let host_caps=registry.host_capabilities();
                  let download_configured=host_caps.download.is_some();
-                 let popup_configured=host_caps.popup.is_some();
+                 let popup_configured=host_caps.popup.is_some()
+                     || self.state.routing.popup_filter().is_some()
+                     || self.state.routing.is_popup_ui_listener_active()
+                     || self.state.routing.effective_popup_policy()
+                         != rust_cef_core::host_capabilities::PopupPolicy::Deny;
                  let target=TargetMenuContext {
                      link_url: crate::menu_model::read_userfree(&params.link_url(), 4096).ok().filter(|s|!s.is_empty()),
                      source_url: crate::menu_model::read_userfree(&params.source_url(), 4096).ok().filter(|s|!s.is_empty()),

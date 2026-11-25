@@ -9,17 +9,36 @@ use std::{
 
 use crate::contracts::{
     BrowserConfig, BrowserCursor, BrowserId, BrowserSnapshot, CefFeatureState, ConsoleSeverity,
-    InitializeOutcome, PixelRect, RuntimeConfig, RuntimeGeneration, ShortcutId, Viewport,
+    DraggableRegionRect, FocusedDomNodeInfo, FrameLifecycleInfo, InitializeOutcome,
+    JsUncaughtExceptionInfo, PixelRect, ResourceLoadCompleteInfo, ResourceResponseInfo,
+    RuntimeConfig, RuntimeGeneration, ShortcutId, Viewport,
 };
 use crate::{
+    custom_schemes::ResourceInterceptor,
     frame_budget::BudgetedPixels,
+    host_capabilities::{
+        DragEnterFilter, HostCapabilities, KeyEventFilter, NavigationFilter, PopupFilter,
+        PopupPolicy, PreKeyFilter, ProtocolExecutionFilter, SetFocusFilter,
+    },
     ime::ImeSnapshot,
     inbound_drag::InboundDragCommand,
     input::{BrowserTouchEvent, InputEvent, InputResetReason, InputSnapshot},
     js_bridge::{EvalOutcome, EvalRequestId, JsFrameScope},
     mailbox::FrameUpdate,
-    outbound_drag::{DragOperationMask, OutboundDragFinish, OutboundDragStart},
+    outbound_drag::{DragOperationMask, OsrDragFinish, OutboundDragFinish, OutboundDragStart},
 };
+
+pub const EXT_EVENT_TOOLTIP: u32 = 1 << 0;
+pub const EXT_EVENT_CONSOLE: u32 = 1 << 1;
+pub const EXT_EVENT_AUTO_RESIZE: u32 = 1 << 2;
+pub const EXT_EVENT_MEDIA_ACCESS: u32 = 1 << 3;
+pub const EXT_EVENT_DOCUMENT_AVAILABLE: u32 = 1 << 4;
+pub const EXT_EVENT_DRAGGABLE_REGIONS: u32 = 1 << 5;
+pub const EXT_EVENT_FRAME_LIFECYCLE: u32 = 1 << 6;
+pub const EXT_EVENT_V8_CONTEXT: u32 = 1 << 7;
+pub const EXT_EVENT_FOCUSED_NODE: u32 = 1 << 8;
+pub const EXT_EVENT_UNCAUGHT_EXCEPTION: u32 = 1 << 9;
+pub const EXT_EVENT_RESOURCE_OBSERVE: u32 = 1 << 10;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CloseMode {
@@ -66,6 +85,11 @@ pub struct MouseClick {
 #[derive(Clone, PartialEq)]
 pub enum BrowserCommand {
     Navigate(String),
+    LoadUrlWithPostData {
+        url: String,
+        post_data: Vec<u8>,
+        content_type: Option<String>,
+    },
     Back,
     Forward,
     Reload,
@@ -98,6 +122,7 @@ pub enum BrowserCommand {
         payload_json: String,
     },
     FinishOutboundDrag(OutboundDragFinish),
+    FinishOsrDrag(OsrDragFinish),
     SetAccessibilityState(CefFeatureState),
     TouchEvent(BrowserTouchEvent),
     SetNativeBounds(PixelRect),
@@ -106,6 +131,10 @@ pub enum BrowserCommand {
         x_px: i32,
         y_px: i32,
     },
+    SetClientOffset {
+        x_dip: f32,
+        y_dip: f32,
+    },
     DragTarget(InboundDragCommand),
 }
 
@@ -113,6 +142,16 @@ impl std::fmt::Debug for BrowserCommand {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Navigate(url) => f.debug_tuple("Navigate").field(url).finish(),
+            Self::LoadUrlWithPostData {
+                url,
+                post_data,
+                content_type,
+            } => f
+                .debug_struct("LoadUrlWithPostData")
+                .field("url", url)
+                .field("post_data_bytes", &post_data.len())
+                .field("content_type", content_type)
+                .finish(),
             Self::Back => f.write_str("Back"),
             Self::Forward => f.write_str("Forward"),
             Self::Reload => f.write_str("Reload"),
@@ -157,6 +196,7 @@ impl std::fmt::Debug for BrowserCommand {
             Self::FinishOutboundDrag(finish) => {
                 f.debug_tuple("FinishOutboundDrag").field(finish).finish()
             }
+            Self::FinishOsrDrag(finish) => f.debug_tuple("FinishOsrDrag").field(finish).finish(),
             Self::SetAccessibilityState(state) => {
                 f.debug_tuple("SetAccessibilityState").field(state).finish()
             }
@@ -167,6 +207,11 @@ impl std::fmt::Debug for BrowserCommand {
                 .debug_struct("SetScreenOrigin")
                 .field("x_px", x_px)
                 .field("y_px", y_px)
+                .finish(),
+            Self::SetClientOffset { x_dip, y_dip } => f
+                .debug_struct("SetClientOffset")
+                .field("x_dip", x_dip)
+                .field("y_dip", y_dip)
                 .finish(),
             Self::DragTarget(cmd) => f.debug_tuple("DragTarget").field(cmd).finish(),
         }
@@ -216,6 +261,15 @@ pub enum CaptureFailureKind {
     ResizeExhausted,
 }
 
+impl CaptureFailureKind {
+    /// True for intermediate compositor/resize transitions that the runtime
+    /// recovers from internally without corrupting or dropping the active session.
+    #[must_use]
+    pub const fn is_recoverable_resize_transition(self) -> bool {
+        matches!(self, Self::IncompleteFrame | Self::ResizeExhausted | Self::Busy)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EngineError {
     WrongThread,
@@ -237,6 +291,24 @@ pub enum EngineError {
         kind: CaptureFailureKind,
         code: Option<i32>,
     },
+}
+
+impl EngineError {
+    /// True when the error represents an expected, kernel-handled intermediate
+    /// resize/compositor frame rejection rather than a broken capture pipeline.
+    #[must_use]
+    pub const fn is_recoverable_capture(&self) -> bool {
+        matches!(
+            self,
+            Self::Capture {
+                kind: CaptureFailureKind::IncompleteFrame | CaptureFailureKind::ResizeExhausted,
+                code: None,
+            } | Self::Capture {
+                kind: CaptureFailureKind::Busy,
+                ..
+            }
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -343,6 +415,42 @@ pub enum BrowserEvent {
         node_count: usize,
         truncated: bool,
     },
+    PopupRequested(crate::host_capabilities::PopupRequest),
+    DraggableRegionsChanged(Vec<DraggableRegionRect>),
+    AutoResized {
+        width: i32,
+        height: i32,
+    },
+    MediaAccessChanged {
+        has_video: bool,
+        has_audio: bool,
+    },
+    DocumentAvailableInMainFrame,
+    FrameCreated(FrameLifecycleInfo),
+    FrameAttached {
+        frame: FrameLifecycleInfo,
+        reattached: bool,
+    },
+    FrameDetached {
+        frame_id: String,
+        is_main: bool,
+    },
+    MainFrameChanged {
+        old_frame_id: Option<String>,
+        new_frame: Option<FrameLifecycleInfo>,
+    },
+    ContextCreated {
+        frame_id: String,
+        is_main_frame: bool,
+    },
+    ContextReleased {
+        frame_id: String,
+        is_main_frame: bool,
+    },
+    FocusedNodeChanged(Option<FocusedDomNodeInfo>),
+    UncaughtJsException(JsUncaughtExceptionInfo),
+    ResourceResponseObserved(ResourceResponseInfo),
+    ResourceLoadCompleted(ResourceLoadCompleteInfo),
     CloseCancelled,
     Closed,
 }
@@ -485,6 +593,73 @@ impl std::fmt::Debug for BrowserEvent {
                 .field("node_count", node_count)
                 .field("truncated", truncated)
                 .finish(),
+            Self::PopupRequested(req) => f.debug_tuple("PopupRequested").field(req).finish(),
+            Self::DraggableRegionsChanged(regions) => f
+                .debug_struct("DraggableRegionsChanged")
+                .field("count", &regions.len())
+                .finish(),
+            Self::AutoResized { width, height } => f
+                .debug_struct("AutoResized")
+                .field("width", width)
+                .field("height", height)
+                .finish(),
+            Self::MediaAccessChanged {
+                has_video,
+                has_audio,
+            } => f
+                .debug_struct("MediaAccessChanged")
+                .field("has_video", has_video)
+                .field("has_audio", has_audio)
+                .finish(),
+            Self::DocumentAvailableInMainFrame => f.write_str("DocumentAvailableInMainFrame"),
+            Self::FrameCreated(info) => f.debug_tuple("FrameCreated").field(info).finish(),
+            Self::FrameAttached { frame, reattached } => f
+                .debug_struct("FrameAttached")
+                .field("frame", frame)
+                .field("reattached", reattached)
+                .finish(),
+            Self::FrameDetached { frame_id, is_main } => f
+                .debug_struct("FrameDetached")
+                .field("frame_id", frame_id)
+                .field("is_main", is_main)
+                .finish(),
+            Self::MainFrameChanged {
+                old_frame_id,
+                new_frame,
+            } => f
+                .debug_struct("MainFrameChanged")
+                .field("old_frame_id", old_frame_id)
+                .field("new_frame", new_frame)
+                .finish(),
+            Self::ContextCreated {
+                frame_id,
+                is_main_frame,
+            } => f
+                .debug_struct("ContextCreated")
+                .field("frame_id", frame_id)
+                .field("is_main_frame", is_main_frame)
+                .finish(),
+            Self::ContextReleased {
+                frame_id,
+                is_main_frame,
+            } => f
+                .debug_struct("ContextReleased")
+                .field("frame_id", frame_id)
+                .field("is_main_frame", is_main_frame)
+                .finish(),
+            Self::FocusedNodeChanged(node) => {
+                f.debug_tuple("FocusedNodeChanged").field(node).finish()
+            }
+            Self::UncaughtJsException(info) => {
+                f.debug_tuple("UncaughtJsException").field(info).finish()
+            }
+            Self::ResourceResponseObserved(info) => f
+                .debug_tuple("ResourceResponseObserved")
+                .field(info)
+                .finish(),
+            Self::ResourceLoadCompleted(info) => {
+                f.debug_tuple("ResourceLoadCompleted").field(info).finish()
+            }
             Self::CloseCancelled => f.write_str("CloseCancelled"),
             Self::Closed => f.write_str("Closed"),
         }
@@ -834,6 +1009,10 @@ pub trait FrameSource: Send + Sync {
     fn take_update(&self) -> Option<FrameUpdate>;
     /// Current state without consuming pending state, for resynchronization.
     fn snapshot(&self) -> FrameUpdate;
+    /// Pure query whether an unconsumed update is currently queued (`dirty`).
+    fn has_pending_update(&self) -> bool {
+        false
+    }
 }
 
 pub trait UiDispatcher: Send + Sync {
@@ -1050,6 +1229,9 @@ pub trait BrowserControl: Send + Sync {
     fn take_js_events(&self) -> Vec<BrowserEvent> {
         Vec::new()
     }
+    fn take_view_events(&self) -> Vec<BrowserEvent> {
+        Vec::new()
+    }
     fn evaluate_script(
         &self,
         _script: String,
@@ -1130,6 +1312,32 @@ pub trait BrowserControl: Send + Sync {
     fn submit_zoom_level_fast(&self, level: f64) -> Result<(), EngineError> {
         self.submit(BrowserCommand::SetZoomLevel(level)).map(|_| ())
     }
+    /// Latest-wins coalesced OSR HTML5 drag-over/leave update for the active outbound drag.
+    fn submit_osr_drag_move_fast(
+        &self,
+        _drag_id: crate::outbound_drag::DragSessionId,
+        _x: i32,
+        _y: i32,
+        _modifiers: MouseModifiers,
+        _in_view: bool,
+    ) -> Result<(), EngineError> {
+        Err(EngineError::InvalidRequest)
+    }
+    fn set_popup_policy(&self, _policy: PopupPolicy) {}
+    fn popup_policy(&self) -> PopupPolicy {
+        PopupPolicy::Auto
+    }
+    fn set_popup_filter(&self, _filter: Option<PopupFilter>) {}
+    fn set_popup_ui_listener_active(&self, _active: bool) {}
+    fn set_navigation_filter(&self, _filter: Option<NavigationFilter>) {}
+    fn set_extended_event_mask(&self, _mask: u32) {}
+    fn set_drag_enter_filter(&self, _filter: Option<DragEnterFilter>) {}
+    fn set_focus_filter(&self, _filter: Option<SetFocusFilter>) {}
+    fn set_pre_key_filter(&self, _filter: Option<PreKeyFilter>) {}
+    fn set_key_event_filter(&self, _filter: Option<KeyEventFilter>) {}
+    fn set_protocol_execution_filter(&self, _filter: Option<ProtocolExecutionFilter>) {}
+    fn set_browser_host_capabilities(&self, _capabilities: Option<HostCapabilities>) {}
+    fn set_browser_resource_interceptor(&self, _interceptor: Option<Arc<dyn ResourceInterceptor>>) {}
 }
 
 #[derive(Clone)]
@@ -1177,6 +1385,18 @@ impl BrowserHandle {
         self.control.submit_zoom_level_fast(level)
     }
 
+    pub fn submit_osr_drag_move_fast(
+        &self,
+        drag_id: crate::outbound_drag::DragSessionId,
+        x: i32,
+        y: i32,
+        modifiers: MouseModifiers,
+        in_view: bool,
+    ) -> Result<(), EngineError> {
+        self.control
+            .submit_osr_drag_move_fast(drag_id, x, y, modifiers, in_view)
+    }
+
     pub fn submit(&self, command: BrowserCommand) -> Result<CommandId, EngineError> {
         self.control.submit(command)
     }
@@ -1201,6 +1421,10 @@ impl BrowserHandle {
         self.control.take_js_events()
     }
 
+    pub fn take_view_events(&self) -> Vec<BrowserEvent> {
+        self.control.take_view_events()
+    }
+
     pub fn evaluate_script(
         &self,
         script: String,
@@ -1213,5 +1437,121 @@ impl BrowserHandle {
 
     pub fn request_close(&self, mode: CloseMode) -> CloseTicket {
         self.control.request_close(mode)
+    }
+
+    pub fn set_popup_policy(&self, policy: PopupPolicy) {
+        self.control.set_popup_policy(policy);
+    }
+
+    pub fn popup_policy(&self) -> PopupPolicy {
+        self.control.popup_policy()
+    }
+
+    pub fn set_popup_filter(&self, filter: Option<PopupFilter>) {
+        self.control.set_popup_filter(filter);
+    }
+
+    pub fn set_popup_ui_listener_active(&self, active: bool) {
+        self.control.set_popup_ui_listener_active(active);
+    }
+
+    pub fn set_navigation_filter(&self, filter: Option<NavigationFilter>) {
+        self.control.set_navigation_filter(filter);
+    }
+
+    pub fn set_extended_event_mask(&self, mask: u32) {
+        self.control.set_extended_event_mask(mask);
+    }
+
+    pub fn set_drag_enter_filter(&self, filter: Option<DragEnterFilter>) {
+        self.control.set_drag_enter_filter(filter);
+    }
+
+    pub fn set_focus_filter(&self, filter: Option<SetFocusFilter>) {
+        self.control.set_focus_filter(filter);
+    }
+
+    pub fn set_pre_key_filter(&self, filter: Option<PreKeyFilter>) {
+        self.control.set_pre_key_filter(filter);
+    }
+
+    pub fn set_key_event_filter(&self, filter: Option<KeyEventFilter>) {
+        self.control.set_key_event_filter(filter);
+    }
+
+    pub fn set_protocol_execution_filter(&self, filter: Option<ProtocolExecutionFilter>) {
+        self.control.set_protocol_execution_filter(filter);
+    }
+
+    pub fn set_browser_host_capabilities(&self, capabilities: Option<HostCapabilities>) {
+        self.control.set_browser_host_capabilities(capabilities);
+    }
+
+    pub fn set_browser_resource_interceptor(
+        &self,
+        interceptor: Option<Arc<dyn ResourceInterceptor>>,
+    ) {
+        self.control.set_browser_resource_interceptor(interceptor);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        contracts::RuntimeGeneration,
+        mailbox::{FrameMailbox, SurfaceBounds},
+    };
+
+    #[test]
+    fn engine_error_recoverable_capture_matches_expected_resize_states() {
+        assert!(CaptureFailureKind::IncompleteFrame.is_recoverable_resize_transition());
+        assert!(CaptureFailureKind::ResizeExhausted.is_recoverable_resize_transition());
+        assert!(CaptureFailureKind::Busy.is_recoverable_resize_transition());
+        assert!(!CaptureFailureKind::DeviceRemoved.is_recoverable_resize_transition());
+
+        assert!(EngineError::Capture {
+            kind: CaptureFailureKind::IncompleteFrame,
+            code: None,
+        }
+        .is_recoverable_capture());
+        assert!(EngineError::Capture {
+            kind: CaptureFailureKind::ResizeExhausted,
+            code: None,
+        }
+        .is_recoverable_capture());
+        assert!(EngineError::Capture {
+            kind: CaptureFailureKind::Busy,
+            code: Some(1),
+        }
+        .is_recoverable_capture());
+        assert!(!EngineError::Capture {
+            kind: CaptureFailureKind::IncompleteFrame,
+            code: Some(-1),
+        }
+        .is_recoverable_capture());
+        assert!(!EngineError::Closed.is_recoverable_capture());
+    }
+
+    #[test]
+    fn frame_source_has_pending_update_tracks_mailbox_dirty_flag() {
+        let mailbox = FrameMailbox::new(BrowserId::new(RuntimeGeneration::new(1), 1));
+        assert!(!FrameSource::has_pending_update(&mailbox));
+        let ticket = mailbox
+            .configure_view(
+                SurfaceBounds {
+                    x: 0,
+                    y: 0,
+                    width: 4,
+                    height: 4,
+                },
+                4,
+                4,
+            )
+            .expect("configure_view");
+        assert!(ticket.is_some());
+        assert!(FrameSource::has_pending_update(&mailbox));
+        let _ = mailbox.take_update().expect("take_update");
+        assert!(!FrameSource::has_pending_update(&mailbox));
     }
 }

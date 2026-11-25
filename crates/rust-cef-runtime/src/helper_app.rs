@@ -28,6 +28,10 @@ pub(crate) const MSG_POST_MESSAGE: &str = "rust_cef.post_message";
 pub(crate) const MSG_HOST_MESSAGE: &str = "rust_cef.host_message";
 pub(crate) const MSG_EVAL_REQUEST: &str = "rust_cef.eval_request";
 pub(crate) const MSG_EVAL_RESPONSE: &str = "rust_cef.eval_response";
+pub(crate) const MSG_CONTEXT_CREATED: &str = "rust_cef.context_created";
+pub(crate) const MSG_CONTEXT_RELEASED: &str = "rust_cef.context_released";
+pub(crate) const MSG_FOCUSED_NODE_CHANGED: &str = "rust_cef.focused_node_changed";
+pub(crate) const MSG_UNCAUGHT_EXCEPTION: &str = "rust_cef.uncaught_exception";
 
 const MAX_V8_LISTENERS_PER_BROWSER: usize = 16;
 
@@ -126,7 +130,11 @@ impl HelperRenderState {
             let count = list.size().min(64);
             for i in 0..count {
                 let s = CefString::from(&list.string(i)).to_string();
-                if let Some(canonical) = canonical_origin(&s, &self.custom_schemes) {
+                if s.eq_ignore_ascii_case("https://*") {
+                    allowed_origins.insert("https://*".into());
+                } else if s.eq_ignore_ascii_case("http://*") {
+                    allowed_origins.insert("http://*".into());
+                } else if let Some(canonical) = canonical_origin(&s, &self.custom_schemes) {
                     allowed_origins.insert(canonical);
                 }
             }
@@ -181,7 +189,10 @@ impl HelperRenderState {
         let origin = self.origin_for_url(&url)?;
         let guard = self.lock_browsers();
         let bridge = guard.get(&native_id)?;
-        if !bridge.js_bridge_enabled || !bridge.allowed_origins.contains(&origin) {
+        let origin_allowed = bridge.allowed_origins.contains(&origin)
+            || (origin.starts_with("https://") && bridge.allowed_origins.contains("https://*"))
+            || (origin.starts_with("http://") && bridge.allowed_origins.contains("http://*"));
+        if !bridge.js_bridge_enabled || !origin_allowed {
             return None;
         }
         Some((
@@ -297,17 +308,39 @@ wrap_v8_handler! {
                 "postMessage" => {
                     if args.len() != 1 {
                         if let Some(ex) = exception {
-                            ex.try_set("rustCef.postMessage requires exactly 1 JSON string argument");
+                            ex.try_set("rustCef.postMessage requires exactly 1 argument");
                         }
                         return 1;
                     }
-                    let Some(arg) = args[0].as_ref().filter(|v| v.is_string() != 0) else {
-                        if let Some(ex) = exception {
-                            ex.try_set("rustCef.postMessage argument must be a JSON string");
+                    let payload = match args[0].as_ref() {
+                        None => "null".to_owned(),
+                        Some(arg) if arg.is_string() != 0 => {
+                            let raw = CefString::from(&arg.string_value()).to_string();
+                            if validate_bounded_json(&raw, max_bytes, MAX_JS_JSON_DEPTH).is_ok() {
+                                raw
+                            } else {
+                                let encoded = serde_json::Value::String(raw).to_string();
+                                if let Err(err) = validate_bounded_json(&encoded, max_bytes, MAX_JS_JSON_DEPTH) {
+                                    if let Some(ex) = exception {
+                                        let msg = format!("rustCef.postMessage rejected payload: {err:?}");
+                                        ex.try_set(&msg);
+                                    }
+                                    return 1;
+                                }
+                                encoded
+                            }
                         }
-                        return 1;
+                        Some(arg) => match v8_value_to_bounded_json(arg, max_bytes) {
+                            Ok(encoded) => encoded,
+                            Err((_kind, msg)) => {
+                                if let Some(ex) = exception {
+                                    let detail = format!("rustCef.postMessage rejected payload: {msg}");
+                                    ex.try_set(&detail);
+                                }
+                                return 1;
+                            }
+                        },
                     };
-                    let payload = CefString::from(&arg.string_value()).to_string();
                     if let Err(err) = validate_bounded_json(&payload, max_bytes, MAX_JS_JSON_DEPTH) {
                         if let Some(ex) = exception {
                             let msg = format!("rustCef.postMessage rejected payload: {err:?}");
@@ -398,6 +431,11 @@ wrap_render_process_handler! {
                 return;
             };
             let native_id = browser.identifier();
+            if let Some((rt, br, _)) = self.state.identity_for_browser(native_id)
+                && frame.is_valid() != 0
+            {
+                send_frame_context_event(frame, MSG_CONTEXT_CREATED, rt, br);
+            }
             if self.state.is_frame_bridge_permitted(native_id, frame).is_none() {
                 return;
             }
@@ -427,7 +465,18 @@ wrap_render_process_handler! {
             let mut eval_exc: Option<V8Exception> = None;
             let _ = context.eval(
                 Some(&CefString::from(
-                    "if (typeof globalThis !== 'undefined' && globalThis.rustCef && Object.freeze) { Object.freeze(globalThis.rustCef); }",
+                    "if (typeof globalThis !== 'undefined' && globalThis.rustCef) {\
+                       if (Object.freeze) { Object.freeze(globalThis.rustCef); }\
+                       if (typeof globalThis.CefSharp === 'undefined') {\
+                         globalThis.CefSharp = {\
+                           PostMessage: function(msg) { return globalThis.rustCef.postMessage(msg); },\
+                           BindObjectAsync: function() { return Promise.resolve({ Success: true, Message: 'ready' }); },\
+                           DeleteBoundObject: function() { return true; },\
+                           IsObjectCached: function() { return true; },\
+                           RemoveObjectFromCache: function() { return true; }\
+                         };\
+                       }\
+                     }",
                 )),
                 Some(&CefString::from("rust-cef://bootstrap")),
                 1,
@@ -439,12 +488,135 @@ wrap_render_process_handler! {
         fn on_context_released(
             &self,
             browser: Option<&mut Browser>,
-            _frame: Option<&mut Frame>,
+            frame: Option<&mut Frame>,
             context: Option<&mut V8Context>,
         ) {
-            if let (Some(browser), Some(context)) = (browser, context) {
-                self.state.release_context_listeners(browser.identifier(), context);
+            let Some(browser) = browser else {
+                return;
+            };
+            let native_id = browser.identifier();
+            if let Some(context) = context {
+                self.state.release_context_listeners(native_id, context);
             }
+            if let Some((rt, br, _)) = self.state.identity_for_browser(native_id)
+                && let Some(frame) = frame
+                && frame.is_valid() != 0
+            {
+                send_frame_context_event(frame, MSG_CONTEXT_RELEASED, rt, br);
+            }
+        }
+
+        fn on_uncaught_exception(
+            &self,
+            browser: Option<&mut Browser>,
+            frame: Option<&mut Frame>,
+            _context: Option<&mut V8Context>,
+            exception: Option<&mut V8Exception>,
+            _stack_trace: Option<&mut V8StackTrace>,
+        ) {
+            let (Some(browser), Some(frame), Some(exception)) = (browser, frame, exception) else {
+                return;
+            };
+            if frame.is_valid() == 0 {
+                return;
+            }
+            let Some((rt, br, _)) = self.state.identity_for_browser(browser.identifier()) else {
+                return;
+            };
+            let Some(mut msg) = process_message_create(Some(&CefString::from(MSG_UNCAUGHT_EXCEPTION))) else {
+                return;
+            };
+            let Some(args) = msg.argument_list() else {
+                return;
+            };
+            let frame_id = truncate_utf8_bytes(&CefString::from(&frame.identifier()).to_string(), 128);
+            let message_text =
+                truncate_utf8_bytes(&CefString::from(&exception.message()).to_string(), 1024);
+            let source_url = truncate_utf8_bytes(
+                &CefString::from(&exception.script_resource_name()).to_string(),
+                1024,
+            );
+            args.set_string(0, Some(&CefString::from(rt.to_string().as_str())));
+            args.set_string(1, Some(&CefString::from(br.to_string().as_str())));
+            args.set_string(2, Some(&CefString::from(frame_id.as_str())));
+            args.set_bool(3, i32::from(frame.is_main() != 0));
+            args.set_string(4, Some(&CefString::from(message_text.as_str())));
+            args.set_string(5, Some(&CefString::from(source_url.as_str())));
+            args.set_int(6, exception.line_number());
+            args.set_int(7, exception.start_column());
+            frame.send_process_message(ProcessId::BROWSER, Some(&mut msg));
+        }
+
+        fn on_focused_node_changed(
+            &self,
+            browser: Option<&mut Browser>,
+            frame: Option<&mut Frame>,
+            node: Option<&mut Domnode>,
+        ) {
+            let Some(browser) = browser else {
+                return;
+            };
+            let Some((rt, br, _)) = self.state.identity_for_browser(browser.identifier()) else {
+                return;
+            };
+            let target_frame = frame
+                .filter(|f| f.is_valid() != 0)
+                .cloned()
+                .or_else(|| browser.main_frame());
+            let Some(target_frame) = target_frame else {
+                return;
+            };
+            if target_frame.is_valid() == 0 {
+                return;
+            }
+            let Some(mut msg) =
+                process_message_create(Some(&CefString::from(MSG_FOCUSED_NODE_CHANGED)))
+            else {
+                return;
+            };
+            let Some(args) = msg.argument_list() else {
+                return;
+            };
+            let has_node = node.is_some();
+            let frame_id = truncate_utf8_bytes(
+                &CefString::from(&target_frame.identifier()).to_string(),
+                128,
+            );
+            let (tag_name, element_id, input_type, is_editable) = if let Some(node) = node {
+                let is_editable = node.is_editable() != 0;
+                if node.is_element() != 0 {
+                    let tag = truncate_utf8_bytes(
+                        &CefString::from(&node.element_tag_name()).to_string(),
+                        256,
+                    );
+                    let id = truncate_utf8_bytes(
+                        &CefString::from(&node.element_attribute(Some(&CefString::from("id"))))
+                            .to_string(),
+                        256,
+                    );
+                    let ty = truncate_utf8_bytes(
+                        &CefString::from(&node.element_attribute(Some(&CefString::from("type"))))
+                            .to_string(),
+                        256,
+                    );
+                    (tag, id, ty, is_editable)
+                } else {
+                    let name = truncate_utf8_bytes(&CefString::from(&node.name()).to_string(), 256);
+                    (name, String::new(), String::new(), is_editable)
+                }
+            } else {
+                (String::new(), String::new(), String::new(), false)
+            };
+            args.set_string(0, Some(&CefString::from(rt.to_string().as_str())));
+            args.set_string(1, Some(&CefString::from(br.to_string().as_str())));
+            args.set_bool(2, i32::from(has_node));
+            args.set_string(3, Some(&CefString::from(frame_id.as_str())));
+            args.set_bool(4, i32::from(target_frame.is_main() != 0));
+            args.set_string(5, Some(&CefString::from(tag_name.as_str())));
+            args.set_string(6, Some(&CefString::from(element_id.as_str())));
+            args.set_string(7, Some(&CefString::from(input_type.as_str())));
+            args.set_bool(8, i32::from(is_editable));
+            target_frame.send_process_message(ProcessId::BROWSER, Some(&mut msg));
         }
 
         fn on_process_message_received(
@@ -615,6 +787,23 @@ wrap_render_process_handler! {
     }
 }
 
+fn send_frame_context_event(frame: &Frame, msg_name: &str, runtime_gen: u64, browser_local: u64) {
+    let Some(mut msg) = process_message_create(Some(&CefString::from(msg_name))) else {
+        return;
+    };
+    if let Some(list) = msg.argument_list() {
+        let frame_id = truncate_utf8_bytes(&CefString::from(&frame.identifier()).to_string(), 128);
+        list.set_string(0, Some(&CefString::from(runtime_gen.to_string().as_str())));
+        list.set_string(
+            1,
+            Some(&CefString::from(browser_local.to_string().as_str())),
+        );
+        list.set_string(2, Some(&CefString::from(frame_id.as_str())));
+        list.set_bool(3, i32::from(frame.is_main() != 0));
+        frame.send_process_message(ProcessId::BROWSER, Some(&mut msg));
+    }
+}
+
 fn send_eval_ok(
     frame: &Frame,
     runtime_gen: u64,
@@ -720,11 +909,12 @@ fn v8_to_serde(
         let text = CefString::from(&value.string_value()).to_string();
         return Ok(serde_json::Value::String(text));
     }
-    if value.is_function() != 0
-        || value.is_promise() != 0
-        || value.is_array_buffer() != 0
-        || value.is_date() != 0
-    {
+    if value.is_date() != 0 {
+        let win_us = value.date_value().val;
+        let unix_ms = (win_us - 11_644_473_600_000_000_i64).div_euclid(1000);
+        return Ok(serde_json::Value::String(format_unix_ms_iso(unix_ms)));
+    }
+    if value.is_function() != 0 || value.is_promise() != 0 || value.is_array_buffer() != 0 {
         return Err(("unsupported_type", "non-JSON V8 host/function/binary type"));
     }
     if value.is_array() != 0 {
@@ -755,11 +945,10 @@ fn v8_to_serde(
         let mut map = serde_json::Map::with_capacity(key_names.len());
         for key in key_names {
             if let Some(prop) = value.value_bykey(Some(&CefString::from(key.as_str()))) {
-                if prop.is_undefined() != 0 {
+                if prop.is_undefined() != 0 || prop.is_function() != 0 {
                     continue;
                 }
-                if prop.is_function() != 0 || prop.is_promise() != 0 || prop.is_array_buffer() != 0
-                {
+                if prop.is_promise() != 0 || prop.is_array_buffer() != 0 {
                     return Err(("unsupported_type", "object contains non-JSON property"));
                 }
                 map.insert(key, v8_to_serde(&prop, depth + 1)?);
@@ -768,6 +957,27 @@ fn v8_to_serde(
         return Ok(serde_json::Value::Object(map));
     }
     Err(("unsupported_type", "unsupported V8 value kind"))
+}
+
+fn format_unix_ms_iso(unix_ms: i64) -> String {
+    let total_secs = unix_ms.div_euclid(1000);
+    let ms = unix_ms.rem_euclid(1000);
+    let days = total_secs.div_euclid(86_400);
+    let secs_of_day = total_secs.rem_euclid(86_400);
+    let hour = secs_of_day / 3600;
+    let minute = (secs_of_day % 3600) / 60;
+    let second = secs_of_day % 60;
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = mp + if mp < 10 { 3 } else { -9 };
+    let year = y + i64::from(m <= 2);
+    format!("{year:04}-{m:02}-{d:02}T{hour:02}:{minute:02}:{second:02}.{ms:03}Z")
 }
 
 #[cfg(test)]

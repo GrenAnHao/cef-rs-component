@@ -23,6 +23,7 @@ fn in_flight(route_id: u64) -> Envelope {
         nonce: 1,
         key: packet(false, 1),
         claimed: true,
+        host_consumed: false,
         text_allowed: true,
         epoch: Some(1),
     }
@@ -186,6 +187,7 @@ fn private_nonce_is_directional_single_claim_not_a_matching_vk() {
         nonce: 29,
         key,
         claimed: false,
+        host_consumed: false,
         text_allowed: false,
         epoch: None,
     };
@@ -194,13 +196,13 @@ fn private_nonce_is_directional_single_claim_not_a_matching_vk() {
     assert_eq!(stroke.key, native_name(29));
     assert!(!matches_envelope(envelope, &stroke, false));
     let foreign = keystroke(key, 30);
-    assert!(claim_nonce(&slot, &foreign, true, false, None).is_none());
-    assert!(claim_nonce(&slot, &stroke, false, false, None).is_none());
+    assert!(claim_nonce(&slot, &foreign, true, false, false, None).is_none());
+    assert!(claim_nonce(&slot, &stroke, false, false, false, None).is_none());
     assert_eq!(
-        claim_nonce(&slot, &stroke, true, false, None).map(|native| native.vk),
+        claim_nonce(&slot, &stroke, true, false, false, None).map(|native| native.vk),
         Some(0x41)
     );
-    assert!(claim_nonce(&slot, &stroke, true, false, None).is_none());
+    assert!(claim_nonce(&slot, &stroke, true, false, false, None).is_none());
     assert!(slot.get().unwrap().claimed);
 }
 

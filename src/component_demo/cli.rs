@@ -1,7 +1,7 @@
 use rust_cef_gpui::contracts::{RenderPreference, ThreadMode};
 use std::{collections::BTreeMap, ffi::OsString, path::PathBuf, time::Duration};
 
-pub(super) const USAGE: &str = "gpui-cef-component-demo --bundle <absolute-directory> --helper <absolute-exe> --cache-root <absolute-directory> --mode Integrated|Threaded --backend Software|D3d11 [--host-mode osr|native-hwnd] [--smoke-ms 100..30000 [--observer-gate <absolute-file.release>]] [--context-menu true|false [--menu-structure true|false] [--menu-devtools true|false]] [--ux-controls true|false] [--host-capabilities true|false] [--browser-shell true|false] [--page demo|menu|js-bridge]";
+pub(super) const USAGE: &str = "gpui-cef-component-demo --bundle <absolute-directory> --helper <absolute-exe> --cache-root <absolute-directory> --mode Integrated|Threaded --backend Software|D3d11 [--host-mode osr|native-hwnd] [--smoke-ms 100..30000 [--observer-gate <absolute-file.release>]] [--context-menu true|false [--menu-structure true|false] [--menu-devtools true|false]] [--ux-controls true|false] [--host-capabilities true|false] [--browser-shell true|false] [--cef-example true|false] [--page demo|menu|js-bridge] [--url http://...|https://...]";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) enum HostMode {
@@ -44,6 +44,10 @@ pub(super) struct Config {
     /// Opt-in desktop multi-tab browser shell mode built strictly over public
     /// `rust-cef-gpui` and `rust-cef-core` APIs.
     pub browser_shell: bool,
+    /// Opt-in desktop browser example showcase mode.
+    pub cef_example: bool,
+    /// Optional explicit initial `http://` or `https://` URL for interactive testing.
+    pub custom_url: Option<String>,
 }
 
 pub(super) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Option<Config>, String> {
@@ -75,7 +79,9 @@ pub(super) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Option<C
                 | "--page"
                 | "--ux-controls"
                 | "--host-capabilities"
-                | "--browser-shell"),
+                | "--browser-shell"
+                | "--cef-example"
+                | "--url"),
             ) => n.to_owned(),
             _ => return Err("unknown component demo argument".into()),
         };
@@ -150,15 +156,34 @@ pub(super) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Option<C
     let ux_controls = flag("--ux-controls")?;
     let host_capabilities = flag("--host-capabilities")?;
     let browser_shell = flag("--browser-shell")?;
+    let cef_example = flag("--cef-example")?;
     if (menu_structure || menu_devtools) && !context_menu {
         return Err("menu capabilities require --context-menu true".into());
     }
-    let (menu_page, js_bridge_page) = match values.remove("--page") {
+    let raw_page = values.remove("--page");
+    let (menu_page, js_bridge_page) = match raw_page.as_ref() {
         None => (false, false),
         Some(v) if v == "demo" => (false, false),
         Some(v) if v == "menu" => (true, false),
         Some(v) if v == "js-bridge" => (false, true),
         Some(_) => return Err("--page must be demo, menu, or js-bridge".into()),
+    };
+    let custom_url = match values.remove("--url") {
+        None => None,
+        Some(v) => {
+            if raw_page.is_some() {
+                return Err("--url cannot be combined with --page".into());
+            }
+            let url = v
+                .into_string()
+                .map_err(|_| "--url must be valid UTF-8".to_owned())?;
+            if !(url.starts_with("http://") || url.starts_with("https://"))
+                || url.chars().any(|c| c.is_control())
+            {
+                return Err("--url must start with http:// or https:// without control characters".into());
+            }
+            Some(url)
+        }
     };
     let menu_receipt = match values.remove("--menu-receipt") {
         None => None,
@@ -190,6 +215,8 @@ pub(super) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Option<C
         ux_controls,
         host_capabilities,
         browser_shell,
+        cef_example,
+        custom_url,
     }))
 }
 
@@ -330,6 +357,11 @@ mod tests {
         let mut invalid = args();
         invalid.extend(["--browser-shell".into(), "maybe".into()]);
         assert!(parse(invalid).is_err());
+
+        let mut example = args();
+        example.extend(["--cef-example".into(), "true".into()]);
+        assert!(parse(example).unwrap().unwrap().cef_example);
+        assert!(!parse(args()).unwrap().unwrap().cef_example);
     }
 
     #[test]
@@ -350,5 +382,34 @@ mod tests {
         let mut invalid = args();
         invalid.extend(["--host-mode".into(), "chrome-views".into()]);
         assert!(parse(invalid).is_err());
+    }
+
+    #[test]
+    fn custom_url_validates_http_https_and_conflicts_with_page() {
+        assert_eq!(parse(args()).unwrap().unwrap().custom_url, None);
+
+        let mut ok = args();
+        ok.extend(["--url".into(), "https://cn.bing.com/search?q=gpui".into()]);
+        assert_eq!(
+            parse(ok).unwrap().unwrap().custom_url.as_deref(),
+            Some("https://cn.bing.com/search?q=gpui")
+        );
+
+        let mut bad_scheme = args();
+        bad_scheme.extend(["--url".into(), r"file:///C:/a.html".into()]);
+        assert!(parse(bad_scheme).is_err());
+
+        let mut bad_ctrl = args();
+        bad_ctrl.extend(["--url".into(), "https://cn.bing.com/\n".into()]);
+        assert!(parse(bad_ctrl).is_err());
+
+        let mut conflict = args();
+        conflict.extend([
+            "--url".into(),
+            "https://cn.bing.com/search?q=gpui".into(),
+            "--page".into(),
+            "demo".into(),
+        ]);
+        assert!(parse(conflict).is_err());
     }
 }

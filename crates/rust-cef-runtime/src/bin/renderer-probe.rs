@@ -817,7 +817,22 @@ mod windows {
                 | BrowserEvent::EvalCompleted { .. }
                 | BrowserEvent::StartOutboundDrag(_)
                 | BrowserEvent::OutboundDragCursorChanged(_)
-                | BrowserEvent::AccessibilityTreeUpdated { .. } => {}
+                | BrowserEvent::AccessibilityTreeUpdated { .. }
+                | BrowserEvent::PopupRequested(_)
+                | BrowserEvent::DraggableRegionsChanged(_)
+                | BrowserEvent::AutoResized { .. }
+                | BrowserEvent::MediaAccessChanged { .. }
+                | BrowserEvent::DocumentAvailableInMainFrame
+                | BrowserEvent::FrameCreated(_)
+                | BrowserEvent::FrameAttached { .. }
+                | BrowserEvent::FrameDetached { .. }
+                | BrowserEvent::MainFrameChanged { .. }
+                | BrowserEvent::ContextCreated { .. }
+                | BrowserEvent::ContextReleased { .. }
+                | BrowserEvent::FocusedNodeChanged(_)
+                | BrowserEvent::UncaughtJsException(_)
+                | BrowserEvent::ResourceResponseObserved(_)
+                | BrowserEvent::ResourceLoadCompleted(_) => {}
             }
             if state.created.saturating_add(state.closed) > 0 {
                 // Lifecycle transitions are counted, never replayed from a log:

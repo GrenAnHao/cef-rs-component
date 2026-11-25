@@ -124,6 +124,7 @@ unsafe extern "system" {
     fn RegisterClipboardFormatW(format: *const u16) -> u32;
     fn GetCursorPos(point: *mut Point) -> i32;
     fn ScreenToClient(hwnd: *mut c_void, point: *mut Point) -> i32;
+    fn GetAsyncKeyState(v_key: i32) -> i16;
     fn GetDC(hwnd: *mut c_void) -> *mut c_void;
     fn ReleaseDC(hwnd: *mut c_void, hdc: *mut c_void) -> i32;
     fn SetTimer(
@@ -133,6 +134,20 @@ unsafe extern "system" {
         timer_func: Option<unsafe extern "system" fn(*mut c_void, u32, usize, u32)>,
     ) -> usize;
     fn KillTimer(hwnd: *mut c_void, id_event: usize) -> i32;
+}
+
+const VK_LBUTTON: i32 = 0x01;
+const VK_RBUTTON: i32 = 0x02;
+const VK_MBUTTON: i32 = 0x04;
+
+/// Returns whether any physical OS mouse button capable of driving OLE `DoDragDrop`
+/// is currently held down.
+pub fn is_os_drag_button_down() -> bool {
+    unsafe {
+        ((GetAsyncKeyState(VK_LBUTTON) as u16 & 0x8000) != 0)
+            || ((GetAsyncKeyState(VK_RBUTTON) as u16 & 0x8000) != 0)
+            || ((GetAsyncKeyState(VK_MBUTTON) as u16 & 0x8000) != 0)
+    }
 }
 
 #[repr(C)]
@@ -1452,10 +1467,43 @@ impl Drop for DragPumpGuard {
     }
 }
 
+/// Creates a real COM `IDataObject` (including `SHDRAGIMAGE` when present) for integration testing.
+pub fn new_ole_data_object(payload: &DraggedPayload) -> *mut c_void {
+    let formats = ClipboardFormats::register_os();
+    let data_object = DataObject::new_raw(payload, formats);
+    if let Some(image) = &payload.image {
+        let _ = attach_drag_image(data_object, image);
+    }
+    data_object.cast::<c_void>()
+}
+
+/// Releases a COM `IDataObject` previously returned by [`new_ole_data_object`].
+///
+/// # Safety
+/// `obj` must be a valid pointer previously returned by [`new_ole_data_object`].
+pub unsafe fn release_ole_data_object(obj: *mut c_void) {
+    if !obj.is_null() {
+        unsafe {
+            data_object_release(obj.cast::<DataObject>());
+        }
+    }
+}
+
 /// Runs a modal OLE drag-and-drop loop on the UI/STA thread after `App` borrows end.
 pub fn run_ole_drag(
     start: &OutboundDragStart,
     hwnd: Option<*mut c_void>,
+    integrated_pump: Option<IntegratedPumpCallback>,
+) -> OutboundDragFinish {
+    run_ole_drag_in_surface(start, hwnd, None, integrated_pump)
+}
+
+/// Runs a modal OLE drag-and-drop loop on the UI/STA thread and maps the ending cursor
+/// position back into browser-view DIP coordinates via `surface_geometry`.
+pub fn run_ole_drag_in_surface(
+    start: &OutboundDragStart,
+    hwnd: Option<*mut c_void>,
+    surface_geometry: Option<(f32, f32, f32, f32, f32)>,
     integrated_pump: Option<IntegratedPumpCallback>,
 ) -> OutboundDragFinish {
     if start.payload.is_empty() {
@@ -1509,7 +1557,13 @@ pub fn run_ole_drag(
             if unsafe { GetCursorPos(&mut pt) } != 0
                 && unsafe { ScreenToClient(hwnd, &mut pt) } != 0
             {
-                (pt.x, pt.y)
+                match surface_geometry {
+                    Some((sx, sy, _sw, _sh, scale)) if scale.is_finite() && scale > 0.0 => (
+                        ((pt.x as f32 / scale) - sx).round() as i32,
+                        ((pt.y as f32 / scale) - sy).round() as i32,
+                    ),
+                    _ => (pt.x, pt.y),
+                }
             } else {
                 (start.x, start.y)
             }
@@ -1524,7 +1578,7 @@ pub fn run_ole_drag(
     }
 
     let operation = if hr == DRAGDROP_S_DROP {
-        dropeffect_to_core_mask(effect)
+        dropeffect_to_core_mask(effect).preferred_single_op()
     } else {
         DragOperationMask::NONE
     };

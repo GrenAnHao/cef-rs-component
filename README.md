@@ -17,6 +17,7 @@
 
 ### 1. Windows D3D11 共享纹理零拷贝 OSR 管线（`OnAcceleratedPaint`）
 - **真零拷贝 GPU 直通绘制**：`CefRenderHandler::on_accelerated_paint` 接收 CEF NT 共享句柄，经 `ID3D11Device1::OpenSharedResource1` 与 `IDXGIKeyedMutex` 在 4 槽位设备纹理池间完成同步拷贝，并通过本地补丁（`patches/gpui-pre` / `patches/gpui-pre-windows`）直接将 `ID3D11ShaderResourceView` 绑定到 GPUI `DirectXRenderer` 绘制。**全程无 CPU 像素回读（Readback）、无 `RenderImage` 二次上传。**
+- **GPU 表面变换与采样控制**：由 `patches/gpui-pre` 与 `patches/gpui-pre-windows`（`shaders.hlsl` / `directx_renderer.rs`）原生支持表面任意角度旋转（`Angle`，`-180°..+180°`）、图层透明度（`Opacity`）以及 `Linear` / `NearestNeighbor` 缩放采样模式切换。
 - **显式软件回退**：保留基于 `OnPaint` 的 CPU 像素传输路径（`BackendRequirement::SoftwareRequired`），便于兼容测试或无硬件共享纹理环境。
 
 ### 2. 低延迟 DXGI 呈现与高刷交互链路
@@ -37,16 +38,19 @@
 | --- | --- | --- |
 | GPUI 控件叠层（浮层 / 圆角 / 弹窗 / 自绘菜单） | 完整支持 GPUI 场景合成与透明叠层 | 受 **Win32 子窗口 Airspace** 限制，不可在其上叠画 GPUI 元素 |
 | 渲染管线 | `OnAcceleratedPaint` → D3D11 SRV 直绘 GPUI（或 `OnPaint` 回退） | Chromium 原生 HWND SwapChain 直出 |
-| 右键菜单 / DevTools | Win32 `#32768` 原生菜单桥接 + 受管离线 DevTools | Chromium 原生子窗口上下文能力 + 受管生命周期 |
+| 右键菜单 / DevTools | 默认使用 CEF 原生右键菜单，可按需开启 Win32 `#32768` / GPUI 菜单桥接（`--context-menu true`）+ 受管离线 DevTools | Chromium 原生子窗口上下文能力 + 受管生命周期 |
 | IME / 光标 / 拖放 | IMM32 + 临时系统 Caret；`OnCursorChange` 含自定义位图光标；异步 OLE 外拖与 `IDropTarget` 入站拖放 | Win32 原生子窗口直接托管 |
 | 典型场景 | 现代化自绘桌面壳、浏览器与 GPUI 混合界面 | 纯网页区域、无需 GPUI 叠层的极简内嵌宿主 |
 
 ### 5. 完整组件能力一览
 - **运行时与调度**：支持 `Integrated` 与 `Threaded` 双线程模型、多浏览器实例隔离（每实例独立 `Client` / 视口 / 帧槽）、`Memory` / `Persistent` Profile 与可控租约、Renderer 崩溃/挂起诊断事件与恢复提示。
-- **桌面交互与导航**：导航历史与加载进度、音频静音、快捷键拦截（`on_pre_key_event`）、Page Find 有界串行查找、View Source、系统标准光标（21 种）及 ≤256px 自定义位图光标（`OnCursorChange`）、多点触控（`BrowserTouchEvent` / `WM_POINTER*`）与触控板捏合缩放、`accesskit` UIA 无障碍树投影。
+- **完整 Per-View 事件回调体系**（`crates/rust-cef-gpui/src/events.rs`）：`CefBrowser` 与 `NativeCefBrowser` 共享统一的加载生命周期（`LoadingStateChange`、`LoadStartInfo`、`LoadEndInfo`、`LoadErrorInfo`）、导航请求（`NavigationRequestEvent`）、标题/地址/状态/控制台（`ConsoleMessageInfo`）、Tooltip、光标变更、`-webkit-app-region` 拖拽区、Frame 与 V8 Context 生命周期（`FrameAttachedInfo`、`FrameDetachedInfo`、`MainFrameChangedInfo`、`V8ContextLifecycleInfo`）、未捕获 JS 异常、焦点 DOM 节点、`BeforeUnloadInfo`、`RendererTerminatedInfo`、`AutoResizeInfo`、`MediaAccessInfo` 与资源响应观测等逐视图回调。
+- **受管原生子弹窗（`PopupLedger` / `PopupClient`）**（`crates/rust-cef-runtime/src/popup_window.rs`）：支持策略受限的原生产生子窗口，受 `TrustedContentPolicy` 约束并在父 Browser 关闭或 Runtime 退出前自动回收。
+- **扩展 CEF Handler 与流式响应重写**：通过 `crates/rust-cef-runtime/src/client_handlers.rs` 提供 `DragHandler`、`FrameHandler` 与可选 `AudioHandler`；支持 `ResourceInterceptor`、`ResponseBodyFilter` 流式响应体替换、`LoadUrlWithPostData` 以及 `ExecuteJavascript` / `EvaluateScript` 异步脚本求值。
+- **桌面交互与导航**：导航历史与加载进度、音频静音、快捷键拦截（`on_pre_key_event`）、Page Find 有界串行查找、View Source、系统标准光标（21 种）及 ≤256px 自定义位图光标（`OnCursorChange`）、多点触控（`BrowserTouchEvent` / `WM_POINTER*`）与触控板捏合缩放、`accesskit` UIA 无障碍树投影；并提供交互式 GPUI 文本输入组件（`src/cef_example/text_input.rs`，支持光标闪烁、聚焦动效、鼠标拖选与双三击选词、撤销/剪贴板及 Win32 IME `EntityInputHandler`），同时复用于 `gpui-cef-example` 与 `component-demo` 多标签壳。
 - **原生拖放**：默认 `OutboundDragPolicy::Deny`；Opt-in `AllowAsync` 支持基于零新增依赖 COM 虚表的异步 OLE `DoDragDrop`（含虚拟图像拖出）；通过 `IDropTarget` + `IDropTargetHelper` 支持外部文件、URL、纯文本及 HTML 入站与页内拖放。
 - **安全边界与扩展能力**：
-  - `TrustedContentPolicy`、`ResourceInterceptor`、受限 `app://` 自定义 Scheme 与冻结只读 `window.rustCef` JS 桥接（256 KiB / 32 层深度边界）；
+  - `TrustedContentPolicy`、`ResourceInterceptor`、受限 `app://` / `custom://` Scheme 与冻结只读 `window.rustCef` JS 桥接（256 KiB / 32 层深度边界）；
   - 可插拔宿主能力（下载管控、JS/文件对话框、权限请求、托管弹窗、禁用内置登录框的 HTTP 401 Basic Auth、TLS 证书确认）；
   - `CookieManager`、`PrintConfirmation` / `PrintToPdf`、独立 `CefURLRequest`、默认关闭且受管释放的无头 CDP。
 
@@ -55,16 +59,16 @@
 ## 分层架构与仓库结构
 
 ```text
-  Host Applications (examples/bing_cn.rs · src/component_demo/)
+  Host Applications (src/cef_example/ · examples/bing_cn.rs · src/component_demo/)
                                 │
                                 ▼
-  crates/rust-cef-gpui          GPUI 视图适配器 (CefBrowser / NativeCefBrowser / ZoomGate / OLE / IME)
-       ▲                        └── patches/gpui-pre, patches/gpui-pre-windows (D3D11 SRV 直绘 & DXGI 调优)
+  crates/rust-cef-gpui          GPUI 视图适配器 (CefBrowser / NativeCefBrowser / ZoomGate / OLE / IME / Events)
+       ▲                        └── patches/gpui-pre, patches/gpui-pre-windows (D3D11 SRV 直绘 · 旋转透明度采样 · DXGI 调优)
        │
   crates/rust-cef-ui            UI 框架无关渲染管线、输入通道与菜单端口 (SurfacePipeline / NativeSlotController)
        ▲
        │
-  crates/rust-cef-runtime       CEF 156.0.31 原生宿主、D3D11/CPU 采集、Win32 菜单宿主、策略与受管 DevTools
+  crates/rust-cef-runtime       CEF 156.0.31 原生宿主、D3D11/CPU 采集、Win32 菜单宿主、策略、扩展 Handler 与受管弹窗/DevTools
        ▲                        └── crates/rust-cef-helper (独立零 GPUI 子进程 + PerMonitorV2 清单)
        │
   crates/rust-cef-core          纯 std 核心契约、会话/Profile 状态机、帧邮箱、键位/滚轮模型、光标与拖放契约
@@ -73,14 +77,15 @@
 | 目录 / 文件 | 说明 |
 | --- | --- |
 | [`crates/rust-cef-core`](crates/rust-cef-core) | 零外部依赖纯 `std` 核心契约层 |
-| [`crates/rust-cef-runtime`](crates/rust-cef-runtime) | CEF `156.0.31` 原生运行时、D3D11/CPU OSR 采集、Alloy 子窗口、Win32 原生菜单与探针 |
+| [`crates/rust-cef-runtime`](crates/rust-cef-runtime) | CEF `156.0.31` 原生运行时、D3D11/CPU OSR 采集、Alloy 子窗口、扩展 Handler（`client_handlers.rs`）、受管子弹窗（`popup_window.rs`）与 Win32 菜单桥接 |
 | [`crates/rust-cef-helper`](crates/rust-cef-helper) | 独立 CEF 子进程可执行文件，通过 `build.rs` 嵌入 Win10/11 兼容与 `PerMonitorV2` 清单 |
 | [`crates/rust-cef-ui`](crates/rust-cef-ui) | UI 无关表面管线、原生窗口槽位与输入投影层 |
-| [`crates/rust-cef-gpui`](crates/rust-cef-gpui) | GPUI 视图集成层（`CefBrowser`、`NativeCefBrowser`、`UiComposition`、`DefaultMenuPresenter`） |
-| [`patches/gpui-pre`](patches/gpui-pre) / [`patches/gpui-pre-windows`](patches/gpui-pre-windows) | 本地 GPUI 补丁：外部 D3D11 SRV 表面直绘、`FLIP_DISCARD`、帧延迟 `MaximumFrameLatency=1` 等 |
-| [`examples/bing_cn.rs`](examples/bing_cn.rs) | 独立在线浏览示例（默认 D3D11 零拷贝 OSR，可选 `-NativeHwnd` 与 `-SelfTestOsr`） |
-| [`src/component_demo`](src/component_demo) | 公开组件演示宿主与多标签桌面壳（`gpui-cef-component-demo`） |
-| [`scripts/`](scripts) | Windows 构建、CEF 导出、独立发行打包与自动化验证脚本 |
+| [`crates/rust-cef-gpui`](crates/rust-cef-gpui) | GPUI 视图集成层（`CefBrowser`、`NativeCefBrowser`、统一逐视图事件回调 `events.rs`、`UiComposition`、`DefaultMenuPresenter`） |
+| [`patches/gpui-pre`](patches/gpui-pre) / [`patches/gpui-pre-windows`](patches/gpui-pre-windows) | 本地 GPUI 补丁：外部 D3D11 SRV 表面直绘、`Angle` / `Opacity` / 采样模式、`FLIP_DISCARD`、帧延迟 `MaximumFrameLatency=1` 等 |
+| [`src/cef_example`](src/cef_example) / [`src/bin/cef-example.rs`](src/bin/cef-example.rs) | 全功能桌面浏览器示例（`gpui-cef-example`）：多标签、GPU 旋转/透明度/采样面板、JS 执行/求值、自定义 Scheme、流式响应过滤、PDF/下载、基准自测与交互式 GPUI 文本输入 |
+| [`examples/bing_cn.rs`](examples/bing_cn.rs) | 轻量在线浏览示例（默认 D3D11 零拷贝 OSR，可选 `-NativeHwnd`、`-SelfTestOsr` 与 `-SelfTestOsrDnd`） |
+| [`src/component_demo`](src/component_demo) | 公开组件演示宿主与多标签桌面壳（`gpui-cef-component-demo`，支持 `--cef-example true`） |
+| [`scripts/`](scripts) | Windows 构建、示例启动（`run-example.ps1` / `run-bing.ps1`）、独立发行打包与自动化验证脚本 |
 | [`docs/`](docs) | [架构设计](docs/architecture.md)、[组件视图接入](docs/component-view.md)、[发行契约](docs/component-deployment.md)、[目录说明](docs/project-structure.md)、[验证记录](docs/validation.md) |
 
 ---
@@ -94,7 +99,36 @@
 - **Git**（首次构建需拉取 `cef-rs` 及导出 Windows x64 CEF `156.0.31` 运行时至 `.cef/156.0.31_windows_x86_64`，需预留数 GB 磁盘空间）
 - **fxc.exe**（仅 `-Release` 构建需要；若脚本未自动定位，可设置 `$env:GPUI_FXC_PATH`）
 
-### 1. 运行交互式浏览器示例（`examples/bing_cn.rs`）
+### 1. 运行全功能桌面浏览器示例（`gpui-cef-example`）
+
+在仓库根目录的 PowerShell（5.1 或 7+）中执行 [`scripts/run-example.ps1`](scripts/run-example.ps1)（自动编译 `gpui-cef-example` 与 `rust-cef-helper`、打包至独立 bundle 目录并启动；支持多标签、GPU 旋转/透明度/采样模式面板、JS 执行/异步求值、`custom://cefsharp/` 自定义 Scheme、`ResponseBodyFilter` 流式过滤、下载/PDF 导出与内置基准自测页）：
+
+```powershell
+# 默认以 D3D11 零拷贝 OSR + Threaded + CEF 原生右键菜单启动（可仅加 -BuildOnly 构建打包）
+.\scripts\run-example.ps1
+
+# 以 Release 构建并运行（推荐日常交互体验）
+.\scripts\run-example.ps1 -Release
+
+# 切换为原生 Win32 子 HWND 后端或 OSR 软件渲染
+.\scripts\run-example.ps1 -NativeHwnd
+.\scripts\run-example.ps1 -Backend Software
+
+# 启用 GPUI 自定义菜单桥接或指定启动 URL
+.\scripts\run-example.ps1 -ContextMenu -Url https://cn.bing.com
+
+# 运行自动化 3 标签冒烟自测（含 GPU 变换、JS 求值、ResponseFilter 与 BenchmarkSuite）
+.\scripts\run-example.ps1 -Release -SmokeSeconds 8
+```
+
+打包完成后，也可直接运行离线 bundle 中的 `gpui-cef-example.exe`（零参数即可启动，自动识别同目录 CEF 运行时与 `rust-cef-helper.exe`）：
+
+```powershell
+& 'E:\cargo-target\gpui-cef-poc\component-bundles\cef-example-release\gpui-cef-example.exe'
+# 可选 CLI 参数: [--host-mode osr|native-hwnd] [--backend D3d11|Software] [--mode Threaded|Integrated] [--context-menu true|false] [--url <url>] [--smoke-ms 100..30000]
+```
+
+### 2. 运行在线浏览示例（`examples/bing_cn.rs`）
 
 在仓库根目录的 PowerShell（5.1 或 7+）中执行：
 
@@ -110,9 +144,10 @@
 
 # 运行完整 OSR 自动化自测（菜单/工具提示/输入/拖放/光标/DevTools/Resize）
 .\scripts\run-bing.ps1 -SelfTestOsr
+.\scripts\run-bing.ps1 -SelfTestOsrDnd
 ```
 
-### 2. 运行组件演示宿主与多标签桌面壳（`gpui-cef-component-demo`）
+### 3. 运行组件演示宿主与多标签桌面壳（`gpui-cef-component-demo`）
 
 ```powershell
 # 默认以 Threaded 模式启动离线演示窗口
@@ -129,7 +164,7 @@
 .\scripts\build.ps1
 .\scripts\run.ps1 -Release -BuildOnly
 
-# 手动运行已打包的组件演示宿主（支持 --ux-controls / --browser-shell / --host-mode）
+# 手动运行已打包的组件演示宿主（支持 --ux-controls / --browser-shell / --cef-example / --host-mode）
 & 'E:\cargo-target\gpui-cef-poc\component-bundles\component-demo-debug\gpui-cef-component-demo.exe' `
     --bundle 'E:\cargo-target\gpui-cef-poc\component-bundles\component-demo-debug' `
     --helper 'E:\cargo-target\gpui-cef-poc\component-bundles\component-demo-debug\rust-cef-helper.exe' `
@@ -158,8 +193,8 @@ cargo test --locked -p rust-cef-gpui --lib
 # Runtime 快速输入 / 缩放合并队列等核心单测
 cargo test --locked -p rust-cef-runtime --lib fast_
 
-# 多标签 Shell 单测
-cargo test --locked --bin gpui-cef-component-demo -- shell::tests
+# 桌面示例与组件演示宿主单测
+cargo test --locked --bin gpui-cef-example --bin gpui-cef-component-demo --features component-demo
 
 # 脚本化格式与核心检查（不编译 GUI）
 .\scripts\check.ps1
@@ -168,6 +203,9 @@ cargo test --locked --bin gpui-cef-component-demo -- shell::tests
 ### 集成与发行级验证（PowerShell 7）
 
 ```powershell
+# 全功能桌面示例 Release 自动化冒烟自测
+pwsh -NoProfile -File scripts/run-example.ps1 -Release -SmokeSeconds 8
+
 # 完整四模式组合被动冒烟（Integrated/Threaded × Software/D3d11）与原生菜单探针
 pwsh -NoProfile -File scripts/test-component-demo.ps1
 pwsh -NoProfile -File scripts/test-component-demo.ps1 -Release -ReleasePathGuards

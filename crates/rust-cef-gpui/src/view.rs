@@ -53,12 +53,13 @@ use image::{Frame, ImageBuffer, Rgba};
 use rust_cef_core::{
     accessibility::AxTreeSnapshot,
     contracts::{
-        BrowserCursor, BrowserId, CefFeatureState, MAX_FAVICON_URL_BYTES, MAX_FAVICON_URLS,
-        MAX_STATUS_MESSAGE_BYTES, MAX_TOOLTIP_BYTES, MAX_ZOOM_LEVEL, MIN_ZOOM_LEVEL,
-        NavigationSnapshot, RendererState, SessionState, ShortcutId, Viewport,
+        BrowserCursor, BrowserId, CefFeatureState, DraggableRegionRect, MAX_FAVICON_URL_BYTES,
+        MAX_FAVICON_URLS, MAX_STATUS_MESSAGE_BYTES, MAX_TOOLTIP_BYTES, MAX_ZOOM_LEVEL,
+        MIN_ZOOM_LEVEL, NavigationSnapshot, RendererState, SessionState, ShortcutId, Viewport,
         step_canonical_zoom_level, truncate_utf8_bytes, zoom_level_to_milli,
     },
     file_drop::{FileDragPhase, FileDropPaths},
+    host_capabilities::PopupRequest,
     frame_budget::FrameError,
     input::{
         BrowserTouchEvent, InputKind, InputResetReason, MAX_INPUT_RANGE_UTF16,
@@ -67,7 +68,7 @@ use rust_cef_core::{
     js_bridge::{EvalOutcome, EvalRequestId, JsFrameScope},
     keymap,
     mailbox::{FrameUpdate, SurfaceSnapshot},
-    outbound_drag::{OutboundDragFinish, OutboundDragStart},
+    outbound_drag::{DragOperationMask, OsrDragFinish, OutboundDragFinish, OutboundDragStart},
     ports::{
         BrowserCommand, BrowserEvent, BrowserHandle, CloseMode, CommandId, EngineError, FrameInfo,
         FramePayload, FrameSource, ImeGeometry, MouseModifiers, OwnedFrame, PixelFormat,
@@ -79,6 +80,7 @@ use smallvec::smallvec;
 use crate::{
     BrowserAttachment,
     binding::{BindingError, PaintStamp, WindowToken},
+    events::{BrowserViewCallbacks, dispatch_single_view_event},
     input::{
         ClickGesture, InputAdmission, InputCallback, InputCallbackGate, InputDiagnostics,
         InputLane, MirrorEffect,
@@ -348,6 +350,92 @@ struct PaintFrame {
     stamp: PaintStamp,
 }
 
+struct ActiveCefDrag {
+    drag_id: rust_cef_core::outbound_drag::DragSessionId,
+    allowed_ops: DragOperationMask,
+    current_op: DragOperationMask,
+    in_view: bool,
+    cursor_win_dip: (f32, f32),
+    last_view_point: (i32, i32),
+    preview_image: Option<Arc<RenderImage>>,
+    preview_size_dip: (f32, f32),
+    hotspot_dip: (f32, f32),
+    fallback_label: Option<String>,
+}
+
+struct DragPaintOverlay {
+    cursor_win_dip: (f32, f32),
+    preview_image: Arc<RenderImage>,
+    preview_size_dip: (f32, f32),
+    hotspot_dip: (f32, f32),
+}
+
+fn drag_cursor_style(op: DragOperationMask) -> CursorStyle {
+    if op == DragOperationMask::NONE {
+        return CursorStyle::OperationNotAllowed;
+    }
+    let preferred = op.preferred_single_op();
+    if preferred == DragOperationMask::LINK {
+        CursorStyle::DragLink
+    } else if preferred == DragOperationMask::MOVE {
+        CursorStyle::ClosedHand
+    } else {
+        CursorStyle::DragCopy
+    }
+}
+
+fn drag_preview_from_start(
+    start: &OutboundDragStart,
+    window_scale: f32,
+) -> (Option<Arc<RenderImage>>, (f32, f32), (f32, f32), Option<String>) {
+    if let Some(img) = &start.payload.image {
+        let mut premul = img.bgra.clone();
+        // GPUI's DirectX atlas uses PremultipliedBgra8; apply slight ghost
+        // translucency while premultiplying from CEF's POSTMULTIPLIED bitmap.
+        for px in premul.chunks_exact_mut(4) {
+            let eff_a = (u32::from(px[3]) * 224 + 127) / 255;
+            px[0] = ((u32::from(px[0]) * eff_a + 127) / 255) as u8;
+            px[1] = ((u32::from(px[1]) * eff_a + 127) / 255) as u8;
+            px[2] = ((u32::from(px[2]) * eff_a + 127) / 255) as u8;
+            px[3] = eff_a as u8;
+        }
+        if let Some(buffer) = ImageBuffer::<Rgba<u8>, Vec<u8>>::from_raw(img.width, img.height, premul)
+        {
+            let scale = if img.scale_milli > 0 {
+                img.scale_milli as f32 / 1000.0
+            } else {
+                window_scale.max(1.0)
+            };
+            let size_dip = (img.width as f32 / scale, img.height as f32 / scale);
+            let hotspot_dip = (img.hotspot_x as f32 / scale, img.hotspot_y as f32 / scale);
+            return (
+                Some(Arc::new(RenderImage::new(smallvec![Frame::new(buffer)]))),
+                size_dip,
+                hotspot_dip,
+                None,
+            );
+        }
+    }
+    let fallback = start
+        .payload
+        .url
+        .as_deref()
+        .or(start.payload.text.as_deref())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            let mut out = String::new();
+            for ch in s.chars().take(48) {
+                out.push(ch);
+            }
+            if s.chars().count() > 48 {
+                out.push_str("...");
+            }
+            out
+        });
+    (None, (0.0, 0.0), (0.0, 0.0), fallback)
+}
+
 /// Explicit total mapping from UI-agnostic [`BrowserCursor`] to [`CursorStyle`].
 /// Every standard GPUI variant maps 1-to-1; custom cursors fall back to `Arrow`.
 pub fn cursor_style_for(cursor: BrowserCursor) -> CursorStyle {
@@ -379,6 +467,13 @@ pub fn cursor_style_for(cursor: BrowserCursor) -> CursorStyle {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ViewUxState {
+    pub(crate) address: String,
+    pub(crate) title: String,
+    pub(crate) is_loading: bool,
+    pub(crate) can_go_back: bool,
+    pub(crate) can_go_forward: bool,
+    pub(crate) main_http_status: Option<i32>,
+    pub(crate) last_main_frame_error: Option<i32>,
     pub(crate) cursor: BrowserCursor,
     pub(crate) tooltip: String,
     pub(crate) status_text: String,
@@ -387,10 +482,18 @@ pub(crate) struct ViewUxState {
     pub(crate) loading_progress_per_mille: u16,
     pub(crate) zoom_level_milli: i32,
     pub(crate) audio_muted: bool,
+    pub(crate) draggable_regions: Vec<DraggableRegionRect>,
 }
 
 impl ViewUxState {
     pub(crate) fn apply_snapshot(&mut self, nav: &NavigationSnapshot) {
+        self.address.clone_from(&nav.address);
+        self.title.clone_from(&nav.title);
+        self.is_loading = nav.is_loading;
+        self.can_go_back = nav.can_go_back;
+        self.can_go_forward = nav.can_go_forward;
+        self.main_http_status = nav.main_http_status;
+        self.last_main_frame_error = nav.last_main_frame_error;
         self.cursor = nav.cursor;
         self.tooltip = truncate_utf8_bytes(&nav.tooltip, MAX_TOOLTIP_BYTES);
         self.status_text = truncate_utf8_bytes(&nav.status_message, MAX_STATUS_MESSAGE_BYTES);
@@ -437,6 +540,20 @@ impl ViewUxState {
         }
         (None, None)
     }
+}
+
+pub(crate) fn clear_routing_and_filters(handle: &BrowserHandle) {
+    handle.set_popup_ui_listener_active(false);
+    handle.set_extended_event_mask(0);
+    handle.set_popup_filter(None);
+    handle.set_navigation_filter(None);
+    handle.set_drag_enter_filter(None);
+    handle.set_focus_filter(None);
+    handle.set_pre_key_filter(None);
+    handle.set_key_event_filter(None);
+    handle.set_protocol_execution_filter(None);
+    handle.set_browser_host_capabilities(None);
+    handle.set_browser_resource_interceptor(None);
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -589,6 +706,10 @@ pub type OutboundDragCallback = Box<
         &mut Context<CefBrowser>,
     ) -> Option<OutboundDragFinish>,
 >;
+pub type PopupCallback =
+    Box<dyn FnMut(PopupRequest, &mut CefBrowser, &mut Window, &mut Context<CefBrowser>)>;
+pub type NavigationCallback =
+    Box<dyn FnMut(String, &mut CefBrowser, &mut Window, &mut Context<CefBrowser>)>;
 
 /// GPUI view over one attached CEF Browser VIEW surface.
 pub struct CefBrowser {
@@ -637,6 +758,7 @@ pub struct CefBrowser {
     sent_viewport: Rc<Cell<Option<Viewport>>>,
     in_flight_viewport: Rc<Cell<Option<(Viewport, std::time::Instant)>>>,
     sent_screen_origin: Rc<Cell<Option<(i32, i32)>>>,
+    sent_client_offset: Rc<Cell<Option<(f32, f32)>>>,
     minimized_hidden: Rc<Cell<bool>>,
     drop_surface_geometry: Rc<Cell<(f32, f32, f32, f32, f32)>>,
     /// Finite release, close, activation and bounds observers, all owned here.
@@ -649,9 +771,18 @@ pub struct CefBrowser {
     outbound_drag_pump: Option<crate::ole_drag::IntegratedPumpCallback>,
     outbound_drag_task: Option<gpui::Task<()>>,
     on_outbound_drag: Option<OutboundDragCallback>,
+    active_drag: Option<ActiveCefDrag>,
+    active_drag_flag: Rc<Cell<bool>>,
+    left_mouse_down: bool,
+    last_pointer_win_dip: Option<(f32, f32)>,
     ax_snapshot: Option<AxTreeSnapshot>,
     pinch_zoom_enabled: bool,
     ctrl_wheel_zoom_enabled: bool,
+    surface_opacity: f32,
+    rotation_angle_deg: f32,
+    nearest_neighbor_scaling: bool,
+    fit_rotated_to_bounds: bool,
+    transparent_backdrop: bool,
     scroll_accumulator: keymap::ScrollWheelAccumulator,
     ctrl_wheel_zoom_notches: f32,
     ctrl_wheel_last_at: Option<Instant>,
@@ -664,11 +795,19 @@ pub struct CefBrowser {
     on_shortcut: Option<ShortcutCallback>,
     on_js_message: Option<JsMessageCallback>,
     on_eval_completed: Option<EvalCompletedCallback>,
+    on_popup: Option<PopupCallback>,
+    on_popup_epoch: u64,
+    on_address_changed: Option<NavigationCallback>,
+    on_address_epoch: u64,
+    callbacks: BrowserViewCallbacks<Self>,
     hwnd_raw: Option<isize>,
     native_cursor_revision: u64,
     native_cursor: rust_cef_core::cursor::NativeCursorData,
     pointer_over_surface: bool,
+    right_mouse_down: bool,
 }
+
+const NATIVE_CONTEXT_MENU_REOPEN_WINDOW: Duration = Duration::from_millis(400);
 
 impl CefBrowser {
     /// Builds the view in an existing GPUI window.
@@ -701,6 +840,7 @@ impl CefBrowser {
         let sent_viewport = Rc::new(Cell::new(None));
         let in_flight_viewport = Rc::new(Cell::new(None));
         let sent_screen_origin = Rc::new(Cell::new(None));
+        let sent_client_offset = Rc::new(Cell::new(None));
         let minimized_hidden = Rc::new(Cell::new(false));
         let drop_surface_geometry = Rc::new(Cell::new((0.0, 0.0, 0.0, 0.0, scale_factor)));
         let paint = Rc::new(RefCell::new(PaintDiagnostics {
@@ -764,6 +904,7 @@ impl CefBrowser {
             sent_viewport,
             in_flight_viewport,
             sent_screen_origin,
+            sent_client_offset,
             minimized_hidden,
             drop_surface_geometry,
             subscriptions: [None, None, None, None, None, None],
@@ -773,9 +914,18 @@ impl CefBrowser {
             outbound_drag_pump: None,
             outbound_drag_task: None,
             on_outbound_drag: None,
+            active_drag: None,
+            active_drag_flag: Rc::new(Cell::new(false)),
+            left_mouse_down: false,
+            last_pointer_win_dip: None,
             ax_snapshot: initial_ax_snapshot,
             pinch_zoom_enabled: false,
             ctrl_wheel_zoom_enabled: false,
+            surface_opacity: 1.0,
+            rotation_angle_deg: 0.0,
+            nearest_neighbor_scaling: false,
+            fit_rotated_to_bounds: true,
+            transparent_backdrop: false,
             scroll_accumulator: keymap::ScrollWheelAccumulator::default(),
             ctrl_wheel_zoom_notches: 0.0,
             ctrl_wheel_last_at: None,
@@ -788,10 +938,16 @@ impl CefBrowser {
             on_shortcut: None,
             on_js_message: None,
             on_eval_completed: None,
+            on_popup: None,
+            on_popup_epoch: 0,
+            on_address_changed: None,
+            on_address_epoch: 0,
+            callbacks: BrowserViewCallbacks::default(),
             hwnd_raw,
             native_cursor_revision: 0,
             native_cursor: rust_cef_core::cursor::NativeCursorData::default(),
             pointer_over_surface: false,
+            right_mouse_down: false,
         });
 
         // Release runs while the entity still exists but before it is dropped.
@@ -814,6 +970,7 @@ impl CefBrowser {
             close_ax_tree.clear();
             if close_view
                 .update(app, |view, _| {
+                    view.clear_callbacks_and_filters();
                     view.cancel_outbound_drags();
                     view.ax_snapshot = None;
                     view.reset_input(InputResetReason::Closing);
@@ -827,17 +984,39 @@ impl CefBrowser {
                     .borrow_mut()
                     .abandon(&close_handle, InputResetReason::Closing);
             }
+            clear_routing_and_filters(&close_handle);
             close_handle.request_close(CloseMode::Graceful);
         });
         crate::native_view::install_smooth_resize_hook(window);
         view.update(cx, move |view, cx| {
+            crate::native_view::register_sizemove_source(
+                window,
+                surface_cursor_key(view.browser),
+                std::sync::Arc::downgrade(view.attachment.frame_source()),
+            );
             let activation = cx.observe_window_activation(window, |view, window, cx| {
                 if !crate::native_view::is_window_effectively_active(window) {
+                    if view.active_drag.is_some() {
+                        view.finish_active_osr_drag(
+                            window.mouse_position(),
+                            gpui::Modifiers::default(),
+                            true,
+                            window,
+                            cx,
+                        );
+                    }
+                    view.left_mouse_down = false;
                     if let Some(b) = crate::menu::project(&view.menu) {
                         b.readiness(false);
                     }
-                    view.reset_input(InputResetReason::FocusLost);
-                    view.was_focused = false;
+                    if view.attachment.native_context_menu().is_open() {
+                        view.cef_focus_accepted.set(false);
+                        view.right_mouse_down = false;
+                        view.was_focused = false;
+                    } else {
+                        view.reset_input(InputResetReason::FocusLost);
+                        view.was_focused = false;
+                    }
                     cx.notify();
                 } else {
                     view.ime_request = None;
@@ -878,7 +1057,7 @@ impl CefBrowser {
                             crate::native_view::window_client_screen_origin(window)
                     {
                         let (sx, sy, _, _) = view.paint.borrow().surface_bounds;
-                        let scale = view.paint.borrow().scale_factor;
+                        let scale = window.scale_factor();
                         let origin = (
                             cx_px.saturating_add((sx * scale).round() as i32),
                             cy_px.saturating_add((sy * scale).round() as i32),
@@ -904,7 +1083,7 @@ impl CefBrowser {
                         view.ime_request = None;
                         view.refresh_ime(window, cx);
                     }
-                    cx.notify();
+                    let _ = view.consume(window, cx);
                 }
             });
             let focus = view.focus.clone();
@@ -1089,6 +1268,7 @@ impl CefBrowser {
         self.sync_focus(window, cx);
         self.sync_ux(window, cx);
         self.sync_js(window, cx);
+        self.sync_view_events(window, cx);
         // IME state has its own owned snapshot/wake, including Threaded mode
         // with no new frame and no manual pump.
         self.refresh_ime(window, cx);
@@ -1304,6 +1484,54 @@ impl CefBrowser {
 
     pub fn audio_muted(&self) -> bool {
         self.ux.audio_muted
+    }
+
+    pub fn has_active_drag(&self) -> bool {
+        self.active_drag.is_some()
+    }
+
+    pub fn active_drag_cursor_op(&self) -> Option<DragOperationMask> {
+        self.active_drag.as_ref().map(|d| d.current_op)
+    }
+
+    pub fn has_active_drag_preview(&self) -> bool {
+        self.active_drag
+            .as_ref()
+            .is_some_and(|d| d.preview_image.is_some() || d.fallback_label.is_some())
+    }
+
+    pub fn is_left_mouse_down(&self) -> bool {
+        self.left_mouse_down
+    }
+
+    pub fn handle(&self) -> &BrowserHandle {
+        self.attachment.handle()
+    }
+
+    fn clear_callbacks_and_filters(&mut self) {
+        self.on_take_focus = None;
+        self.on_shortcut = None;
+        self.on_js_message = None;
+        self.on_eval_completed = None;
+        self.set_on_popup(None);
+        self.set_on_address_changed(None);
+        self.callbacks.clear_all();
+        clear_routing_and_filters(self.attachment.handle());
+    }
+
+    crate::events::impl_view_surface_api!();
+
+    pub fn set_on_popup(&mut self, handler: Option<PopupCallback>) {
+        self.on_popup_epoch = self.on_popup_epoch.wrapping_add(1);
+        self.attachment
+            .handle()
+            .set_popup_ui_listener_active(handler.is_some());
+        self.on_popup = handler;
+    }
+
+    pub fn set_on_address_changed(&mut self, handler: Option<NavigationCallback>) {
+        self.on_address_epoch = self.on_address_epoch.wrapping_add(1);
+        self.on_address_changed = handler;
     }
 
     pub fn set_on_take_focus(&mut self, handler: Option<TakeFocusCallback>) {
@@ -1595,6 +1823,64 @@ impl CefBrowser {
         self.ctrl_wheel_zoom_enabled
     }
 
+    pub fn set_surface_opacity(&mut self, opacity: f32) {
+        self.surface_opacity = if opacity.is_finite() {
+            opacity.clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+    }
+
+    pub fn surface_opacity(&self) -> f32 {
+        self.surface_opacity
+    }
+
+    pub fn set_rotation_angle_deg(&mut self, degrees: f32) {
+        self.rotation_angle_deg = if degrees.is_finite() {
+            degrees.clamp(-180.0, 180.0)
+        } else {
+            0.0
+        };
+    }
+
+    pub fn rotation_angle_deg(&self) -> f32 {
+        self.rotation_angle_deg
+    }
+
+    pub fn set_nearest_neighbor_scaling(&mut self, nearest: bool) {
+        self.nearest_neighbor_scaling = nearest;
+    }
+
+    pub fn nearest_neighbor_scaling(&self) -> bool {
+        self.nearest_neighbor_scaling
+    }
+
+    pub fn set_fit_rotated_to_bounds(&mut self, fit: bool) {
+        self.fit_rotated_to_bounds = fit;
+    }
+
+    pub fn fit_rotated_to_bounds(&self) -> bool {
+        self.fit_rotated_to_bounds
+    }
+
+    pub fn set_transparent_backdrop(&mut self, transparent: bool) {
+        self.transparent_backdrop = transparent;
+    }
+
+    pub fn transparent_backdrop(&self) -> bool {
+        self.transparent_backdrop
+    }
+
+    pub fn hit_test_surface_point(&self, position_dip: (f32, f32)) -> Option<(i32, i32)> {
+        translate_point_transformed(
+            self.paint.borrow().surface_bounds,
+            position_dip,
+            self.rotation_angle_deg,
+            self.fit_rotated_to_bounds,
+            false,
+        )
+    }
+
     pub fn send_touch_event(&mut self, event: BrowserTouchEvent) -> Result<CommandId, ViewError> {
         self.check_live()?;
         let event = event.validate_and_normalize().map_err(ViewError::Input)?;
@@ -1604,8 +1890,106 @@ impl CefBrowser {
             .map_err(ViewError::Input)
     }
 
+    fn cancel_active_osr_drag_without_window(&mut self) -> Option<Arc<RenderImage>> {
+        self.left_mouse_down = false;
+        self.active_drag_flag.set(false);
+        let Some(mut drag) = self.active_drag.take() else {
+            return None;
+        };
+        let _ = self.outbound_drag.finish_in_flight(
+            drag.drag_id,
+            drag.last_view_point.0,
+            drag.last_view_point.1,
+            DragOperationMask::NONE,
+        );
+        let _ = self
+            .attachment
+            .handle()
+            .submit(BrowserCommand::FinishOsrDrag(OsrDragFinish {
+                drag_id: drag.drag_id,
+                x: drag.last_view_point.0,
+                y: drag.last_view_point.1,
+                modifiers: MouseModifiers::default(),
+                allow_drop: false,
+            }));
+        drag.preview_image.take()
+    }
+
+    fn finish_active_osr_drag(
+        &mut self,
+        position: Point<Pixels>,
+        modifiers: gpui::Modifiers,
+        cancelled: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.left_mouse_down = false;
+        self.active_drag_flag.set(false);
+        let Some(mut drag) = self.active_drag.take() else {
+            return;
+        };
+        let inside_point = self.point(position, false);
+        let (vx, vy) = inside_point
+            .or_else(|| self.point(position, true))
+            .unwrap_or(drag.last_view_point);
+        let allow_drop =
+            !cancelled && inside_point.is_some() && drag.current_op != DragOperationMask::NONE;
+        let final_op = if allow_drop {
+            drag.current_op.preferred_single_op()
+        } else {
+            DragOperationMask::NONE
+        };
+        let _ = self
+            .outbound_drag
+            .finish_in_flight(drag.drag_id, vx, vy, final_op);
+        let _ = self
+            .attachment
+            .handle()
+            .submit(BrowserCommand::FinishOsrDrag(OsrDragFinish {
+                drag_id: drag.drag_id,
+                x: vx,
+                y: vy,
+                modifiers: mouse_modifiers(modifiers),
+                allow_drop,
+            }));
+        if let Some(img) = drag.preview_image.take() {
+            let _ = drop_atlas_image(window, img);
+        }
+        self.input.borrow_mut().clear_held_buttons();
+        self.click.borrow_mut().cancel();
+        crate::native_view::set_window_drag_cursor(window, None);
+        crate::native_view::update_surface_cursor(
+            window,
+            surface_cursor_key(self.browser),
+            &self.native_cursor,
+            self.surface_client_rect_px(),
+            self.pointer_over_surface,
+        );
+        window.refresh();
+        cx.notify();
+    }
+
+    fn cancel_active_osr_drag_in_window(&mut self, window: &mut Window) {
+        let img = self.cancel_active_osr_drag_without_window();
+        if let Some(img) = img {
+            let _ = drop_atlas_image(window, img);
+        }
+        self.input.borrow_mut().clear_held_buttons();
+        self.click.borrow_mut().cancel();
+        crate::native_view::set_window_drag_cursor(window, None);
+        crate::native_view::update_surface_cursor(
+            window,
+            surface_cursor_key(self.browser),
+            &self.native_cursor,
+            self.surface_client_rect_px(),
+            self.pointer_over_surface,
+        );
+        window.refresh();
+    }
+
     fn cancel_outbound_drags(&mut self) {
         self.outbound_drag_task.take();
+        let _ = self.cancel_active_osr_drag_without_window();
         for finish in self.outbound_drag.cancel_all() {
             let _ = self
                 .attachment
@@ -1663,6 +2047,8 @@ impl CefBrowser {
         let events = self.attachment.handle().take_ux_events();
         let mut focus_taken = Vec::new();
         let mut shortcuts = Vec::new();
+        let mut addresses = Vec::new();
+        let mut popups = Vec::new();
         let mut a11y_updated = false;
         for event in events {
             match event {
@@ -1676,9 +2062,25 @@ impl CefBrowser {
                 }
                 BrowserEvent::OutboundDragCursorChanged(op) => {
                     self.outbound_drag.update_cursor(op);
+                    if let Some(drag) = self.active_drag.as_mut() {
+                        let next_op = if drag.in_view {
+                            DragOperationMask(op.bits() & drag.allowed_ops.bits())
+                        } else {
+                            DragOperationMask::NONE
+                        };
+                        if drag.current_op != next_op {
+                            drag.current_op = next_op;
+                            crate::native_view::set_window_drag_cursor(window, Some(next_op));
+                            window.refresh();
+                            cx.notify();
+                        }
+                    }
                 }
                 BrowserEvent::AccessibilityTreeUpdated { .. } => {
                     a11y_updated = true;
+                }
+                BrowserEvent::PopupRequested(req) => {
+                    popups.push(req);
                 }
                 BrowserEvent::ZoomLevelChanged(milli) => {
                     if self.zoom_gate.is_busy() {
@@ -1713,6 +2115,9 @@ impl CefBrowser {
                         self.ctrl_wheel_zoom_notches = 0.0;
                         self.zoom_timeout_task = None;
                         self.zoom_gate.clear_in_flight();
+                    }
+                    if let BrowserEvent::AddressChanged(ref addr) = other {
+                        addresses.push(addr.clone());
                     }
                     let (focus, shortcut) = self.ux.apply_event(other);
                     if let Some(next) = focus {
@@ -1754,6 +2159,28 @@ impl CefBrowser {
                 self.on_shortcut = Some(cb);
             }
         }
+        if !addresses.is_empty()
+            && let Some(mut cb) = self.on_address_changed.take()
+        {
+            let epoch = self.on_address_epoch;
+            for addr in addresses {
+                cb(addr, self, window, cx);
+            }
+            if self.on_address_epoch == epoch && self.on_address_changed.is_none() {
+                self.on_address_changed = Some(cb);
+            }
+        }
+        if !popups.is_empty()
+            && let Some(mut cb) = self.on_popup.take()
+        {
+            let epoch = self.on_popup_epoch;
+            for req in popups {
+                cb(req, self, window, cx);
+            }
+            if self.on_popup_epoch == epoch && self.on_popup.is_none() {
+                self.on_popup = Some(cb);
+            }
+        }
         if let Some(start) = self.outbound_drag.take_pending() {
             if let Some(mut cb) = self.on_outbound_drag.take() {
                 let result = cb(start, self, window, cx);
@@ -1767,6 +2194,7 @@ impl CefBrowser {
                         finish.y,
                         finish.operation,
                     );
+                    self.left_mouse_down = false;
                     self.input.borrow_mut().clear_held_buttons();
                     self.click.borrow_mut().cancel();
                     let _ = self
@@ -1775,47 +2203,157 @@ impl CefBrowser {
                         .submit(BrowserCommand::FinishOutboundDrag(finish));
                 }
             } else {
-                let hwnd_raw = raw_window_handle::HasWindowHandle::window_handle(window)
-                    .ok()
-                    .and_then(|h| match h.as_raw() {
-                        raw_window_handle::RawWindowHandle::Win32(w) => Some(w.hwnd.get() as usize),
-                        _ => None,
+                self.outbound_drag_task.take();
+                self.input.borrow_mut().clear_held_buttons();
+                self.click.borrow_mut().cancel();
+                let cursor_win_dip = self.last_pointer_win_dip.unwrap_or_else(|| {
+                    let pos = window.mouse_position();
+                    (f32::from(pos.x), f32::from(pos.y))
+                });
+                let cursor_pos = gpui::point(px(cursor_win_dip.0), px(cursor_win_dip.1));
+                let inside_pt = self.point(cursor_pos, false);
+                let last_view_point = inside_pt
+                    .or_else(|| self.point(cursor_pos, true))
+                    .unwrap_or((start.x, start.y));
+                let was_left_down = std::mem::replace(&mut self.left_mouse_down, false);
+                let os_button_down = crate::ole_drag::is_os_drag_button_down();
+                if os_button_down {
+                    // Interactive OS drag: hand off to Windows COM OLE `DoDragDrop` + `SHDRAGIMAGE`
+                    // so the drag preview floats freely beyond window edges and external apps
+                    // receive real OLE drops, while `ComDropTarget` (`ole_drop.rs`) handles
+                    // intra-window CEF `DragTarget*` feedback & drop.
+                    if let Some(old) = self.active_drag.take()
+                        && let Some(old_img) = old.preview_image
+                    {
+                        let _ = drop_atlas_image(window, old_img);
+                    }
+                    crate::native_view::set_window_drag_cursor(window, None);
+                    self.active_drag_flag.set(true);
+                    let hwnd = crate::native_view::window_hwnd(window)
+                        .map(|h| h.get() as *mut std::ffi::c_void);
+                    let surface_geom = Some(self.drop_surface_geometry.get());
+                    let pump = self.outbound_drag_pump.clone();
+                    let handle = self.attachment.handle().clone();
+                    let drag_flag = self.active_drag_flag.clone();
+                    self.outbound_drag_task = Some(cx.spawn_in(window, async move |weak, cx| {
+                        // Yield once so `consume_ux_events` releases all GPUI App/Entity
+                        // borrows before `DoDragDrop` enters the Win32 modal loop.
+                        cx.background_executor().timer(Duration::ZERO).await;
+                        let finish = if crate::ole_drag::is_os_drag_button_down() {
+                            crate::ole_drag::run_ole_drag_in_surface(
+                                &start,
+                                hwnd,
+                                surface_geom,
+                                pump,
+                            )
+                        } else {
+                            OutboundDragFinish {
+                                drag_id: start.drag_id,
+                                x: start.x,
+                                y: start.y,
+                                operation: DragOperationMask::NONE,
+                            }
+                        };
+                        drag_flag.set(false);
+                        let _ = cx.update(|window, app| {
+                            let _ = weak.update(app, |view, cx| {
+                                view.left_mouse_down = false;
+                                view.input.borrow_mut().clear_held_buttons();
+                                view.click.borrow_mut().cancel();
+                                let _ = view.outbound_drag.finish_in_flight(
+                                    finish.drag_id,
+                                    finish.x,
+                                    finish.y,
+                                    finish.operation,
+                                );
+                                view.outbound_drag_task = None;
+                                crate::native_view::set_window_drag_cursor(window, None);
+                                crate::native_view::update_surface_cursor(
+                                    window,
+                                    surface_cursor_key(view.browser),
+                                    &view.native_cursor,
+                                    view.surface_client_rect_px(),
+                                    view.pointer_over_surface,
+                                );
+                                window.refresh();
+                                cx.notify();
+                            });
+                        });
+                        let _ = handle.submit(BrowserCommand::FinishOutboundDrag(finish));
+                    }));
+                } else if !was_left_down {
+                    let _ = self.outbound_drag.finish_in_flight(
+                        start.drag_id,
+                        last_view_point.0,
+                        last_view_point.1,
+                        DragOperationMask::NONE,
+                    );
+                    let _ = self
+                        .attachment
+                        .handle()
+                        .submit(BrowserCommand::FinishOutboundDrag(OutboundDragFinish {
+                            drag_id: start.drag_id,
+                            x: last_view_point.0,
+                            y: last_view_point.1,
+                            operation: DragOperationMask::NONE,
+                        }));
+                } else {
+                    let in_view = inside_pt.is_some();
+                    let current_op = if in_view {
+                        DragOperationMask(
+                            self.outbound_drag.current_cursor().bits() & start.allowed_ops.bits(),
+                        )
+                    } else {
+                        DragOperationMask::NONE
+                    };
+                    let (preview_image, preview_size_dip, hotspot_dip, fallback_label) =
+                        drag_preview_from_start(&start, window.scale_factor());
+                    if let Some(old) = self.active_drag.take()
+                        && let Some(old_img) = old.preview_image
+                    {
+                        let _ = drop_atlas_image(window, old_img);
+                    }
+                    self.active_drag = Some(ActiveCefDrag {
+                        drag_id: start.drag_id,
+                        allowed_ops: start.allowed_ops,
+                        current_op,
+                        in_view,
+                        cursor_win_dip,
+                        last_view_point,
+                        preview_image,
+                        preview_size_dip,
+                        hotspot_dip,
+                        fallback_label,
                     });
-                let handle = self.attachment.handle().clone();
-                let pump = self.outbound_drag_pump.clone();
-                self.outbound_drag_task = Some(cx.spawn_in(window, async move |weak, cx| {
-                    let hwnd = hwnd_raw.map(|ptr| ptr as *mut std::ffi::c_void);
-                    let finish = crate::ole_drag::run_ole_drag(&start, hwnd, pump);
-                    let _ = handle.submit(BrowserCommand::FinishOutboundDrag(finish));
-                    let _ = weak.update(cx, |view, _| {
-                        let _ = view.outbound_drag.finish_in_flight(
-                            finish.drag_id,
-                            finish.x,
-                            finish.y,
-                            finish.operation,
-                        );
-                        // OLE DoDragDrop consumes the physical button-up; clear local held
-                        // button tracking so the next MouseMove does not trigger a spurious
-                        // FocusLost reset.
-                        view.input.borrow_mut().clear_held_buttons();
-                        view.click.borrow_mut().cancel();
-                    });
-                }));
+                    self.active_drag_flag.set(true);
+                    let _ = self.attachment.handle().submit_osr_drag_move_fast(
+                        start.drag_id,
+                        last_view_point.0,
+                        last_view_point.1,
+                        MouseModifiers::default(),
+                        in_view,
+                    );
+                    crate::native_view::set_window_drag_cursor(window, Some(current_op));
+                    window.refresh();
+                    cx.notify();
+                }
             }
         }
         let (cursor_rev, native_cursor) = self.attachment.cursor_slot().snapshot();
         if cursor_rev != self.native_cursor_revision || self.native_cursor != native_cursor {
             self.native_cursor_revision = cursor_rev;
             self.native_cursor = native_cursor;
-            let key = surface_cursor_key(self.browser);
-            let rect_px = self.surface_client_rect_px();
-            crate::native_view::update_surface_cursor(
-                window,
-                key,
-                &self.native_cursor,
-                rect_px,
-                self.pointer_over_surface,
-            );
+            if self.active_drag.is_none() {
+                let key = surface_cursor_key(self.browser);
+                let rect_px = self.surface_client_rect_px();
+                crate::native_view::update_surface_cursor(
+                    window,
+                    key,
+                    &self.native_cursor,
+                    rect_px,
+                    self.pointer_over_surface,
+                );
+            }
         }
     }
 
@@ -1844,6 +2382,20 @@ impl CefBrowser {
                 }
                 _ => {}
             }
+        }
+    }
+
+    fn callbacks_mut(&mut self) -> &mut BrowserViewCallbacks<Self> {
+        &mut self.callbacks
+    }
+
+    fn sync_view_events(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let events = self.attachment.handle().take_view_events();
+        for event in events {
+            if let BrowserEvent::DraggableRegionsChanged(ref regions) = event {
+                self.ux.draggable_regions.clone_from(regions);
+            }
+            dispatch_single_view_event(self, event, window, cx, Self::callbacks_mut);
         }
     }
 
@@ -1899,6 +2451,8 @@ impl CefBrowser {
         self.composition = None;
         self.composition_selection = 0..0;
         self.click.borrow_mut().cancel();
+        self.left_mouse_down = false;
+        self.right_mouse_down = false;
         self.cef_focus_accepted.set(false);
     }
 
@@ -2112,12 +2666,26 @@ impl CefBrowser {
         Ok(())
     }
 
-    fn sync_focus(&mut self, window: &Window, cx: &App) {
+    fn sync_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.project_menu_focus(window, cx);
         let focused = crate::native_view::is_window_effectively_active(window)
             && self.focus.is_focused(window);
         if self.was_focused && !focused {
-            self.reset_input(InputResetReason::FocusLost);
+            if self.active_drag.is_some() {
+                self.finish_active_osr_drag(
+                    window.mouse_position(),
+                    gpui::Modifiers::default(),
+                    true,
+                    window,
+                    cx,
+                );
+            }
+            if self.attachment.native_context_menu().is_open() {
+                self.cef_focus_accepted.set(false);
+                self.right_mouse_down = false;
+            } else {
+                self.reset_input(InputResetReason::FocusLost);
+            }
         }
         self.was_focused = focused;
     }
@@ -2217,6 +2785,11 @@ impl CefBrowser {
             return Err(error);
         }
         if update.closed {
+            if self.active_drag.is_some() {
+                self.cancel_active_osr_drag_in_window(window);
+            }
+            self.cancel_outbound_drags();
+            crate::native_view::set_window_drag_cursor(window, None);
             self.zoom_timeout_task = None;
             self.zoom_gate.clear_in_flight();
             self.pointer_over_surface = false;
@@ -2292,6 +2865,9 @@ impl CefBrowser {
             self.viewport_context = Some(next);
             self.surface_geometry = Some(geometry);
             if changed {
+                if self.active_drag.is_some() {
+                    self.cancel_active_osr_drag_in_window(window);
+                }
                 if let Some(b) = crate::menu::project(&self.menu) {
                     b.geometry_changed();
                 }
@@ -2436,6 +3012,9 @@ impl CefBrowser {
             b.visible(update.view.visible);
         }
         if !update.view.visible {
+            if self.active_drag.is_some() {
+                self.cancel_active_osr_drag_in_window(window);
+            }
             self.reset_input(InputResetReason::FocusLost);
             // Hiding is recoverable: clear the atlas entry but keep the token
             // live so a later show can present again.
@@ -2537,6 +3116,8 @@ impl CefBrowser {
     /// the callback then only drops the CPU owner; no atlas removal is reported
     /// as successful in that case, and no loop or timer is created.
     fn release_on_entity_release(&mut self, app: &mut App, window_handle: AnyWindowHandle) {
+        self.clear_callbacks_and_filters();
+        let drag_image = self.cancel_active_osr_drag_without_window();
         self.cancel_outbound_drags();
         self.zoom_timeout_task = None;
         self.zoom_gate.clear_in_flight();
@@ -2545,6 +3126,7 @@ impl CefBrowser {
         self.ax_snapshot = None;
         self.attachment.ax_tree().clear();
         self.attachment.cursor_slot().clear();
+        self.attachment.native_context_menu().clear();
         crate::native_view::clear_surface_cursor(self.hwnd_raw, surface_cursor_key(self.browser));
         self.reset_input(InputResetReason::Closing);
         self.token.retire();
@@ -2554,7 +3136,8 @@ impl CefBrowser {
         let has_cpu = [&view, &popup]
             .into_iter()
             .flatten()
-            .any(|slot| matches!(slot.content, PresentedContent::CpuImage(_)));
+            .any(|slot| matches!(slot.content, PresentedContent::CpuImage(_)))
+            || drag_image.is_some();
         if !has_cpu {
             // GpuTexture leases drop immediately here with no GPUI atlas entry to remove.
             return;
@@ -2572,6 +3155,11 @@ impl CefBrowser {
                     {
                         error.get_or_insert(message);
                     }
+                }
+                if let Some(drag_image) = drag_image
+                    && let Err(message) = drop_atlas_image(window, drag_image)
+                {
+                    error.get_or_insert(message);
                 }
                 error.map_or(Ok(()), Err)
             });
@@ -2909,9 +3497,11 @@ impl CefBrowser {
     }
 
     fn point(&self, position: Point<Pixels>, outside: bool) -> Option<(i32, i32)> {
-        translate_point(
+        translate_point_transformed(
             self.paint.borrow().surface_bounds,
             (f32::from(position.x), f32::from(position.y)),
+            self.rotation_angle_deg,
+            self.fit_rotated_to_bounds,
             outside,
         )
     }
@@ -2925,6 +3515,11 @@ impl CefBrowser {
         let Some(button) = input_button(event.button) else {
             return;
         };
+        self.last_pointer_win_dip =
+            Some((f32::from(event.position.x), f32::from(event.position.y)));
+        if self.active_drag.is_some() {
+            self.finish_active_osr_drag(event.position, event.modifiers, true, window, cx);
+        }
         self.presses_received = self.presses_received.saturating_add(1);
         if self
             .check_window(window)
@@ -2946,8 +3541,9 @@ impl CefBrowser {
         if count == 0 {
             return;
         }
-        // Match CefSharp OnMouseDown: fold clickCount > 3 to 1.
-        let count = if count > 3 { 1 } else { count };
+        // Match CefSharp OnMouseDown: fold clickCount > 3 to 1, and normalize
+        // MBT_RIGHT to 1 so rapid right-clicks never interfere with context menu trigger.
+        let count = normalize_click_count(button, count);
         let input_pending = self.input.borrow().pending();
         if input_pending {
             // The capture listener already marked this down as overflow.
@@ -2962,8 +3558,35 @@ impl CefBrowser {
         self.focus.focus(window, cx);
         self.project_menu_focus(window, cx);
         self.was_focused = true;
+        if button == InputButton::Right
+            && self
+                .attachment
+                .native_context_menu()
+                .was_active_within(NATIVE_CONTEXT_MENU_REOPEN_WINDOW)
+        {
+            self.cef_focus_accepted.set(false);
+        }
         if self.ensure_cef_focus(window).is_err() {
             return;
+        }
+        let modifiers = mouse_modifiers(event.modifiers);
+        if button == InputButton::Right
+            && (self.last_hover_dip.is_none()
+                || self
+                    .attachment
+                    .native_context_menu()
+                    .was_active_within(NATIVE_CONTEXT_MENU_REOPEN_WINDOW))
+        {
+            let _ = self.send_input(
+                InputKind::MouseMove {
+                    x,
+                    y,
+                    leaving: false,
+                    modifiers,
+                },
+                false,
+                window,
+            );
         }
         if button == InputButton::Left {
             let bounds = self.paint.borrow().surface_bounds;
@@ -2971,7 +3594,7 @@ impl CefBrowser {
                 window_identity(window),
                 bounds,
                 (f32::from(event.position.x), f32::from(event.position.y)),
-                mouse_modifiers(event.modifiers),
+                modifiers,
                 count,
             ) {
                 self.record_message(error.to_string());
@@ -2979,18 +3602,23 @@ impl CefBrowser {
         } else {
             self.click.borrow_mut().cancel();
         }
-        let _ = self.send_input(
+        let admitted = self.send_input(
             InputKind::MouseButton {
                 x,
                 y,
                 button,
                 up: false,
                 click_count: count,
-                modifiers: mouse_modifiers(event.modifiers),
+                modifiers,
             },
             false,
             window,
         );
+        if button == InputButton::Left {
+            self.left_mouse_down = admitted;
+        } else if button == InputButton::Right {
+            self.right_mouse_down = admitted;
+        }
         cx.notify();
     }
 
@@ -2998,9 +3626,102 @@ impl CefBrowser {
         let Some(button) = input_button(event.button) else {
             return;
         };
+        self.last_pointer_win_dip =
+            Some((f32::from(event.position.x), f32::from(event.position.y)));
+        if button == InputButton::Left {
+            self.left_mouse_down = false;
+            if self.active_drag.is_some() {
+                self.finish_active_osr_drag(event.position, event.modifiers, false, window, cx);
+                return;
+            }
+            if self.active_drag_flag.get() {
+                self.click.borrow_mut().cancel();
+                return;
+            }
+        }
         let owned = self.input.borrow().owns_button(button);
-        if !owned && !self.input.borrow().pending() {
+        if button == InputButton::Right
+            && !owned
+            && !self.right_mouse_down
+            && !self.input.borrow().pending()
+            && self
+                .attachment
+                .native_context_menu()
+                .was_active_within(NATIVE_CONTEXT_MENU_REOPEN_WINDOW)
+        {
+            // When CEF's native popup menu captured and swallowed WM_RBUTTONDOWN
+            // at a new location to dismiss the old menu, GPUI receives only the
+            // trailing orphan MouseUp(Right). Restore focus, sync cursor position,
+            // and synthesize a clean right-click pair so the new menu opens directly.
+            if self
+                .check_window(window)
+                .and_then(|_| self.check_live())
+                .is_err()
+                || self.attachment.handle().snapshot().state != SessionState::Alive
+            {
+                return;
+            }
+            let Some((x, y)) = self.point(event.position, false) else {
+                return;
+            };
+            self.focus.focus(window, cx);
+            self.project_menu_focus(window, cx);
+            self.was_focused = true;
+            self.cef_focus_accepted.set(false);
+            if let Err(error) = self.attachment.handle().submit(BrowserCommand::SetFocus(true)) {
+                self.record_message(format!("orphan right-up focus refused: {error:?}"));
+                return;
+            }
+            self.input.borrow_mut().mark_focus();
+            self.cef_focus_accepted.set(true);
+            let modifiers = mouse_modifiers(event.modifiers);
+            let _ = self.send_input(
+                InputKind::MouseMove {
+                    x,
+                    y,
+                    leaving: false,
+                    modifiers,
+                },
+                false,
+                window,
+            );
+            if self.send_input(
+                InputKind::MouseButton {
+                    x,
+                    y,
+                    button: InputButton::Right,
+                    up: false,
+                    click_count: 1,
+                    modifiers,
+                },
+                false,
+                window,
+            ) {
+                let _ = self.send_input(
+                    InputKind::MouseButton {
+                        x,
+                        y,
+                        button: InputButton::Right,
+                        up: true,
+                        click_count: 1,
+                        modifiers,
+                    },
+                    false,
+                    window,
+                );
+            }
+            self.right_mouse_down = false;
+            cx.notify();
             return;
+        }
+        if !owned && !self.input.borrow().pending() {
+            if button == InputButton::Right {
+                self.right_mouse_down = false;
+            }
+            return;
+        }
+        if button == InputButton::Right {
+            self.right_mouse_down = false;
         }
         if self
             .check_window(window)
@@ -3011,7 +3732,13 @@ impl CefBrowser {
             self.reset_input(InputResetReason::FocusLost);
             return;
         }
-        let Some((x, y)) = self.point(event.position, true) else {
+        let coords = if button == InputButton::Right {
+            self.point(event.position, false)
+                .or_else(|| self.point(event.position, true))
+        } else {
+            self.point(event.position, true)
+        };
+        let Some((x, y)) = coords else {
             self.reset_input(InputResetReason::Rejected);
             return;
         };
@@ -3023,7 +3750,7 @@ impl CefBrowser {
             self.reset_input(InputResetReason::Rejected);
             return;
         }
-        let count = if count > 3 { 1 } else { count };
+        let count = normalize_click_count(button, count);
         let complete = if button == InputButton::Left {
             let bounds = self.paint.borrow().surface_bounds;
             self.click
@@ -3056,6 +3783,11 @@ impl CefBrowser {
     }
 
     fn pointer_move(&mut self, event: &MouseMoveEvent, window: &Window, owned_only: bool) {
+        self.last_pointer_win_dip =
+            Some((f32::from(event.position.x), f32::from(event.position.y)));
+        if self.active_drag.is_some() || self.active_drag_flag.get() {
+            return;
+        }
         let held = self.input.borrow().held_button();
         if held != owned_only {
             return;
@@ -3070,7 +3802,14 @@ impl CefBrowser {
         if !self.attachment.handle().is_fast_input_ready() {
             return;
         }
-        if held && event.pressed_button.is_none() && !os_any_mouse_button_down() {
+        if held
+            && ((self.input.borrow().owns_button(InputButton::Left) && !self.left_mouse_down)
+                || (event.pressed_button.is_none() && !os_any_mouse_button_down()))
+        {
+            if self.right_mouse_down || self.input.borrow().owns_button(InputButton::Right) {
+                // Avoid dropping an in-flight right-click on micro-movement right before MouseUp(Right).
+                return;
+            }
             // A mouse move no longer reporting a pressed button (neither in
             // GPUI's event nor physically pressed — guarding against Win32
             // WM_NCMOUSEMOVE which clears pressed_button mid-drag) cannot
@@ -3107,8 +3846,83 @@ impl CefBrowser {
         );
     }
 
+    fn drag_pointer_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.last_pointer_win_dip =
+            Some((f32::from(event.position.x), f32::from(event.position.y)));
+        if self.active_drag.is_none() {
+            return;
+        }
+        if self
+            .check_window(window)
+            .and_then(|_| self.check_live())
+            .is_err()
+        {
+            self.finish_active_osr_drag(event.position, event.modifiers, true, window, cx);
+            return;
+        }
+        if event.pressed_button.is_none() && !os_any_mouse_button_down() {
+            self.finish_active_osr_drag(event.position, event.modifiers, true, window, cx);
+            return;
+        }
+        let inside_pt = self.point(event.position, false);
+        let view_pt = inside_pt.or_else(|| self.point(event.position, true));
+        let cursor_win_dip = (f32::from(event.position.x), f32::from(event.position.y));
+        let Some(drag) = self.active_drag.as_mut() else {
+            return;
+        };
+        drag.cursor_win_dip = cursor_win_dip;
+        let next_pt = view_pt.unwrap_or(drag.last_view_point);
+        drag.last_view_point = next_pt;
+        let now_in_view = inside_pt.is_some();
+        let left_view = drag.in_view && !now_in_view;
+        drag.in_view = now_in_view;
+        if left_view {
+            drag.current_op = DragOperationMask::NONE;
+            crate::native_view::set_window_drag_cursor(window, Some(DragOperationMask::NONE));
+        }
+        let drag_id = drag.drag_id;
+        let _ = self.attachment.handle().submit_osr_drag_move_fast(
+            drag_id,
+            next_pt.0,
+            next_pt.1,
+            mouse_modifiers(event.modifiers),
+            now_in_view,
+        );
+        window.refresh();
+        cx.notify();
+    }
+
+    fn drag_pointer_leave(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(drag) = self.active_drag.as_mut() else {
+            return;
+        };
+        if !drag.in_view {
+            return;
+        }
+        drag.in_view = false;
+        drag.current_op = DragOperationMask::NONE;
+        let drag_id = drag.drag_id;
+        let (x, y) = drag.last_view_point;
+        crate::native_view::set_window_drag_cursor(window, Some(DragOperationMask::NONE));
+        let _ = self.attachment.handle().submit_osr_drag_move_fast(
+            drag_id,
+            x,
+            y,
+            MouseModifiers::default(),
+            false,
+        );
+        window.refresh();
+        cx.notify();
+    }
+
     fn pointer_leave(&mut self, window: &Window) {
-        if self.input.borrow().held_button()
+        if self.active_drag.is_some()
+            || self.input.borrow().held_button()
             || self
                 .check_window(window)
                 .and_then(|_| self.check_live())
@@ -3207,8 +4021,19 @@ impl CefBrowser {
     pub(crate) fn native_key_down(
         &mut self,
         key: NativeKey,
-        window: &Window,
+        window: &mut Window,
+        cx: &mut Context<Self>,
     ) -> NativeDownAdmission {
+        if key.vk == 0x1B && self.active_drag.is_some() {
+            self.finish_active_osr_drag(
+                window.mouse_position(),
+                gpui::Modifiers::default(),
+                true,
+                window,
+                cx,
+            );
+            return NativeDownAdmission::ConsumedByHostGesture;
+        }
         self.input
             .borrow_mut()
             .note_callback_entered(InputCallback::KeyDown);
@@ -3245,7 +4070,7 @@ impl CefBrowser {
         }
     }
 
-    fn key_down(&mut self, event: &KeyDownEvent, window: &Window) {
+    fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         // A live native service intercepts real down *before* GPUI shortcut
         // pending/replay and forwards it above. Exempt host shortcuts deliberately
         // stay in GPUI and must not leak into Chromium through this listener.
@@ -3255,6 +4080,16 @@ impl CefBrowser {
             .and_then(|service| service.upgrade())
             .is_some_and(|service| service.is_active())
         {
+            return;
+        }
+        if self.active_drag.is_some() && event.keystroke.key.eq_ignore_ascii_case("escape") {
+            self.finish_active_osr_drag(
+                window.mouse_position(),
+                event.keystroke.modifiers,
+                true,
+                window,
+                cx,
+            );
             return;
         }
         self.input
@@ -3358,6 +4193,7 @@ impl Drop for CefBrowser {
         // owned, thread-safe ResetInput request, but never invokes GPUI,
         // direct native CEF or an event-loop pump. Dropping the ordinary
         // subscriber fields unregisters them without App-lifetime detachment.
+        self.clear_callbacks_and_filters();
         self.cancel_outbound_drags();
         self.zoom_timeout_task = None;
         self.zoom_gate.clear_in_flight();
@@ -3630,6 +4466,15 @@ impl Render for CefBrowser {
             );
             return div().size_full().into_any_element();
         }
+        if crate::native_view::is_window_in_sizemove(window)
+            && !self.minimized_hidden.get()
+            && self.token.is_live()
+            && self.attachment.frame_source().has_pending_update()
+            && let Some(update) = self.attachment.frame_source().take_update()
+        {
+            self.consumed_updates = self.consumed_updates.saturating_add(1);
+            let _ = self.apply_update(window, update);
+        }
         let Some(stamp) = self.token.stamp() else {
             self.note_rejected_paint(ViewError::RetiredBinding.to_string());
             return div().size_full().into_any_element();
@@ -3643,6 +4488,13 @@ impl Render for CefBrowser {
             .image
             .as_ref()
             .map_or(0xffffff, |slot| slot.backdrop_rgb);
+        let surface_opacity = self.surface_opacity;
+        let rotation_angle_deg = self.rotation_angle_deg;
+        let nearest_neighbor_scaling = self.nearest_neighbor_scaling;
+        let fit_rotated_to_bounds = self.fit_rotated_to_bounds;
+        let use_opaque_backdrop = !self.transparent_backdrop
+            && surface_opacity >= 1.0 - 1e-4
+            && rotation_angle_deg.abs() <= 1e-4;
         let paint_frame = self.image.as_ref().map(|slot| PaintFrame {
             content: slot.content.clone(),
             sequence: slot.sequence,
@@ -3675,8 +4527,29 @@ impl Render for CefBrowser {
         let sent_viewport = self.sent_viewport.clone();
         let in_flight_viewport = self.in_flight_viewport.clone();
         let sent_screen_origin = self.sent_screen_origin.clone();
+        let sent_client_offset = self.sent_client_offset.clone();
         let minimized_hidden = self.minimized_hidden.clone();
         let drop_surface_geometry = self.drop_surface_geometry.clone();
+
+        let active_drag_op = self.active_drag.as_ref().map(|d| d.current_op);
+        let drag_overlay = self.active_drag.as_ref().and_then(|d| {
+            d.preview_image.as_ref().map(|img| DragPaintOverlay {
+                cursor_win_dip: d.cursor_win_dip,
+                preview_image: img.clone(),
+                preview_size_dip: d.preview_size_dip,
+                hotspot_dip: d.hotspot_dip,
+            })
+        });
+        let drag_fallback_card = self.active_drag.as_ref().and_then(|d| {
+            if d.preview_image.is_none() {
+                d.fallback_label
+                    .as_ref()
+                    .map(|lbl| (d.cursor_win_dip.0, d.cursor_win_dip.1, lbl.clone()))
+            } else {
+                None
+            }
+        });
+        let drag_flag_move = self.active_drag_flag.clone();
 
         self.sync_focus(window, cx);
         let focus = self.focus.clone();
@@ -3691,9 +4564,9 @@ impl Render for CefBrowser {
             .id(("cef-browser-input", cx.entity_id()))
             .relative()
             .size_full()
-            .bg(gpui::rgb(backdrop_rgb))
+            .when(use_opaque_backdrop, |el| el.bg(gpui::rgb(backdrop_rgb)))
             .role(Role::WebView)
-            .cursor(cursor_style_for(self.ux.cursor))
+            .cursor(active_drag_op.map_or_else(|| cursor_style_for(self.ux.cursor), drag_cursor_style))
             .track_focus(&focus)
             .on_any_mouse_down(move |event, window, app| {
                 // Only eligible GPUI bubble/hitbox input may begin a click; an
@@ -3709,26 +4582,35 @@ impl Render for CefBrowser {
                 view.file_drop(paths, window);
             }))
             .on_mouse_move(cx.listener(|view, event: &MouseMoveEvent, window, cx| {
-                if !cx.has_active_drag() {
+                if view.active_drag.is_none()
+                    && !view.active_drag_flag.get()
+                    && !cx.has_active_drag()
+                {
                     view.pointer_move(event, window, false);
                 }
             }))
             .on_hover(cx.listener(|view, hovered: &bool, window, cx| {
                 view.pointer_over_surface = *hovered;
-                crate::native_view::set_surface_cursor_hover(
-                    window,
-                    surface_cursor_key(view.browser),
-                    *hovered,
-                );
-                if !*hovered && !cx.has_active_drag() {
-                    view.pointer_leave(window);
+                if view.active_drag.is_none() && !view.active_drag_flag.get() {
+                    crate::native_view::set_surface_cursor_hover(
+                        window,
+                        surface_cursor_key(view.browser),
+                        *hovered,
+                    );
+                }
+                if !*hovered {
+                    if view.active_drag.is_some() {
+                        view.drag_pointer_leave(window, cx);
+                    } else if !view.active_drag_flag.get() && !cx.has_active_drag() {
+                        view.pointer_leave(window);
+                    }
                 }
             }))
             .on_scroll(cx.listener(|view, event: &ScrollEvent, window, cx| {
                 view.pointer_scroll(event, window, cx);
             }))
-            .on_key_down(cx.listener(|view, event: &KeyDownEvent, window, _| {
-                view.key_down(event, window);
+            .on_key_down(cx.listener(|view, event: &KeyDownEvent, window, cx| {
+                view.key_down(event, window, cx);
             }))
             .on_key_up(cx.listener(|view, event: &KeyUpEvent, window, _| {
                 view.key_up(event, window);
@@ -3821,6 +4703,18 @@ impl Render for CefBrowser {
                         if !in_sizemove || minimized {
                             in_flight_viewport.set(None);
                         }
+                        let client_offset =
+                            (f32::from(bounds.origin.x), f32::from(bounds.origin.y));
+                        if sent_client_offset.get() != Some(client_offset)
+                            && handle
+                                .submit(BrowserCommand::SetClientOffset {
+                                    x_dip: client_offset.0,
+                                    y_dip: client_offset.1,
+                                })
+                                .is_ok()
+                        {
+                            sent_client_offset.set(Some(client_offset));
+                        }
                         if !in_sizemove
                             && !minimized
                             && let Some((cx_px, cy_px)) =
@@ -3906,7 +4800,16 @@ impl Render for CefBrowser {
                         window.on_mouse_event(move |event: &MouseDownEvent, phase, window, app| {
                             if phase == DispatchPhase::Capture {
                                 if let Some(entity) = down.upgrade() {
-                                    entity.update(app, |view, _| {
+                                    entity.update(app, |view, cx| {
+                                        if view.active_drag.is_some() {
+                                            view.finish_active_osr_drag(
+                                                event.position,
+                                                event.modifiers,
+                                                true,
+                                                window,
+                                                cx,
+                                            );
+                                        }
                                         // An overlapping/overlay down invalidates an earlier held gesture.
                                         let has_ownership = {
                                             let input = view.input.borrow();
@@ -3924,9 +4827,13 @@ impl Render for CefBrowser {
                                         view.click.borrow_mut().cancel();
                                         if !crate::native_view::is_window_effectively_active(window)
                                         {
-                                            view.reset_input(InputResetReason::FocusLost);
+                                            if view.attachment.native_context_menu().is_open() {
+                                                view.cef_focus_accepted.set(false);
+                                                view.right_mouse_down = false;
+                                            } else {
+                                                view.reset_input(InputResetReason::FocusLost);
+                                            }
                                         }
-                                        let _ = event;
                                     });
                                 }
                             }
@@ -3973,14 +4880,20 @@ impl Render for CefBrowser {
                         let moving = weak_move.clone();
                         let input_move = input_paint.clone();
                         window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, app| {
-                            if phase == DispatchPhase::Capture
-                                && input_move.borrow().held_button()
-                                && !app.has_active_drag()
-                            {
-                                if let Some(entity) = moving.upgrade() {
-                                    entity.update(app, |view, _| {
-                                        view.pointer_move(event, window, true)
-                                    });
+                            if phase == DispatchPhase::Capture {
+                                if drag_flag_move.get() {
+                                    if let Some(entity) = moving.upgrade() {
+                                        entity.update(app, |view, cx| {
+                                            view.drag_pointer_move(event, window, cx)
+                                        });
+                                    }
+                                } else if input_move.borrow().held_button() && !app.has_active_drag()
+                                {
+                                    if let Some(entity) = moving.upgrade() {
+                                        entity.update(app, |view, _| {
+                                            view.pointer_move(event, window, true)
+                                        });
+                                    }
                                 }
                             }
                         });
@@ -4039,11 +4952,22 @@ impl Render for CefBrowser {
                                     return;
                                 }
                             };
-                            let visible = bounds.intersect(&target);
-                            if f32::from(visible.size.width) <= 0.0
-                                || f32::from(visible.size.height) <= 0.0
-                            {
-                                continue;
+                            let has_transform = rotation_angle_deg.abs() > 1e-4;
+                            if has_transform {
+                                if f32::from(bounds.size.width) <= 0.0
+                                    || f32::from(bounds.size.height) <= 0.0
+                                    || f32::from(target.size.width) <= 0.0
+                                    || f32::from(target.size.height) <= 0.0
+                                {
+                                    continue;
+                                }
+                            } else {
+                                let visible = bounds.intersect(&target);
+                                if f32::from(visible.size.width) <= 0.0
+                                    || f32::from(visible.size.height) <= 0.0
+                                {
+                                    continue;
+                                }
                             }
                             if !token_paint.permits(check_stamp, window_identity(window)) {
                                 diag_paint.borrow_mut().reject_stamp(
@@ -4055,23 +4979,54 @@ impl Render for CefBrowser {
                                 );
                                 continue;
                             }
+                            let (rad, fit_scale) = compute_surface_transform_params(
+                                bounds_dip(bounds),
+                                rotation_angle_deg,
+                                fit_rotated_to_bounds,
+                            );
+                            let transformation = if has_transform {
+                                let cx_px = (f32::from(bounds.origin.x)
+                                    + f32::from(bounds.size.width) * 0.5)
+                                    * scale;
+                                let cy_px = (f32::from(bounds.origin.y)
+                                    + f32::from(bounds.size.height) * 0.5)
+                                    * scale;
+                                let center = gpui::point(
+                                    gpui::ScaledPixels(cx_px),
+                                    gpui::ScaledPixels(cy_px),
+                                );
+                                let neg_center = gpui::point(
+                                    gpui::ScaledPixels(-cx_px),
+                                    gpui::ScaledPixels(-cy_px),
+                                );
+                                gpui::TransformationMatrix::unit()
+                                    .translate(center)
+                                    .rotate(gpui::Radians(rad))
+                                    .scale(gpui::size(fit_scale, fit_scale))
+                                    .translate(neg_center)
+                            } else {
+                                gpui::TransformationMatrix::unit()
+                            };
                             // `bounds` clips; `target` keeps the frame at its captured
                             // device-pixel size divided by the window scale, anchored at
                             // the surface origin. No stretching of a stale image.
                             let paint_result = match &frame.content {
-                                PresentedContent::CpuImage(image) => window.paint_image(
+                                PresentedContent::CpuImage(image) => window.paint_image_transformed(
                                     bounds,
                                     target,
                                     Corners::default(),
                                     image.clone(),
                                     0,
                                     false,
+                                    Some(surface_opacity),
+                                    transformation,
+                                    nearest_neighbor_scaling,
                                 ),
                                 PresentedContent::GpuTexture(owned) => {
                                     #[cfg(target_os = "windows")]
                                     {
                                         if let Some(gpu) = owned.gpu_texture() {
-                                            window.paint_shared_texture(
+                                            window.paint_shared_texture_transformed(
                                                 bounds,
                                                 target,
                                                 gpui::WindowsSharedTexture {
@@ -4098,6 +5053,9 @@ impl Render for CefBrowser {
                                                         &gpu.handle_owner,
                                                     )),
                                                 },
+                                                Some(surface_opacity),
+                                                transformation,
+                                                nearest_neighbor_scaling,
                                             );
                                         }
                                         Ok(())
@@ -4148,12 +5106,46 @@ impl Render for CefBrowser {
                                 }
                             }
                         }
+                        if let Some(overlay) = drag_overlay
+                            && overlay.preview_size_dip.0 > 0.0
+                            && overlay.preview_size_dip.1 > 0.0
+                            && token_paint.permits(prepaint_stamp, window_identity(window))
+                        {
+                            let ghost_bounds = Bounds {
+                                origin: gpui::point(
+                                    px(overlay.cursor_win_dip.0 - overlay.hotspot_dip.0),
+                                    px(overlay.cursor_win_dip.1 - overlay.hotspot_dip.1),
+                                ),
+                                size: size(
+                                    px(overlay.preview_size_dip.0),
+                                    px(overlay.preview_size_dip.1),
+                                ),
+                            };
+                            let client_bounds = Bounds {
+                                origin: gpui::point(px(0.0), px(0.0)),
+                                size: window.viewport_size(),
+                            };
+                            let visible = client_bounds.intersect(&ghost_bounds);
+                            if f32::from(visible.size.width) > 0.0
+                                && f32::from(visible.size.height) > 0.0
+                            {
+                                let _ = window.paint_image(
+                                    visible,
+                                    ghost_bounds,
+                                    Corners::default(),
+                                    overlay.preview_image,
+                                    0,
+                                    false,
+                                );
+                            }
+                        }
                     },
                 )
                 .size_full(),
             )
             .when(
-                !self.ux.tooltip.is_empty()
+                self.active_drag.is_none()
+                    && !self.ux.tooltip.is_empty()
                     && !self.popup_visible
                     && !self.input.borrow().held_button()
                     && self.last_hover_dip.is_some(),
@@ -4182,6 +5174,25 @@ impl Render for CefBrowser {
                     )
                 },
             )
+            .when_some(drag_fallback_card, |el, (cx_dip, cy_dip, label)| {
+                let (sx, sy, _, _) = self.paint.borrow().surface_bounds;
+                el.child(
+                    div()
+                        .absolute()
+                        .left(px((cx_dip - sx + 14.0).max(0.0)))
+                        .top(px((cy_dip - sy + 14.0).max(0.0)))
+                        .max_w(px(280.0))
+                        .px_2()
+                        .py_1()
+                        .rounded(px(4.0))
+                        .bg(gpui::rgba(0x1e222ad8))
+                        .border_1()
+                        .border_color(gpui::rgba(0x94a3b8aa))
+                        .text_xs()
+                        .text_color(rgb(0xf8fafc))
+                        .child(label),
+                )
+            })
             .into_any_element()
     }
 }
@@ -4224,6 +5235,72 @@ fn bounded_replacement(range: std::ops::Range<usize>) -> Option<Utf16Range> {
     })
 }
 
+pub(crate) fn compute_surface_transform_params(
+    bounds_dip: (f32, f32, f32, f32),
+    angle_deg: f32,
+    fit_to_bounds: bool,
+) -> (f32, f32) {
+    if !angle_deg.is_finite() || angle_deg.abs() <= 1e-4 {
+        return (0.0, 1.0);
+    }
+    let rad = angle_deg.to_radians();
+    let (_, _, w, h) = bounds_dip;
+    if !fit_to_bounds || !w.is_finite() || !h.is_finite() || w <= 0.0 || h <= 0.0 {
+        return (rad, 1.0);
+    }
+    let c = rad.cos().abs();
+    let s = rad.sin().abs();
+    let denom_x = w * c + h * s;
+    let denom_y = w * s + h * c;
+    let scale = if denom_x > 1e-4 && denom_y > 1e-4 {
+        (w / denom_x).min(h / denom_y).clamp(0.05, 1.0)
+    } else {
+        1.0
+    };
+    (rad, scale)
+}
+
+pub(crate) fn inverse_transform_surface_point(
+    bounds: (f32, f32, f32, f32),
+    position: (f32, f32),
+    angle_deg: f32,
+    fit_to_bounds: bool,
+) -> (f32, f32) {
+    let (x, y, width, height) = bounds;
+    let (px, py) = position;
+    if !angle_deg.is_finite()
+        || angle_deg.abs() <= 1e-4
+        || !width.is_finite()
+        || !height.is_finite()
+        || width <= 0.0
+        || height <= 0.0
+        || !px.is_finite()
+        || !py.is_finite()
+    {
+        return position;
+    }
+    let (rad, fit_scale) = compute_surface_transform_params(bounds, angle_deg, fit_to_bounds);
+    let cx = x + width * 0.5;
+    let cy = y + height * 0.5;
+    let dx = (px - cx) / fit_scale;
+    let dy = (py - cy) / fit_scale;
+    let (sin_r, cos_r) = rad.sin_cos();
+    let ux = dx * cos_r + dy * sin_r;
+    let uy = -dx * sin_r + dy * cos_r;
+    (cx + ux, cy + uy)
+}
+
+fn translate_point_transformed(
+    bounds: (f32, f32, f32, f32),
+    position: (f32, f32),
+    angle_deg: f32,
+    fit_to_bounds: bool,
+    outside: bool,
+) -> Option<(i32, i32)> {
+    let mapped = inverse_transform_surface_point(bounds, position, angle_deg, fit_to_bounds);
+    translate_point(bounds, mapped, outside)
+}
+
 fn translate_point(
     bounds: (f32, f32, f32, f32),
     position: (f32, f32),
@@ -4244,7 +5321,22 @@ fn translate_point(
     {
         return None;
     }
-    keymap::to_view_point(position, (x, y), (width, height))
+    let (vx, vy) = keymap::to_view_point(position, (x, y), (width, height))?;
+    if outside {
+        Some((vx, vy))
+    } else {
+        let max_x = (width.round() as i32 - 1).max(0);
+        let max_y = (height.round() as i32 - 1).max(0);
+        Some((vx.clamp(0, max_x), vy.clamp(0, max_y)))
+    }
+}
+
+fn normalize_click_count(button: InputButton, raw_count: u8) -> u8 {
+    if button == InputButton::Right || raw_count > 3 {
+        1
+    } else {
+        raw_count
+    }
 }
 
 fn os_any_mouse_button_down() -> bool {
@@ -5632,5 +6724,293 @@ mod tests {
         gate.sync_external(1.5);
         assert!((gate.desired_zoom_level() - 1.5).abs() < 1e-9);
         assert!(!gate.is_busy());
+    }
+
+    #[test]
+    fn right_mouse_button_maps_to_input_right_for_down_and_up() {
+        assert_eq!(input_button(MouseButton::Right), Some(InputButton::Right));
+        let mods = mouse_modifiers(gpui::Modifiers::default());
+        assert!(!mods.shift && !mods.control && !mods.alt && !mods.platform);
+    }
+
+    #[test]
+    fn translate_point_clamps_extreme_corners_inside_view_rect_and_normalizes_right_click_count() {
+        let bounds = (0.0, 44.0, 1200.0, 762.0);
+        // Fractional 150%-DPI positions near the bottom-right corner round to (1200, 762)
+        // in raw float arithmetic, so inside-bounds translation must clamp inside [0..1199, 0..761].
+        assert_eq!(translate_point(bounds, (0.2, 44.2), false), Some((0, 0)));
+        assert_eq!(
+            translate_point(bounds, (1199.6667, 805.6667), false),
+            Some((1199, 761))
+        );
+        assert_eq!(
+            normalize_click_count(InputButton::Right, 1),
+            1
+        );
+        assert_eq!(
+            normalize_click_count(InputButton::Right, 2),
+            1
+        );
+        assert_eq!(
+            normalize_click_count(InputButton::Right, 3),
+            1
+        );
+        assert_eq!(normalize_click_count(InputButton::Left, 2), 2);
+        assert_eq!(normalize_click_count(InputButton::Left, 4), 1);
+    }
+
+    #[test]
+    fn surface_transform_inverse_mouse_mapping_roundtrips_and_rejects_watermark_corners() {
+        let bounds = (100.0, 50.0, 800.0, 600.0);
+        let cx = 500.0_f32;
+        let cy = 350.0_f32;
+
+        // 0 deg is identity.
+        assert_eq!(
+            translate_point_transformed(bounds, (260.0, 190.0), 0.0, true, false),
+            Some((160, 140))
+        );
+
+        // Any angle preserves the center.
+        for angle in [-180.0_f32, -90.0, -32.5, 25.0, 90.0, 180.0] {
+            let center_hit = translate_point_transformed(bounds, (cx, cy), angle, true, false);
+            assert_eq!(center_hit, Some((400, 300)), "angle={angle}");
+
+            // Forward transform local point (600, 150) -> (500, 100) in view coords, then invert.
+            let (rad, fit_scale) = compute_surface_transform_params(bounds, angle, true);
+            let local_x = 100.0_f32; // offset from center
+            let local_y = -120.0_f32;
+            let (sin_r, cos_r) = rad.sin_cos();
+            let screen_x = cx + fit_scale * (local_x * cos_r - local_y * sin_r);
+            let screen_y = cy + fit_scale * (local_x * sin_r + local_y * cos_r);
+            let mapped =
+                translate_point_transformed(bounds, (screen_x, screen_y), angle, true, false)
+                    .expect("rotated quad interior must hit");
+            assert!((mapped.0 - 500).abs() <= 1, "angle={angle} x={}", mapped.0);
+            assert!((mapped.1 - 180).abs() <= 1, "angle={angle} y={}", mapped.1);
+        }
+
+        // Exposed watermark corner at 35 deg falls outside rotated quad when outside=false.
+        assert_eq!(
+            translate_point_transformed(bounds, (105.0, 55.0), 35.0, true, false),
+            None
+        );
+    }
+
+    #[test]
+    fn browser_handle_routes_popup_policy_filters_and_ui_listener() {
+        use rust_cef_core::host_capabilities::{
+            DragEnterDecision, FocusDecision, KeyEventDecision, NavigationDecision,
+            NavigationFilter, PopupDecision, PopupDisposition, PopupFilter, PopupPolicy,
+            PreKeyDecision, ProtocolExecutionDecision,
+        };
+        use rust_cef_core::ime::ImeSnapshot;
+        use rust_cef_core::input::InputSnapshot;
+        use rust_cef_core::ports::{BrowserControl, BrowserHandle, EXT_EVENT_FRAME_LIFECYCLE};
+        use std::sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, AtomicU32, Ordering},
+        };
+
+        struct RoutingStub {
+            policy: Mutex<PopupPolicy>,
+            ui_active: AtomicBool,
+            popup_filter_set: AtomicBool,
+            nav_filter_set: AtomicBool,
+            extended_mask: AtomicU32,
+            drag_filter_set: AtomicBool,
+            focus_filter_set: AtomicBool,
+            pre_key_filter_set: AtomicBool,
+            key_filter_set: AtomicBool,
+            protocol_filter_set: AtomicBool,
+        }
+
+        impl BrowserControl for RoutingStub {
+            fn snapshot(&self) -> rust_cef_core::contracts::BrowserSnapshot {
+                panic!("unused")
+            }
+            fn input_snapshot(&self) -> Result<InputSnapshot, EngineError> {
+                Err(EngineError::NotReady)
+            }
+            fn ime_snapshot(&self) -> Result<ImeSnapshot, EngineError> {
+                Err(EngineError::NotReady)
+            }
+            fn submit(&self, _: BrowserCommand) -> Result<CommandId, EngineError> {
+                Err(EngineError::NotReady)
+            }
+            fn evaluate_script(
+                &self,
+                _: String,
+                _: JsFrameScope,
+                _: u64,
+            ) -> Result<EvalRequestId, EngineError> {
+                Err(EngineError::NotReady)
+            }
+            fn request_close(&self, _: CloseMode) -> rust_cef_core::ports::CloseTicket {
+                rust_cef_core::ports::CloseTicket::pending(browser(9), 1).0
+            }
+            fn take_ux_events(&self) -> Vec<BrowserEvent> {
+                Vec::new()
+            }
+            fn take_js_events(&self) -> Vec<BrowserEvent> {
+                Vec::new()
+            }
+            fn set_popup_policy(&self, policy: PopupPolicy) {
+                *self.policy.lock().unwrap() = policy;
+            }
+            fn popup_policy(&self) -> PopupPolicy {
+                *self.policy.lock().unwrap()
+            }
+            fn set_popup_filter(&self, filter: Option<PopupFilter>) {
+                self.popup_filter_set
+                    .store(filter.is_some(), Ordering::Release);
+            }
+            fn set_popup_ui_listener_active(&self, active: bool) {
+                self.ui_active.store(active, Ordering::Release);
+            }
+            fn set_navigation_filter(&self, filter: Option<NavigationFilter>) {
+                self.nav_filter_set
+                    .store(filter.is_some(), Ordering::Release);
+            }
+            fn set_extended_event_mask(&self, mask: u32) {
+                self.extended_mask.store(mask, Ordering::Release);
+            }
+            fn set_drag_enter_filter(
+                &self,
+                filter: Option<rust_cef_core::host_capabilities::DragEnterFilter>,
+            ) {
+                self.drag_filter_set
+                    .store(filter.is_some(), Ordering::Release);
+            }
+            fn set_focus_filter(
+                &self,
+                filter: Option<rust_cef_core::host_capabilities::SetFocusFilter>,
+            ) {
+                self.focus_filter_set
+                    .store(filter.is_some(), Ordering::Release);
+            }
+            fn set_pre_key_filter(
+                &self,
+                filter: Option<rust_cef_core::host_capabilities::PreKeyFilter>,
+            ) {
+                self.pre_key_filter_set
+                    .store(filter.is_some(), Ordering::Release);
+            }
+            fn set_key_event_filter(
+                &self,
+                filter: Option<rust_cef_core::host_capabilities::KeyEventFilter>,
+            ) {
+                self.key_filter_set
+                    .store(filter.is_some(), Ordering::Release);
+            }
+            fn set_protocol_execution_filter(
+                &self,
+                filter: Option<rust_cef_core::host_capabilities::ProtocolExecutionFilter>,
+            ) {
+                self.protocol_filter_set
+                    .store(filter.is_some(), Ordering::Release);
+            }
+        }
+
+        let stub = Arc::new(RoutingStub {
+            policy: Mutex::new(PopupPolicy::Auto),
+            ui_active: AtomicBool::new(false),
+            popup_filter_set: AtomicBool::new(false),
+            nav_filter_set: AtomicBool::new(false),
+            extended_mask: AtomicU32::new(0),
+            drag_filter_set: AtomicBool::new(false),
+            focus_filter_set: AtomicBool::new(false),
+            pre_key_filter_set: AtomicBool::new(false),
+            key_filter_set: AtomicBool::new(false),
+            protocol_filter_set: AtomicBool::new(false),
+        });
+        let handle = BrowserHandle::new(stub.clone());
+        assert_eq!(handle.popup_policy(), PopupPolicy::Auto);
+        handle.set_popup_policy(PopupPolicy::NavigateCurrentTab);
+        assert_eq!(handle.popup_policy(), PopupPolicy::NavigateCurrentTab);
+
+        handle.set_popup_ui_listener_active(true);
+        assert!(stub.ui_active.load(Ordering::Acquire));
+        handle.set_extended_event_mask(EXT_EVENT_FRAME_LIFECYCLE);
+        assert_eq!(stub.extended_mask.load(Ordering::Acquire), EXT_EVENT_FRAME_LIFECYCLE);
+
+        let pfilter: PopupFilter = Arc::new(|req| {
+            assert_eq!(req.disposition, PopupDisposition::NewForegroundTab);
+            PopupDecision::NavigateCurrentTab
+        });
+        handle.set_popup_filter(Some(pfilter));
+        assert!(stub.popup_filter_set.load(Ordering::Acquire));
+
+        let nfilter: NavigationFilter = Arc::new(|req| {
+            if req.url.contains("block") {
+                NavigationDecision::Cancel
+            } else {
+                NavigationDecision::Allow
+            }
+        });
+        handle.set_navigation_filter(Some(nfilter));
+        assert!(stub.nav_filter_set.load(Ordering::Acquire));
+
+        handle.set_drag_enter_filter(Some(Arc::new(|_| DragEnterDecision::Allow)));
+        handle.set_focus_filter(Some(Arc::new(|_, _| FocusDecision::Allow)));
+        handle.set_pre_key_filter(Some(Arc::new(|_, _| PreKeyDecision::PassThrough)));
+        handle.set_key_event_filter(Some(Arc::new(|_, _| KeyEventDecision::PassThrough)));
+        handle.set_protocol_execution_filter(Some(Arc::new(|_, _| {
+            ProtocolExecutionDecision::AllowOsExecution
+        })));
+        assert!(stub.drag_filter_set.load(Ordering::Acquire));
+        assert!(stub.focus_filter_set.load(Ordering::Acquire));
+        assert!(stub.pre_key_filter_set.load(Ordering::Acquire));
+        assert!(stub.key_filter_set.load(Ordering::Acquire));
+        assert!(stub.protocol_filter_set.load(Ordering::Acquire));
+
+        clear_routing_and_filters(&handle);
+        assert!(!stub.ui_active.load(Ordering::Acquire));
+        assert_eq!(stub.extended_mask.load(Ordering::Acquire), 0);
+        assert!(!stub.popup_filter_set.load(Ordering::Acquire));
+        assert!(!stub.nav_filter_set.load(Ordering::Acquire));
+        assert!(!stub.drag_filter_set.load(Ordering::Acquire));
+        assert!(!stub.focus_filter_set.load(Ordering::Acquire));
+        assert!(!stub.pre_key_filter_set.load(Ordering::Acquire));
+        assert!(!stub.key_filter_set.load(Ordering::Acquire));
+        assert!(!stub.protocol_filter_set.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn view_ux_state_apply_snapshot_updates_extended_cefsharp_fields() {
+        let mut ux = ViewUxState::default();
+        let mut nav = NavigationSnapshot::default();
+        nav.address = "https://example.test/page".into();
+        nav.title = "Example Page".into();
+        nav.is_loading = true;
+        nav.can_go_back = true;
+        nav.can_go_forward = false;
+        nav.main_http_status = Some(200);
+        nav.last_main_frame_error = Some(-105);
+        nav.cursor = BrowserCursor::PointingHand;
+        nav.tooltip = "Open link".into();
+        nav.status_message = "Connecting".into();
+        nav.favicon_urls = vec!["https://example.test/favicon.ico".into()];
+        nav.fullscreen = true;
+        nav.loading_progress_per_mille = 1450;
+        nav.zoom_level_milli = 1250;
+        nav.audio_muted = true;
+
+        ux.apply_snapshot(&nav);
+        assert_eq!(ux.address, "https://example.test/page");
+        assert_eq!(ux.title, "Example Page");
+        assert!(ux.is_loading);
+        assert!(ux.can_go_back);
+        assert!(!ux.can_go_forward);
+        assert_eq!(ux.main_http_status, Some(200));
+        assert_eq!(ux.last_main_frame_error, Some(-105));
+        assert_eq!(ux.cursor, BrowserCursor::PointingHand);
+        assert_eq!(ux.tooltip, "Open link");
+        assert_eq!(ux.status_text, "Connecting");
+        assert_eq!(ux.favicon_urls, vec!["https://example.test/favicon.ico"]);
+        assert!(ux.fullscreen);
+        assert_eq!(ux.loading_progress_per_mille, 1000);
+        assert_eq!(ux.zoom_level_milli, 1250);
+        assert!(ux.audio_muted);
     }
 }

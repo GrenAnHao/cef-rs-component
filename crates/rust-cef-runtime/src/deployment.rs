@@ -4,12 +4,18 @@ use std::{
     fs::{self, File},
     io::{self, Read, Seek, SeekFrom},
     path::{Component, Path, PathBuf},
+    sync::{
+        OnceLock,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use crate::build_stamp::{BINDING_REVISION, CEF_VERSION, COMPONENT_VERSION, HELPER_PREFIX, TARGET};
 use rust_cef_core::contracts::RuntimeFiles;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+
+const HASH_BUFFER_BYTES: usize = 256 * 1024;
 
 include!(concat!(env!("OUT_DIR"), "/helper_stamp.rs"));
 
@@ -176,22 +182,216 @@ fn check_pe(path: &Path) -> Result<(), DeploymentError> {
     Ok(())
 }
 
-pub fn file_sha256(path: &Path) -> Result<String, DeploymentError> {
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+mod cng_sha256 {
+    use std::{ffi::c_void, fs::File, io::Read, sync::OnceLock};
+
+    const SHA256_ALG_NAME: &[u16] = &[
+        b'S' as u16, b'H' as u16, b'A' as u16, b'2' as u16, b'5' as u16, b'6' as u16, 0,
+    ];
+    const OBJECT_LENGTH_PROP: &[u16] = &[
+        b'O' as u16, b'b' as u16, b'j' as u16, b'e' as u16, b'c' as u16, b't' as u16,
+        b'L' as u16, b'e' as u16, b'n' as u16, b'g' as u16, b't' as u16, b'h' as u16, 0,
+    ];
+    const SHA256_DIGEST_LEN: u32 = 32;
+
+    #[link(name = "bcrypt")]
+    unsafe extern "system" {
+        fn BCryptOpenAlgorithmProvider(
+            ph_algorithm: *mut *mut c_void,
+            psz_alg_id: *const u16,
+            psz_implementation: *const u16,
+            dw_flags: u32,
+        ) -> i32;
+        fn BCryptGetProperty(
+            h_object: *mut c_void,
+            psz_property: *const u16,
+            pb_output: *mut u8,
+            cb_output: u32,
+            pcb_result: *mut u32,
+            dw_flags: u32,
+        ) -> i32;
+        fn BCryptCloseAlgorithmProvider(h_algorithm: *mut c_void, dw_flags: u32) -> i32;
+        fn BCryptCreateHash(
+            h_algorithm: *mut c_void,
+            ph_hash: *mut *mut c_void,
+            pb_hash_object: *mut u8,
+            cb_hash_object: u32,
+            pb_secret: *mut u8,
+            cb_secret: u32,
+            dw_flags: u32,
+        ) -> i32;
+        fn BCryptHashData(
+            h_hash: *mut c_void,
+            pb_input: *const u8,
+            cb_input: u32,
+            dw_flags: u32,
+        ) -> i32;
+        fn BCryptFinishHash(
+            h_hash: *mut c_void,
+            pb_output: *mut u8,
+            cb_output: u32,
+            dw_flags: u32,
+        ) -> i32;
+        fn BCryptDestroyHash(h_hash: *mut c_void) -> i32;
+    }
+
+    struct AlgProvider {
+        handle: usize,
+        object_length: usize,
+    }
+
+    fn provider() -> Option<&'static AlgProvider> {
+        static ALG: OnceLock<Option<AlgProvider>> = OnceLock::new();
+        ALG.get_or_init(|| {
+            let mut alg: *mut c_void = std::ptr::null_mut();
+            let status = unsafe {
+                BCryptOpenAlgorithmProvider(&mut alg, SHA256_ALG_NAME.as_ptr(), std::ptr::null(), 0)
+            };
+            if status < 0 || alg.is_null() {
+                return None;
+            }
+            let mut obj_len_bytes = [0u8; 4];
+            let mut result_len: u32 = 0;
+            let prop_status = unsafe {
+                BCryptGetProperty(
+                    alg,
+                    OBJECT_LENGTH_PROP.as_ptr(),
+                    obj_len_bytes.as_mut_ptr(),
+                    4,
+                    &mut result_len,
+                    0,
+                )
+            };
+            if prop_status < 0 || result_len != 4 {
+                unsafe {
+                    let _ = BCryptCloseAlgorithmProvider(alg, 0);
+                }
+                return None;
+            }
+            let object_length = u32::from_le_bytes(obj_len_bytes) as usize;
+            if object_length == 0 || object_length > 64 * 1024 {
+                unsafe {
+                    let _ = BCryptCloseAlgorithmProvider(alg, 0);
+                }
+                return None;
+            }
+            Some(AlgProvider {
+                handle: alg as usize,
+                object_length,
+            })
+        })
+        .as_ref()
+    }
+
+    struct HashGuard(*mut c_void);
+    impl Drop for HashGuard {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe {
+                    let _ = BCryptDestroyHash(self.0);
+                }
+            }
+        }
+    }
+
+    pub(super) fn hash_file(
+        file: &mut File,
+        buffer: &mut [u8],
+    ) -> Option<std::io::Result<[u8; 32]>> {
+        let alg = provider()?;
+        let mut hash_obj = vec![0u8; alg.object_length];
+        let mut hash_handle: *mut c_void = std::ptr::null_mut();
+        let status = unsafe {
+            BCryptCreateHash(
+                alg.handle as *mut c_void,
+                &mut hash_handle,
+                hash_obj.as_mut_ptr(),
+                alg.object_length as u32,
+                std::ptr::null_mut(),
+                0,
+                0,
+            )
+        };
+        if status < 0 || hash_handle.is_null() {
+            return None;
+        }
+        let _guard = HashGuard(hash_handle);
+        loop {
+            let n = match file.read(buffer) {
+                Ok(n) => n,
+                Err(err) => return Some(Err(err)),
+            };
+            if n == 0 {
+                break;
+            }
+            let Ok(chunk_len) = u32::try_from(n) else {
+                return None;
+            };
+            let status = unsafe { BCryptHashData(hash_handle, buffer.as_ptr(), chunk_len, 0) };
+            if status < 0 {
+                return None;
+            }
+        }
+        let mut digest = [0u8; 32];
+        let status =
+            unsafe { BCryptFinishHash(hash_handle, digest.as_mut_ptr(), SHA256_DIGEST_LEN, 0) };
+        if status < 0 {
+            return None;
+        }
+        Some(Ok(digest))
+    }
+}
+
+fn format_sha256_hex(digest: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(digest.len() * 2);
+    for &byte in digest {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+fn file_sha256_software_with_buffer(
+    path: &Path,
+    buffer: &mut [u8],
+) -> Result<String, DeploymentError> {
     let mut file = File::open(path).map_err(|e| io_error(path, e))?;
     let mut digest = Sha256::new();
-    let mut buffer = [0u8; 65536];
     loop {
-        let n = file.read(&mut buffer).map_err(|e| io_error(path, e))?;
+        let n = file.read(buffer).map_err(|e| io_error(path, e))?;
         if n == 0 {
             break;
         }
         digest.update(&buffer[..n]);
     }
-    Ok(format!("{:x}", digest.finalize()))
+    Ok(format_sha256_hex(&digest.finalize()))
 }
 
-fn check_hash(path: &Path, expected: &str) -> Result<(), DeploymentError> {
-    if !file_sha256(path)?.eq_ignore_ascii_case(expected) {
+fn file_sha256_with_buffer(path: &Path, buffer: &mut [u8]) -> Result<String, DeploymentError> {
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    {
+        let mut file = File::open(path).map_err(|e| io_error(path, e))?;
+        if let Some(res) = cng_sha256::hash_file(&mut file, buffer) {
+            let digest = res.map_err(|e| io_error(path, e))?;
+            return Ok(format_sha256_hex(&digest));
+        }
+    }
+    file_sha256_software_with_buffer(path, buffer)
+}
+
+pub fn file_sha256(path: &Path) -> Result<String, DeploymentError> {
+    let mut buffer = vec![0u8; HASH_BUFFER_BYTES];
+    file_sha256_with_buffer(path, &mut buffer)
+}
+
+fn check_hash_with_buffer(
+    path: &Path,
+    expected: &str,
+    buffer: &mut [u8],
+) -> Result<(), DeploymentError> {
+    if !file_sha256_with_buffer(path, buffer)?.eq_ignore_ascii_case(expected) {
         return Err(DeploymentError::HashMismatch {
             path: path.to_owned(),
         });
@@ -199,11 +399,17 @@ fn check_hash(path: &Path, expected: &str) -> Result<(), DeploymentError> {
     Ok(())
 }
 
+fn check_hash(path: &Path, expected: &str) -> Result<(), DeploymentError> {
+    let mut buffer = vec![0u8; HASH_BUFFER_BYTES];
+    check_hash_with_buffer(path, expected, &mut buffer)
+}
+
 fn check_helper_stamp(path: &Path) -> Result<(), DeploymentError> {
     let mut file = File::open(path).map_err(|e| io_error(path, e))?;
-    let mut chunk = [0u8; 65536];
+    let mut chunk = vec![0u8; HASH_BUFFER_BYTES];
     let mut buffer = Vec::with_capacity(chunk.len() + HELPER_STAMP_LEN);
     let mut tail = Vec::with_capacity(HELPER_STAMP_LEN - 1);
+    let lead = HELPER_PREFIX[0];
     loop {
         let n = file.read(&mut chunk).map_err(|e| io_error(path, e))?;
         if n == 0 {
@@ -212,12 +418,20 @@ fn check_helper_stamp(path: &Path) -> Result<(), DeploymentError> {
         buffer.clear();
         buffer.extend_from_slice(&tail);
         buffer.extend_from_slice(&chunk[..n]);
-        for candidate in buffer.windows(HELPER_STAMP_LEN) {
+        let mut pos = 0;
+        while pos + HELPER_STAMP_LEN <= buffer.len() {
+            let end = buffer.len() - HELPER_STAMP_LEN;
+            let Some(rel) = buffer[pos..=end].iter().position(|&b| b == lead) else {
+                break;
+            };
+            let idx = pos + rel;
+            let candidate = &buffer[idx..idx + HELPER_STAMP_LEN];
             if candidate.starts_with(HELPER_PREFIX)
                 && Sha256::digest(candidate)[..] == HELPER_STAMP_DIGEST
             {
                 return Ok(());
             }
+            pos = idx + 1;
         }
         tail.clear();
         let start = buffer.len().saturating_sub(HELPER_STAMP_LEN - 1);
@@ -341,7 +555,14 @@ pub fn validate_files(
     }
     check_hash(&host_executable, &manifest.host.sha256)?;
     check_hash(&helper_executable, &manifest.helper.sha256)?;
-    for entry in &manifest.runtime {
+    struct RuntimeCheckWork {
+        index: usize,
+        size: u64,
+        path: PathBuf,
+        expected_sha256: String,
+    }
+    let mut works = Vec::with_capacity(manifest.runtime.len());
+    for (index, entry) in manifest.runtime.iter().enumerate() {
         let path = canonical_file(&directory.join(&entry.path))?;
         if !path.starts_with(&directory) {
             return Err(DeploymentError::InvalidLayout { path });
@@ -353,7 +574,57 @@ pub fn validate_files(
         {
             check_pe(&path)?;
         }
-        check_hash(&path, &entry.sha256)?;
+        let size = fs::metadata(&path).map_err(|e| io_error(&path, e))?.len();
+        works.push(RuntimeCheckWork {
+            index,
+            size,
+            path,
+            expected_sha256: entry.sha256.clone(),
+        });
+    }
+    if !works.is_empty() {
+        let mut schedule: Vec<usize> = (0..works.len()).collect();
+        // Longest processing time first so large binaries (`libcef.dll`) start immediately at t=0.
+        schedule.sort_by(|&a, &b| works[b].size.cmp(&works[a].size));
+        let worker_count = std::thread::available_parallelism()
+            .map(std::num::NonZeroUsize::get)
+            .unwrap_or(1)
+            .clamp(1, 8)
+            .min(works.len());
+        let cursor = AtomicUsize::new(0);
+        let outcomes: Vec<OnceLock<Result<(), DeploymentError>>> =
+            (0..works.len()).map(|_| OnceLock::new()).collect();
+        std::thread::scope(|scope| {
+            for _ in 0..worker_count {
+                scope.spawn(|| {
+                    let mut buffer = vec![0u8; HASH_BUFFER_BYTES];
+                    loop {
+                        let pos = cursor.fetch_add(1, Ordering::Relaxed);
+                        let Some(&work_idx) = schedule.get(pos) else {
+                            break;
+                        };
+                        let work = &works[work_idx];
+                        let res = check_hash_with_buffer(
+                            &work.path,
+                            &work.expected_sha256,
+                            &mut buffer,
+                        );
+                        let _ = outcomes[work.index].set(res);
+                    }
+                });
+            }
+        });
+        for (i, slot) in outcomes.into_iter().enumerate() {
+            match slot.into_inner() {
+                Some(res) => res?,
+                None => {
+                    return Err(DeploymentError::Io {
+                        path: works[i].path.clone(),
+                        kind: io::ErrorKind::Other,
+                    });
+                }
+            }
+        }
     }
     let archive: serde_json::Value = serde_json::from_slice(
         &fs::read(directory.join("archive.json")).map_err(|e| io_error(&directory, e))?,
@@ -380,4 +651,43 @@ pub fn validate_files(
         helper_executable,
         manifest,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TempDirGuard(PathBuf);
+    impl Drop for TempDirGuard {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn accelerated_file_sha256_matches_reference_sha2_across_sizes() {
+        let root = std::env::temp_dir().join(format!(
+            "rust-cef-sha256-test-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _guard = TempDirGuard(root.clone());
+        fs::create_dir_all(&root).unwrap();
+
+        let sizes = [0usize, 13, 65_536, HASH_BUFFER_BYTES, 3 * 1024 * 1024 + 17];
+        for (i, size) in sizes.into_iter().enumerate() {
+            let mut payload = vec![0u8; size];
+            for (idx, byte) in payload.iter_mut().enumerate() {
+                *byte = ((idx * 31 + i * 17) & 0xff) as u8;
+            }
+            let path = root.join(format!("sample-{i}.bin"));
+            fs::write(&path, &payload).unwrap();
+            let expected = format!("{:x}", Sha256::digest(&payload));
+            let actual = file_sha256(&path).unwrap();
+            assert_eq!(actual, expected, "size={size}");
+            let mut reusable = vec![0u8; HASH_BUFFER_BYTES];
+            let sw = file_sha256_software_with_buffer(&path, &mut reusable).unwrap();
+            assert_eq!(sw, expected, "software size={size}");
+        }
+    }
 }

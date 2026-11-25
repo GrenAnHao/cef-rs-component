@@ -89,9 +89,10 @@ impl CompiledPolicy {
             && self.matches_compiled_origin(origin)
     }
 
-    /// Subresource/network request: exact allowed HTTP(S) or custom scheme origin only.
+    /// Subresource/network request: exact allowed HTTP(S), WebSocket (`ws:`/`wss:`),
+    /// or custom scheme origin only.
     pub(crate) fn allows_network(&self, url: &str) -> bool {
-        self.allows_target(url)
+        self.allows_target(url) || self.allows_websocket(url)
     }
 
     /// Host-selected navigation may approve embedded data content. Page paths
@@ -105,6 +106,80 @@ impl CompiledPolicy {
     /// the adapter separately, never inherited by an unassociated context.
     pub(crate) fn allows_page_navigation(&self, url: &str) -> bool {
         self.allows_target(url)
+    }
+
+    pub(crate) fn is_open_web(&self) -> bool {
+        self.allow_any_http && self.allow_any_https
+    }
+
+    pub(crate) fn allows_http_wildcard(&self) -> bool {
+        self.allow_any_http
+    }
+
+    pub(crate) fn allows_https_wildcard(&self) -> bool {
+        self.allow_any_https
+    }
+
+    /// Inline `data:` URLs (subframes, WebWorkers, WASM, inline scripts/styles/images)
+    /// permitted under opt-in open-web (`http://*` + `https://*`) browsing with embedded
+    /// data enabled. Strict allowlist policies retain `ApprovedDataPages` isolation.
+    pub(crate) fn allows_open_web_data(&self, url: &str) -> bool {
+        self.is_open_web()
+            && self.allow_embedded_data
+            && url.len() >= 6
+            && !url.contains('\0')
+            && url[..5].eq_ignore_ascii_case("data:")
+            && url[5..].contains(',')
+    }
+
+    fn allows_websocket(&self, url: &str) -> bool {
+        if !raw_target_ok(url) {
+            return false;
+        }
+        let Some((scheme, rest)) = url.split_once("://") else {
+            return false;
+        };
+        let mapped = if scheme.eq_ignore_ascii_case("ws") {
+            format!("http://{rest}")
+        } else if scheme.eq_ignore_ascii_case("wss") {
+            format!("https://{rest}")
+        } else {
+            return false;
+        };
+        parse_http(&mapped)
+            .is_some_and(|parsed| self.matches_compiled_origin(&parsed.origin().ascii_serialization()))
+    }
+
+    /// Web-standard `blob:http://...` / `blob:https://...` URLs permitted only
+    /// when the host selected open-web (`http://*` + `https://*`) browsing.
+    pub(crate) fn allows_open_web_blob(&self, url: &str) -> bool {
+        if !self.is_open_web() || !raw_target_ok(url) || url.len() < 5 {
+            return false;
+        }
+        url[..5].eq_ignore_ascii_case("blob:") && self.allows_target(&url[5..])
+    }
+
+    /// Web-standard blank/srcdoc URLs permitted for subframes/subresources or
+    /// JS-opened popups only under open-web browsing.
+    pub(crate) fn allows_open_web_blank(
+        &self,
+        url: &str,
+        allow_srcdoc: bool,
+        allow_empty: bool,
+    ) -> bool {
+        if !self.is_open_web() {
+            return false;
+        }
+        if allow_empty && url.is_empty() {
+            return true;
+        }
+        raw_target_ok(url)
+            && Url::parse(url).is_ok_and(|parsed| {
+                parsed.scheme() == "about"
+                    && parsed.cannot_be_a_base()
+                    && parsed.host_str().is_none()
+                    && (parsed.path() == "blank" || (allow_srcdoc && parsed.path() == "srcdoc"))
+            })
     }
 
     /// Explicit internal-helper exception only; never a page/resource path.
@@ -490,5 +565,51 @@ mod tests {
             };
             assert!(CompiledPolicy::compile(&cfg).is_err(), "{bad_wildcard:?}");
         }
+    }
+
+    #[test]
+    fn open_web_permits_valid_blobs_and_blank_frames_while_strict_policy_denies_them() {
+        let open = CompiledPolicy::compile(&TrustedContentPolicy::allow_all_http_https(true)).unwrap();
+        let strict = policy(&["https://allowed.local"], true);
+
+        assert!(open.is_open_web());
+        assert!(!strict.is_open_web());
+
+        assert!(open.allows_open_web_blob("blob:https://cn.bing.com/12345678-1234"));
+        assert!(open.allows_open_web_blob("BLOB:http://127.0.0.1:8080/item"));
+        assert!(!open.allows_open_web_blob("blob:null/1234"));
+        assert!(!open.allows_open_web_blob("blob:file:///C:/secret"));
+        assert!(!open.allows_open_web_blob("blob:https://user:pass@cn.bing.com/123"));
+        assert!(!open.allows_open_web_blob("blob:https://cn.bing.com\\bad"));
+        assert!(!strict.allows_open_web_blob("blob:https://allowed.local/1234"));
+
+        assert!(open.allows_open_web_blank("about:blank", false, false));
+        assert!(open.allows_open_web_blank("about:blank#frame", true, false));
+        assert!(open.allows_open_web_blank("about:srcdoc", true, false));
+        assert!(!open.allows_open_web_blank("about:srcdoc", false, false));
+        assert!(open.allows_open_web_blank("", false, true));
+        assert!(!open.allows_open_web_blank("", false, false));
+        assert!(!open.allows_open_web_blank("about:settings", true, false));
+        assert!(!open.allows_open_web_blank("javascript:alert(1)", true, true));
+
+        assert!(!strict.allows_open_web_blank("about:blank", true, true));
+        assert!(!strict.allows_open_web_blank("about:srcdoc", true, true));
+        assert!(!strict.allows_open_web_blank("", true, true));
+
+        // WebSockets match HTTP(S) origin rules, and open-web data: subresources stay isolated from strict policies.
+        assert!(open.allows_network("wss://ws.example.com/socket"));
+        assert!(open.allows_network("ws://localhost:8080/live"));
+        assert!(!open.allows_page_navigation("wss://ws.example.com/socket"));
+        assert!(!open.allows_network("wss://user:pass@ws.example.com/socket"));
+        let strict_ws = policy(&["https://allowed.local:8443", "http://allowed.local"], false);
+        assert!(strict_ws.allows_network("wss://allowed.local:8443/stream"));
+        assert!(strict_ws.allows_network("ws://allowed.local/stream"));
+        assert!(!strict_ws.allows_network("wss://allowed.local/stream"));
+        assert!(!strict_ws.allows_network("wss://evil.local:8443/stream"));
+
+        assert!(open.allows_open_web_data("data:text/javascript,console.log('ok')"));
+        assert!(open.allows_open_web_data("data:text/html,<h1>hi</h1>\n<script>1\\n</script>"));
+        assert!(!open.allows_open_web_data("data:text/html"));
+        assert!(!strict.allows_open_web_data("data:text/javascript,console.log('ok')"));
     }
 }

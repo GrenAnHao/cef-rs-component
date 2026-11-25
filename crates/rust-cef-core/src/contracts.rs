@@ -23,6 +23,11 @@ pub const MAX_ENCODING_BYTES: usize = 64;
 pub const DEFAULT_WINDOWLESS_FRAME_RATE: u16 = 120;
 pub const MIN_WINDOWLESS_FRAME_RATE: u16 = 1;
 pub const MAX_WINDOWLESS_FRAME_RATE: u16 = 240;
+pub const MAX_UNCAUGHT_EXCEPTION_STACK_SIZE: u16 = 100;
+pub const MAX_DRAGGABLE_REGIONS: usize = 256;
+pub const MAX_DOM_IDENTIFIER_BYTES: usize = 256;
+pub const MAX_FRAME_ID_BYTES: usize = 128;
+pub const MAX_EXCEPTION_SOURCE_BYTES: usize = 1024;
 pub const MIN_ZOOM_LEVEL: f64 = -9.0;
 pub const MAX_ZOOM_LEVEL: f64 = 9.0;
 pub const MAX_NATIVE_BOUND: u32 = 16384;
@@ -333,6 +338,7 @@ pub struct RuntimeSettings {
     pub locale: Option<String>,
     pub accept_language_list: Option<String>,
     pub background_color: Option<u32>,
+    pub uncaught_exception_stack_size: Option<u16>,
     pub allowlisted_switches: Vec<CliSwitch>,
     pub custom_schemes: Vec<CustomSchemeConfig>,
     pub windowless_rendering_enabled: bool,
@@ -346,6 +352,7 @@ impl Default for RuntimeSettings {
             locale: None,
             accept_language_list: None,
             background_color: None,
+            uncaught_exception_stack_size: None,
             allowlisted_switches: Vec::new(),
             custom_schemes: Vec::new(),
             windowless_rendering_enabled: true,
@@ -365,6 +372,12 @@ impl RuntimeSettings {
             &self.accept_language_list,
             ConfigError::InvalidAcceptLanguageList,
         )?;
+        if self
+            .uncaught_exception_stack_size
+            .is_some_and(|size| size > MAX_UNCAUGHT_EXCEPTION_STACK_SIZE)
+        {
+            return Err(ConfigError::InvalidUncaughtExceptionStackSize);
+        }
         if self.allowlisted_switches.len() > MAX_ALLOWLISTED_SWITCHES {
             return Err(ConfigError::TooManySwitches);
         }
@@ -559,6 +572,11 @@ impl RuntimeConfigBuilder {
         self
     }
 
+    pub fn uncaught_exception_stack_size(mut self, stack_size: u16) -> Self {
+        self.settings.uncaught_exception_stack_size = Some(stack_size);
+        self
+    }
+
     pub fn allowlisted_switch(mut self, name: impl Into<String>, value: Option<String>) -> Self {
         self.settings.allowlisted_switches.push(CliSwitch {
             name: name.into(),
@@ -612,6 +630,7 @@ pub enum ConfigError {
     InvalidUserAgentProduct,
     InvalidLocale,
     InvalidAcceptLanguageList,
+    InvalidUncaughtExceptionStackSize,
     ForbiddenSwitch,
     TooManySwitches,
     InvalidShortcutFilter,
@@ -768,12 +787,96 @@ impl BrowserSurfaceMode {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DraggableRegionRect {
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+    pub draggable: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FrameLifecycleInfo {
+    pub frame_id: String,
+    pub name: String,
+    pub url: String,
+    pub is_main: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FocusedDomNodeInfo {
+    pub frame_id: String,
+    pub is_main_frame: bool,
+    pub tag_name: String,
+    pub element_id: String,
+    pub input_type: String,
+    pub is_editable: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JsUncaughtExceptionInfo {
+    pub frame_id: String,
+    pub is_main_frame: bool,
+    pub message: String,
+    pub source_url: String,
+    pub line: i32,
+    pub column: i32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResourceResponseInfo {
+    pub url: String,
+    pub method: String,
+    pub is_main_frame: bool,
+    pub status_code: i32,
+    pub mime_type: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResourceLoadCompleteInfo {
+    pub url: String,
+    pub method: String,
+    pub is_main_frame: bool,
+    pub status_code: i32,
+    pub ok: bool,
+    pub received_content_length: i64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BrowserKeyEventKind {
+    RawKeyDown,
+    KeyDown,
+    KeyUp,
+    Char,
+    Unknown(i32),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BrowserKeyEvent {
+    pub kind: BrowserKeyEventKind,
+    pub windows_key_code: i32,
+    pub native_key_code: i32,
+    pub modifiers: u32,
+    pub is_system_key: bool,
+    pub character: u16,
+    pub unmodified_character: u16,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FocusRequestSource {
+    Navigation,
+    System,
+    Unknown(i32),
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BrowserOptions {
     pub windowless_frame_rate: Option<u16>,
     pub background_color: Option<u32>,
     pub default_encoding: Option<String>,
     pub enable_tooltip_events: bool,
+    pub enable_extended_events: bool,
     pub console_policy: ConsolePolicy,
     pub shortcut_filter: ShortcutFilter,
     pub feature_states: BrowserFeatureStates,
@@ -785,6 +888,13 @@ pub struct BrowserOptions {
     /// Enable hardware shared texture OSR (`CefRenderHandler::on_accelerated_paint` + D3D11).
     /// Defaults to `true` on Windows (`false` on other platforms).
     pub accelerated_osr: bool,
+    /// Optional host parent `HWND` for OSR browsers (`CefWindowInfo.parent_window`).
+    /// Required by CEF native OSR context menus (`CefMenuRunnerViewsAura`).
+    pub parent_hwnd: Option<std::num::NonZeroUsize>,
+    /// Default handling policy for popups / `_blank` links (`PopupPolicy::Auto`
+    /// allows managed native popup `HWND`s when attached to a UI view and
+    /// preserves default-deny on unattached headless `Runtime` instances).
+    pub popup_policy: crate::host_capabilities::PopupPolicy,
 }
 
 impl Default for BrowserOptions {
@@ -794,6 +904,7 @@ impl Default for BrowserOptions {
             background_color: None,
             default_encoding: None,
             enable_tooltip_events: false,
+            enable_extended_events: false,
             console_policy: ConsolePolicy::default(),
             shortcut_filter: ShortcutFilter::default(),
             feature_states: BrowserFeatureStates::default(),
@@ -803,6 +914,8 @@ impl Default for BrowserOptions {
             accessibility_state: CefFeatureState::default(),
             surface_mode: BrowserSurfaceMode::default(),
             accelerated_osr: cfg!(target_os = "windows"),
+            parent_hwnd: None,
+            popup_policy: crate::host_capabilities::PopupPolicy::Auto,
         }
     }
 }
@@ -825,6 +938,11 @@ impl BrowserOptions {
 
     pub fn with_tooltip_events(mut self, enabled: bool) -> Self {
         self.enable_tooltip_events = enabled;
+        self
+    }
+
+    pub fn with_extended_events(mut self, enabled: bool) -> Self {
+        self.enable_extended_events = enabled;
         self
     }
 
@@ -873,6 +991,19 @@ impl BrowserOptions {
 
     pub fn with_accelerated_osr(mut self, enabled: bool) -> Self {
         self.accelerated_osr = enabled;
+        self
+    }
+
+    pub fn with_parent_hwnd(mut self, hwnd: std::num::NonZeroUsize) -> Self {
+        self.parent_hwnd = Some(hwnd);
+        self
+    }
+
+    pub fn with_popup_policy(
+        mut self,
+        policy: crate::host_capabilities::PopupPolicy,
+    ) -> Self {
+        self.popup_policy = policy;
         self
     }
 
@@ -1047,5 +1178,38 @@ mod tests {
         assert!((zoom_level_to_percent(max_level) - 500.0).abs() < 0.1 || max_level == MAX_ZOOM_LEVEL);
         let min_level = step_canonical_zoom_level(MIN_ZOOM_LEVEL, -5);
         assert!(min_level >= MIN_ZOOM_LEVEL);
+    }
+
+    #[test]
+    fn browser_options_with_parent_hwnd_sets_parent_hwnd() {
+        let opts = BrowserOptions::default();
+        assert_eq!(opts.parent_hwnd, None);
+        assert_eq!(opts.popup_policy, crate::host_capabilities::PopupPolicy::Auto);
+        let hwnd = std::num::NonZeroUsize::new(0x1234).expect("non-zero");
+        let opts = opts
+            .with_parent_hwnd(hwnd)
+            .with_popup_policy(crate::host_capabilities::PopupPolicy::NavigateCurrentTab)
+            .with_extended_events(true);
+        assert_eq!(opts.parent_hwnd, Some(hwnd));
+        assert_eq!(
+            opts.popup_policy,
+            crate::host_capabilities::PopupPolicy::NavigateCurrentTab
+        );
+        assert!(opts.enable_extended_events);
+    }
+
+    #[test]
+    fn runtime_settings_validates_uncaught_exception_stack_size() {
+        let mut settings = RuntimeSettings::default();
+        assert!(settings.validate().is_ok());
+        settings.uncaught_exception_stack_size = Some(0);
+        assert!(settings.validate().is_ok());
+        settings.uncaught_exception_stack_size = Some(MAX_UNCAUGHT_EXCEPTION_STACK_SIZE);
+        assert!(settings.validate().is_ok());
+        settings.uncaught_exception_stack_size = Some(MAX_UNCAUGHT_EXCEPTION_STACK_SIZE + 1);
+        assert_eq!(
+            settings.validate(),
+            Err(ConfigError::InvalidUncaughtExceptionStackSize)
+        );
     }
 }

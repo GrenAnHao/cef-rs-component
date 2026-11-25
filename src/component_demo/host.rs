@@ -7,8 +7,8 @@ use gpui::{
 };
 use rust_cef_gpui::{
     CefBrowser, ContextMenuConfig, ContextMenuRegistration, ContextMenuServices,
-    DefaultMenuPresenter, NativeCefBrowser, NativeViewDiagnostics, Runtime, RuntimeServices,
-    ViewDiagnostics,
+    DefaultMenuPresenter, NativeCefBrowser, NativeDropTargetServices, NativeViewDiagnostics,
+    Runtime, RuntimeServices, ViewDiagnostics,
     contracts::{
         BrowserConfig, BrowserCursor, BrowserId, BrowserOptions, BrowserSurfaceMode,
         NativeChildHwndConfig, PixelRect, ProfileStorage, RuntimeConfig, RuntimeFiles,
@@ -25,6 +25,7 @@ use rust_cef_gpui::{
     },
     js_bridge::{EvalOutcome, JsBridgeConfig, JsFrameScope, MAX_JS_PAYLOAD_BYTES},
     menu::{MenuContextLimits, MenuLimits},
+    outbound_drag_contracts::OutboundDragPolicy,
     ports::{
         BrowserEvent, BrowserEventEnvelope, BrowserEventSink, CloseMode, FrameSink, OwnedFrame,
         PublishResult, UiDispatcher,
@@ -560,6 +561,9 @@ struct ViewLife {
     /// Renders and answers the component menu. Held with the view so it retires
     /// on the ordinary teardown.
     menu_presenter: Option<std::rc::Rc<std::cell::RefCell<DefaultMenuPresenter>>>,
+    /// Replaces GPUI's file-only drop target in OSR mode so outbound/inbound/intra-page
+    /// drags receive Win32 `IDropTarget` callbacks routed to CEF `DragTarget*`.
+    drop_target: Option<NativeDropTargetServices>,
 }
 
 async fn live(
@@ -631,7 +635,9 @@ async fn live(
         })
         .map_err(|e| format!("demo menu config: {e:?}"))?;
     }
-    let initial_url = if config.menu_page {
+    let initial_url = if let Some(url) = &config.custom_url {
+        url.clone()
+    } else if config.menu_page {
         gpui_cef_poc::menu_probe_url()
     } else if config.js_bridge_page {
         "app://demo/index.html".into()
@@ -677,24 +683,32 @@ async fn live(
             ..Default::default()
         });
     }
-    if config.host_mode == HostMode::NativeHwnd {
-        let parent_hwnd = root
-            .update(cx, |_, window, _| rust_cef_gpui::window_hwnd(window))
-            .map_err(|e| e.to_string())?
-            .ok_or_else(|| "GPUI window Win32 HWND unavailable".to_owned())?;
-        let top_dip = if config.ux_controls { 28.0 } else { 0.0 };
-        let initial_bounds = PixelRect {
-            x: 0,
-            y: (top_dip * scale).round() as i32,
-            width: ((width * scale).round().max(1.0)) as u32,
-            height: (((height - top_dip).max(1.0) * scale).round().max(1.0)) as u32,
-        };
-        options =
-            options.with_surface_mode(BrowserSurfaceMode::NativeChildHwnd(NativeChildHwndConfig {
-                parent_hwnd,
-                initial_bounds,
-                activate_on_creation: false,
-            }));
+    let parent_hwnd = root
+        .update(cx, |_, window, _| rust_cef_gpui::window_hwnd(window))
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "GPUI window Win32 HWND unavailable".to_owned())?;
+    match config.host_mode {
+        HostMode::Osr => {
+            options = options
+                .with_parent_hwnd(parent_hwnd)
+                .with_outbound_drag_policy(OutboundDragPolicy::AllowAsync);
+        }
+        HostMode::NativeHwnd => {
+            let top_dip = if config.ux_controls { 28.0 } else { 0.0 };
+            let initial_bounds = PixelRect {
+                x: 0,
+                y: (top_dip * scale).round() as i32,
+                width: ((width * scale).round().max(1.0)) as u32,
+                height: (((height - top_dip).max(1.0) * scale).round().max(1.0)) as u32,
+            };
+            options = options.with_surface_mode(BrowserSurfaceMode::NativeChildHwnd(
+                NativeChildHwndConfig {
+                    parent_hwnd,
+                    initial_bounds,
+                    activate_on_creation: false,
+                },
+            ));
+        }
     }
     let handle = rt
         .create_browser(BrowserConfig {
@@ -806,6 +820,24 @@ async fn live(
         Ok::<_, String>(())
     })
     .map_err(|e| e.to_string())??;
+    if config.host_mode == HostMode::Osr {
+        life.drop_target = Some(
+            root.update(cx, |root, window, cx| {
+                let entity = root
+                    .browser
+                    .as_ref()
+                    .and_then(|v| v.as_osr())
+                    .ok_or_else(|| "demo OSR View missing for drop target".to_owned())?;
+                let nz1 = std::num::NonZeroUsize::new(1).expect("non-zero drop target");
+                let mut ds = NativeDropTargetServices::new(nz1)
+                    .map_err(|e| format!("drop target new: {e:?}"))?;
+                ds.attach(entity, window, cx)
+                    .map_err(|e| format!("drop target attach: {e:?}"))?;
+                Ok::<_, String>(ds)
+            })
+            .map_err(|e| e.to_string())??,
+        );
+    }
     // Opt-in: attach the real default menu presenter and bind the native
     // registration, exactly like the validation host. The presenter owns the
     // menu UI; nothing here fabricates a context model.
@@ -1237,6 +1269,9 @@ async fn live(
 }
 
 fn detach(cx: &mut AsyncApp, root: WindowHandle<Root>, life: &mut ViewLife) -> Result<(), String> {
+    if let Some(mut ds) = life.drop_target.take() {
+        let _ = ds.retire();
+    }
     life.released = root
         .update(cx, |root, window, cx| {
             root.message = "Closing CEF…";
@@ -1362,14 +1397,24 @@ async fn drive(
             },
             root_cache_path: config.cache_root.clone(),
             thread_mode: config.mode,
-            default_profile: ProfileStorage::Memory,
-            content_policy: TrustedContentPolicy {
-                allowed_origins: if config.js_bridge_page {
-                    vec!["app://demo".into()]
-                } else {
-                    vec![]
-                },
-                allow_embedded_data: true,
+            default_profile: if config.custom_url.is_some() {
+                ProfileStorage::Persistent {
+                    directory: config.cache_root.clone(),
+                }
+            } else {
+                ProfileStorage::Memory
+            },
+            content_policy: if config.custom_url.is_some() {
+                TrustedContentPolicy::allow_all_http_https(true)
+            } else {
+                TrustedContentPolicy {
+                    allowed_origins: if config.js_bridge_page {
+                        vec!["app://demo".into()]
+                    } else {
+                        vec![]
+                    },
+                    allow_embedded_data: true,
+                }
             },
             settings: {
                 let mut settings = if config.js_bridge_page {
@@ -1511,6 +1556,25 @@ async fn drive(
 }
 
 pub(super) fn run(config: Config) -> i32 {
+    if config.cef_example {
+        let host_mode = match config.host_mode {
+            crate::cli::HostMode::Osr => crate::cef_example::model::ExampleHostMode::Osr,
+            crate::cli::HostMode::NativeHwnd => {
+                crate::cef_example::model::ExampleHostMode::NativeHwnd
+            }
+        };
+        return crate::cef_example::run(crate::cef_example::model::ExampleConfig {
+            bundle: config.bundle,
+            helper: config.helper,
+            cache_root: config.cache_root,
+            mode: config.mode,
+            backend: config.backend,
+            host_mode,
+            context_menu: config.context_menu,
+            initial_url: config.custom_url,
+            smoke: config.smoke,
+        });
+    }
     if config.browser_shell {
         return crate::shell::run(config);
     }
@@ -1767,6 +1831,45 @@ mod win32_menu_gpui_tests {
         assert!(
             t_out.get() > 0,
             "GPUI async task did not tick while TrackPopupMenuEx was open"
+        );
+    }
+
+    #[test]
+    fn observations_stays_strict_because_kernel_shields_recoverable_resize_events() {
+        use rust_cef_gpui::contracts::RuntimeGeneration;
+        use rust_cef_gpui::ports::{CaptureFailureKind, EngineError};
+
+        assert!(CaptureFailureKind::IncompleteFrame.is_recoverable_resize_transition());
+        assert!(CaptureFailureKind::ResizeExhausted.is_recoverable_resize_transition());
+        assert!(CaptureFailureKind::Busy.is_recoverable_resize_transition());
+        assert!(!CaptureFailureKind::DeviceRemoved.is_recoverable_resize_transition());
+
+        assert!(EngineError::Capture {
+            kind: CaptureFailureKind::IncompleteFrame,
+            code: None,
+        }
+        .is_recoverable_capture());
+        assert!(!EngineError::Capture {
+            kind: CaptureFailureKind::IncompleteFrame,
+            code: Some(-1),
+        }
+        .is_recoverable_capture());
+
+        let browser = BrowserId::new(RuntimeGeneration::new(1), 1);
+        let obs = Observations::default();
+        obs.publish(BrowserEventEnvelope {
+            browser,
+            sequence: 1,
+            event: BrowserEvent::CaptureFailed(EngineError::Capture {
+                kind: CaptureFailureKind::DeviceRemoved,
+                code: None,
+            }),
+        });
+        assert!(
+            obs.first_fault
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_some()
         );
     }
 }

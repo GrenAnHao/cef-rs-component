@@ -5222,6 +5222,9 @@ impl Window {
                 content_mask,
                 tile,
                 opacity,
+                transformation: TransformationMatrix::unit(),
+                nearest_sampling: false.into(),
+                pad2: 0,
             });
         }
         Ok(())
@@ -5309,13 +5312,52 @@ impl Window {
         frame_index: usize,
         grayscale: bool,
     ) -> Result<()> {
+        self.paint_image_transformed(
+            bounds,
+            image_bounds,
+            corner_radii,
+            data,
+            frame_index,
+            grayscale,
+            None,
+            TransformationMatrix::unit(),
+            false,
+        )
+    }
+
+    /// Paint an image into `bounds` positioned/scaled according to `image_bounds`,
+    /// with an optional 2D transformation matrix, opacity override, and nearest-neighbor
+    /// sampling flag.
+    #[allow(clippy::too_many_arguments)]
+    pub fn paint_image_transformed(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        image_bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        data: Arc<RenderImage>,
+        frame_index: usize,
+        grayscale: bool,
+        opacity_override: Option<f32>,
+        transformation: TransformationMatrix,
+        nearest_sampling: bool,
+    ) -> Result<()> {
         self.invalidator.debug_assert_paint();
 
-        let visible_bounds = bounds.intersect(&image_bounds);
-        if visible_bounds.size.width <= Pixels::ZERO || visible_bounds.size.height <= Pixels::ZERO {
+        if bounds.size.width <= Pixels::ZERO
+            || bounds.size.height <= Pixels::ZERO
+            || image_bounds.size.width <= Pixels::ZERO
+            || image_bounds.size.height <= Pixels::ZERO
+        {
             return Ok(());
         }
-        if image_bounds.size.width <= Pixels::ZERO || image_bounds.size.height <= Pixels::ZERO {
+
+        let has_transform = transformation != TransformationMatrix::unit();
+        let visible_bounds = if has_transform {
+            image_bounds
+        } else {
+            bounds.intersect(&image_bounds)
+        };
+        if visible_bounds.size.width <= Pixels::ZERO || visible_bounds.size.height <= Pixels::ZERO {
             return Ok(());
         }
 
@@ -5337,7 +5379,7 @@ impl Window {
             })?
             .expect("Callback above only returns Some");
 
-        let visible_bounds_snapped = self.snap_bounds(visible_bounds);
+        let target_bounds_snapped = self.snap_bounds(visible_bounds);
 
         let sub_tile = if visible_bounds == image_bounds {
             tile
@@ -5379,21 +5421,34 @@ impl Window {
             }
         };
 
-        let content_mask = self.snapped_content_mask();
+        let mut content_mask = self.snapped_content_mask();
+        if has_transform {
+            let clip_bounds = self.snap_bounds(bounds);
+            content_mask = ContentMask {
+                bounds: content_mask.bounds.intersect(&clip_bounds),
+            };
+        }
         let corner_radii = corner_radii
             .clamp_radii_for_quad_size(visible_bounds.size)
             .scale(self.scale_factor());
-        let opacity = self.element_opacity();
+        let opacity = self.element_opacity()
+            * opacity_override
+                .filter(|v| v.is_finite())
+                .unwrap_or(1.0)
+                .clamp(0.0, 1.0);
 
         self.next_frame.scene.insert_primitive(PolychromeSprite {
             order: 0,
             pad: 0,
             grayscale: grayscale.into(),
-            bounds: visible_bounds_snapped,
+            bounds: target_bounds_snapped,
             content_mask,
             corner_radii,
             tile: sub_tile,
             opacity,
+            transformation,
+            nearest_sampling: nearest_sampling.into(),
+            pad2: 0,
         });
         Ok(())
     }
@@ -5413,10 +5468,14 @@ impl Window {
 
         let bounds = self.snap_bounds(bounds);
         let content_mask = self.snapped_content_mask();
+        let opacity = self.element_opacity();
         self.next_frame.scene.insert_primitive(PaintSurface {
             order: 0,
             bounds,
             content_mask,
+            opacity,
+            transformation: TransformationMatrix::unit(),
+            nearest_sampling: false,
             image_buffer,
         });
     }
@@ -5429,19 +5488,52 @@ impl Window {
         &mut self,
         bounds: Bounds<Pixels>,
         image_bounds: Bounds<Pixels>,
+        texture: crate::WindowsSharedTexture,
+    ) {
+        self.paint_shared_texture_transformed(
+            bounds,
+            image_bounds,
+            texture,
+            None,
+            TransformationMatrix::unit(),
+            false,
+        );
+    }
+
+    /// Paint an externally produced Direct3D 11 shared texture with an optional
+    /// 2D transformation matrix, opacity override, and nearest-neighbor sampling flag.
+    #[cfg(target_os = "windows")]
+    pub fn paint_shared_texture_transformed(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        image_bounds: Bounds<Pixels>,
         mut texture: crate::WindowsSharedTexture,
+        opacity_override: Option<f32>,
+        transformation: TransformationMatrix,
+        nearest_sampling: bool,
     ) {
         use crate::PaintSurface;
 
         self.invalidator.debug_assert_paint();
 
-        let visible_bounds = bounds.intersect(&image_bounds);
-        if visible_bounds.size.width <= Pixels::ZERO
-            || visible_bounds.size.height <= Pixels::ZERO
+        if bounds.size.width <= Pixels::ZERO
+            || bounds.size.height <= Pixels::ZERO
             || image_bounds.size.width <= Pixels::ZERO
             || image_bounds.size.height <= Pixels::ZERO
             || texture.width == 0
             || texture.height == 0
+        {
+            return;
+        }
+
+        let has_transform = transformation != TransformationMatrix::unit();
+        let visible_bounds = if has_transform {
+            image_bounds
+        } else {
+            bounds.intersect(&image_bounds)
+        };
+        if visible_bounds.size.width <= Pixels::ZERO
+            || visible_bounds.size.height <= Pixels::ZERO
         {
             return;
         }
@@ -5483,12 +5575,26 @@ impl Window {
             texture.src_size = size(DevicePixels(clamped_width), DevicePixels(clamped_height));
         }
 
-        let bounds = self.snap_bounds(visible_bounds);
-        let content_mask = self.snapped_content_mask();
+        let target_bounds = self.snap_bounds(visible_bounds);
+        let mut content_mask = self.snapped_content_mask();
+        if has_transform {
+            let clip_bounds = self.snap_bounds(bounds);
+            content_mask = ContentMask {
+                bounds: content_mask.bounds.intersect(&clip_bounds),
+            };
+        }
+        let opacity = self.element_opacity()
+            * opacity_override
+                .filter(|v| v.is_finite())
+                .unwrap_or(1.0)
+                .clamp(0.0, 1.0);
         self.next_frame.scene.insert_primitive(PaintSurface {
             order: 0,
-            bounds,
+            bounds: target_bounds,
             content_mask,
+            opacity,
+            transformation,
+            nearest_sampling,
             texture,
         });
     }

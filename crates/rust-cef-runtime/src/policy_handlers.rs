@@ -63,7 +63,7 @@ wrap_jsdialog_handler! {
             default_prompt_text: Option<&CefString>, callback: Option<&mut JsdialogCallback>,
             suppress_message: Option<&mut ::std::os::raw::c_int>,
         ) -> ::std::os::raw::c_int {
-            if let Some(svc) = self.state.policy.host_capabilities().js_dialog {
+            if let Some(svc) = self.state.effective_host_capabilities().js_dialog {
                 let Some(registry) = self.state.registry.upgrade() else {
                     if let Some(suppress) = suppress_message {
                         *suppress = 1;
@@ -151,7 +151,7 @@ wrap_dialog_handler! {
             accept_filters: Option<&mut CefStringList>, _accept_extensions: Option<&mut CefStringList>,
             _accept_descriptions: Option<&mut CefStringList>, callback: Option<&mut FileDialogCallback>,
         ) -> ::std::os::raw::c_int {
-            if let Some(svc) = self.state.policy.host_capabilities().file_dialog {
+            if let Some(svc) = self.state.effective_host_capabilities().file_dialog {
                 let (Some(registry), Some(callback)) = (self.state.registry.upgrade(), callback)
                 else {
                     return 1;
@@ -204,7 +204,7 @@ wrap_download_handler! {
     impl DownloadHandler {
         fn can_download(&self, _browser: Option<&mut Browser>, _url: Option<&CefString>,
             _request_method: Option<&CefString>) -> ::std::os::raw::c_int {
-            if self.state.policy.host_capabilities().download.is_some() {
+            if self.state.effective_host_capabilities().download.is_some() {
                 return 1;
             }
             self.state.deny(PolicyAction::Download);
@@ -213,7 +213,7 @@ wrap_download_handler! {
         fn on_before_download(&self, _browser: Option<&mut Browser>,
             download_item: Option<&mut DownloadItem>, suggested_name: Option<&CefString>,
             callback: Option<&mut BeforeDownloadCallback>) -> ::std::os::raw::c_int {
-            if let Some(svc) = self.state.policy.host_capabilities().download {
+            if let Some(svc) = self.state.effective_host_capabilities().download {
                 let (Some(registry), Some(item), Some(callback)) = (
                     self.state.registry.upgrade(),
                     download_item,
@@ -286,12 +286,13 @@ wrap_download_handler! {
                     percent_complete: item.percent_complete(),
                     full_path: (!path_str.is_empty()).then(|| PathBuf::from(path_str)),
                 };
+                let caps = self.state.effective_host_capabilities();
                 registry.host_requests.on_download_updated(
                     self.state.browser,
                     snapshot,
                     callback.cloned(),
                     registry.audit_ref(),
-                    &self.state.policy,
+                    &caps,
                 );
             } else if state == DownloadState::InProgress {
                 if let Some(callback) = callback {
@@ -309,7 +310,7 @@ wrap_permission_handler! {
         fn on_request_media_access_permission(&self, _browser: Option<&mut Browser>,
             _frame: Option<&mut Frame>, requesting_origin: Option<&CefString>,
             requested_permissions: u32, callback: Option<&mut MediaAccessCallback>) -> ::std::os::raw::c_int {
-            if let Some(svc) = self.state.policy.host_capabilities().permission {
+            if let Some(svc) = self.state.effective_host_capabilities().permission {
                 let (Some(registry), Some(callback)) = (self.state.registry.upgrade(), callback)
                 else {
                     return 1;
@@ -344,7 +345,7 @@ wrap_permission_handler! {
         fn on_show_permission_prompt(&self, _browser: Option<&mut Browser>, _prompt_id: u64,
             requesting_origin: Option<&CefString>, requested_permissions: u32,
             callback: Option<&mut PermissionPromptCallback>) -> ::std::os::raw::c_int {
-            if let Some(svc) = self.state.policy.host_capabilities().permission {
+            if let Some(svc) = self.state.effective_host_capabilities().permission {
                 let (Some(registry), Some(callback)) = (self.state.registry.upgrade(), callback)
                 else {
                     return 1;

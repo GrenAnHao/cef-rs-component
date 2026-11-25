@@ -160,6 +160,11 @@ impl Session {
                     return Err(EngineError::WrongRuntime);
                 }
             }
+            BrowserCommand::FinishOsrDrag(finish) => {
+                if finish.drag_id.browser != self.snapshot.browser {
+                    return Err(EngineError::WrongRuntime);
+                }
+            }
             BrowserCommand::TouchEvent(touch) => {
                 if self.input_retired {
                     return Err(EngineError::Backend { code: None });
@@ -182,6 +187,27 @@ impl Session {
                     return Err(EngineError::InvalidRequest);
                 }
             }
+            BrowserCommand::SetClientOffset { x_dip, y_dip } => {
+                if !x_dip.is_finite() || !y_dip.is_finite() {
+                    return Err(EngineError::InvalidRequest);
+                }
+            }
+            BrowserCommand::LoadUrlWithPostData {
+                post_data,
+                content_type,
+                ..
+            } => {
+                if post_data.len() > crate::custom_schemes::MAX_INTERCEPT_POST_BODY_BYTES {
+                    return Err(EngineError::InvalidRequest);
+                }
+                if let Some(ct) = content_type
+                    && (ct.trim().is_empty()
+                        || ct.len() > 256
+                        || ct.bytes().any(|b| matches!(b, 0 | b'\r' | b'\n')))
+                {
+                    return Err(EngineError::InvalidRequest);
+                }
+            }
             _ => {}
         }
         if self.config.options.surface_mode.is_native_child_hwnd()
@@ -189,11 +215,13 @@ impl Session {
                 &command,
                 BrowserCommand::SetViewport(_)
                     | BrowserCommand::SetScreenOrigin { .. }
+                    | BrowserCommand::SetClientOffset { .. }
                     | BrowserCommand::MouseClick(_)
                     | BrowserCommand::Input(_)
                     | BrowserCommand::TouchEvent(_)
                     | BrowserCommand::DragTarget(_)
                     | BrowserCommand::FinishOutboundDrag(_)
+                    | BrowserCommand::FinishOsrDrag(_)
             )
         {
             return Err(EngineError::InvalidRequest);
@@ -325,10 +353,25 @@ impl Session {
         &mut self,
         finish: crate::outbound_drag::OutboundDragFinish,
     ) -> Result<CommandEnvelope, EngineError> {
+        self.admit_drag_reply(finish.drag_id.browser, BrowserCommand::FinishOutboundDrag(finish))
+    }
+
+    pub fn admit_osr_drag_finish(
+        &mut self,
+        finish: crate::outbound_drag::OsrDragFinish,
+    ) -> Result<CommandEnvelope, EngineError> {
+        self.admit_drag_reply(finish.drag_id.browser, BrowserCommand::FinishOsrDrag(finish))
+    }
+
+    fn admit_drag_reply(
+        &mut self,
+        target_browser: BrowserId,
+        command: BrowserCommand,
+    ) -> Result<CommandEnvelope, EngineError> {
         if self.config.options.surface_mode.is_native_child_hwnd() {
             return Err(EngineError::InvalidRequest);
         }
-        if finish.drag_id.browser != self.snapshot.browser {
+        if target_browser != self.snapshot.browser {
             return Err(EngineError::WrongRuntime);
         }
         match self.snapshot.state {
@@ -351,7 +394,7 @@ impl Session {
                 browser: self.snapshot.browser,
                 sequence,
             },
-            command: BrowserCommand::FinishOutboundDrag(finish),
+            command,
         })
     }
 
@@ -469,7 +512,8 @@ impl Session {
             | BrowserEvent::HostShortcutTriggered { .. }
             | BrowserEvent::StartOutboundDrag(_)
             | BrowserEvent::OutboundDragCursorChanged(_)
-            | BrowserEvent::AccessibilityTreeUpdated { .. } => {}
+            | BrowserEvent::AccessibilityTreeUpdated { .. }
+            | BrowserEvent::PopupRequested(_) => {}
             BrowserEvent::LoadingChanged {
                 loading,
                 can_go_back,
@@ -515,7 +559,21 @@ impl Session {
             BrowserEvent::NavigationRequested { .. }
             | BrowserEvent::LoadStarted { .. }
             | BrowserEvent::LoadFinished { .. }
-            | BrowserEvent::LoadCancelled { .. } => {}
+            | BrowserEvent::LoadCancelled { .. }
+            | BrowserEvent::DraggableRegionsChanged(_)
+            | BrowserEvent::AutoResized { .. }
+            | BrowserEvent::MediaAccessChanged { .. }
+            | BrowserEvent::DocumentAvailableInMainFrame
+            | BrowserEvent::FrameCreated(_)
+            | BrowserEvent::FrameAttached { .. }
+            | BrowserEvent::FrameDetached { .. }
+            | BrowserEvent::MainFrameChanged { .. }
+            | BrowserEvent::ContextCreated { .. }
+            | BrowserEvent::ContextReleased { .. }
+            | BrowserEvent::FocusedNodeChanged(_)
+            | BrowserEvent::UncaughtJsException(_)
+            | BrowserEvent::ResourceResponseObserved(_)
+            | BrowserEvent::ResourceLoadCompleted(_) => {}
             _ => return false,
         }
         true
@@ -584,7 +642,10 @@ impl AcceptedCommand {
 mod input_tests {
     use super::*;
     use crate::{
-        contracts::{RenderPreference, RuntimeGeneration, Viewport},
+        contracts::{
+            BrowserOptions, BrowserSurfaceMode, NativeChildHwndConfig, PixelRect,
+            RenderPreference, RuntimeGeneration, Viewport,
+        },
         input::InputResetReason,
     };
 
@@ -680,5 +741,88 @@ mod input_tests {
             Some(EngineError::Backend { code: None })
         );
         assert!(exhausted.input_retired());
+    }
+
+    #[test]
+    fn set_client_offset_validates_finite_coords_and_osr_surface_mode() {
+        let browser = BrowserId::new(RuntimeGeneration::new(1), 11);
+        let osr_config = BrowserConfig {
+            initial_url: String::new(),
+            profile: None,
+            render_preference: RenderPreference::SoftwareRequired,
+            viewport: Viewport {
+                width: 200,
+                height: 100,
+                scale: 1.5,
+            },
+            options: BrowserOptions::default(),
+        };
+        let mut osr_session = Session::begin_create(browser, osr_config).unwrap();
+        osr_session.after_created();
+        assert!(
+            osr_session
+                .admit_command(BrowserCommand::SetClientOffset {
+                    x_dip: 0.0,
+                    y_dip: 44.0,
+                })
+                .is_ok()
+        );
+        assert_eq!(
+            osr_session
+                .admit_command(BrowserCommand::SetClientOffset {
+                    x_dip: f32::NAN,
+                    y_dip: 10.0,
+                })
+                .err(),
+            Some(EngineError::InvalidRequest)
+        );
+        assert_eq!(
+            osr_session
+                .admit_command(BrowserCommand::SetClientOffset {
+                    x_dip: 0.0,
+                    y_dip: f32::INFINITY,
+                })
+                .err(),
+            Some(EngineError::InvalidRequest)
+        );
+
+        let hwnd = std::num::NonZeroUsize::new(0x1234).unwrap();
+        let native_config = BrowserConfig {
+            initial_url: String::new(),
+            profile: None,
+            render_preference: RenderPreference::SoftwareRequired,
+            viewport: Viewport {
+                width: 200,
+                height: 100,
+                scale: 1.0,
+            },
+            options: BrowserOptions::default().with_surface_mode(
+                BrowserSurfaceMode::NativeChildHwnd(NativeChildHwndConfig {
+                    parent_hwnd: hwnd,
+                    initial_bounds: PixelRect {
+                        x: 0,
+                        y: 0,
+                        width: 200,
+                        height: 100,
+                    },
+                    activate_on_creation: false,
+                }),
+            ),
+        };
+        let mut native_session = Session::begin_create(
+            BrowserId::new(RuntimeGeneration::new(1), 12),
+            native_config,
+        )
+        .unwrap();
+        native_session.after_created();
+        assert_eq!(
+            native_session
+                .admit_command(BrowserCommand::SetClientOffset {
+                    x_dip: 0.0,
+                    y_dip: 28.0,
+                })
+                .err(),
+            Some(EngineError::InvalidRequest)
+        );
     }
 }
