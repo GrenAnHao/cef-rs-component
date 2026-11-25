@@ -9,7 +9,8 @@ param(
     [switch]$Release,
     [switch]$BuildOnly,
     [string]$CefPath = '',
-    [string]$TargetDir = ''
+    [string]$TargetDir = '',
+    [string]$StagingRoot = ''
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
@@ -48,7 +49,12 @@ try {
     $binDir = Join-Path $target "$PocTarget\$profile"
     $hostExe = Join-Path $binDir 'gpui-cef-example.exe'
     $helperExe = Join-Path $binDir 'rust-cef-helper.exe'
-    $bundleDir = Join-Path (Resolve-ComponentBundlesRoot '') "cef-example-$profile"
+    $resolvedStaging = if (-not [string]::IsNullOrWhiteSpace($StagingRoot) -and -not [IO.Path]::IsPathRooted($StagingRoot)) {
+        [IO.Path]::GetFullPath((Join-Path $PocRoot $StagingRoot))
+    } else {
+        $StagingRoot
+    }
+    $bundleDir = Join-Path (Resolve-ComponentBundlesRoot $resolvedStaging) "cef-example-$profile"
 
     $packed = & (Join-Path $PSScriptRoot 'package-component.ps1') `
         -HostExecutable $hostExe `
@@ -58,7 +64,10 @@ try {
         -HostBuildVersion "cef-example-$profile"
 
     Write-Host "Packaged gpui-cef-example: $packed"
-    if ($BuildOnly) { return }
+    if ($BuildOnly) {
+        Write-Output $packed
+        return
+    }
 
     $cacheRoot = Resolve-PocTempDir "cef-example-cache-$profile"
     $stagedExe = Join-Path $packed 'gpui-cef-example.exe'

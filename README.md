@@ -124,7 +124,9 @@
 打包完成后，也可直接运行离线 bundle 中的 `gpui-cef-example.exe`（零参数即可启动，自动识别同目录 CEF 运行时与 `rust-cef-helper.exe`）：
 
 ```powershell
-& 'E:\cargo-target\gpui-cef-poc\component-bundles\cef-example-release\gpui-cef-example.exe'
+# 打包至项目相对目录 .\dist 后，可直接零参数运行离线可执行文件
+.\scripts\run-example.ps1 -Release -StagingRoot .\dist -BuildOnly
+.\dist\cef-example-release\gpui-cef-example.exe
 # 可选 CLI 参数: [--host-mode osr|native-hwnd] [--backend D3d11|Software] [--mode Threaded|Integrated] [--context-menu true|false] [--url <url>] [--smoke-ms 100..30000]
 ```
 
@@ -160,20 +162,20 @@
 如需构建、打包离线独立发行目录或直接运行打包产物：
 
 ```powershell
-# 构建并打包至默认输出目录（或通过 -TargetDir / POC_TARGET_DIR 指定短路径）
-.\scripts\build.ps1
-.\scripts\run.ps1 -Release -BuildOnly
+# 构建并打包至项目相对目录 .\dist（也可通过 -TargetDir / POC_TARGET_DIR 指定自定义构建目录）
+$bundle = .\scripts\build.ps1 -StagingRoot .\dist
+.\scripts\run.ps1 -Release -StagingRoot .\dist -BuildOnly
 
 # 手动运行已打包的组件演示宿主（支持 --ux-controls / --browser-shell / --cef-example / --host-mode）
-& 'E:\cargo-target\gpui-cef-poc\component-bundles\component-demo-debug\gpui-cef-component-demo.exe' `
-    --bundle 'E:\cargo-target\gpui-cef-poc\component-bundles\component-demo-debug' `
-    --helper 'E:\cargo-target\gpui-cef-poc\component-bundles\component-demo-debug\rust-cef-helper.exe' `
-    --cache-root 'E:\cargo-target\gpui-cef-poc\tmp\demo-cache' `
+& (Join-Path $bundle 'gpui-cef-component-demo.exe') `
+    --bundle $bundle `
+    --helper (Join-Path $bundle 'rust-cef-helper.exe') `
+    --cache-root ([IO.Path]::GetFullPath('.\dist\demo-cache')) `
     --mode Threaded --backend D3d11 --ux-controls true --browser-shell true
 ```
 
 ### Windows 构建注意事项
-1. **短构建目录**：由于 `cef-dll-sys` 使用 `CMAKE_OBJECT_PATH_MAX=500`，过深的工程路径易触及 Windows `MAX_PATH` 限制。仓内 [`.cargo/config.toml`](.cargo/config.toml) 与构建脚本默认将产物输出至短路径（本机优先 `E:\cargo-target\gpui-cef-poc\cargo`，亦可通过 `-TargetDir`、`CARGO_TARGET_DIR` 或 `POC_TARGET_DIR` 覆盖）。
+1. **短构建目录**：由于 `cef-dll-sys` 使用 `CMAKE_OBJECT_PATH_MAX=500`，过深的工程路径易触及 Windows `MAX_PATH` 限制。仓内 [`.cargo/config.toml`](.cargo/config.toml) 与构建脚本默认将中间产物输出至所在磁盘根目录下的短路径 `cargo-target`，亦可通过相对或自定义路径参数 `-TargetDir`、`-StagingRoot` 以及环境变量 `CARGO_TARGET_DIR`、`POC_TARGET_DIR`、`POC_OUTPUT_ROOT` 覆盖。
 2. **UTF-8 编码页**：中文 Windows（CP936）下直接编译 CEF 头文件可能触发 `C4819`，仓库已通过 `scripts/windows-toolchain.cmake` 与构建脚本自动注入 `/utf-8`。
 3. **锁定依赖**：所有 `cargo` 命令建议携带 `--locked`，保持 `Cargo.lock` 与本地 `patches/gpui-pre*` 身份一致。
 
@@ -213,8 +215,8 @@ pwsh -NoProfile -File scripts/test-component-demo.ps1 -Release -MenuProbe -MenuT
 
 # 无过滤全 Workspace 与部署自测试（需提前通过 export-cef-dir 导出 CEF 目录）
 pwsh -NoProfile -File scripts/test-component-workspace.ps1 `
-    -TargetDir C:/cef-workspace-test -EvidenceDirectory C:/cef-workspace-evidence `
-    -CefPath C:/path/to/exported-cef
+    -TargetDir ..\cef-workspace-target -EvidenceDirectory ..\cef-workspace-evidence `
+    -CefPath .\.cef\156.0.31_windows_x86_64
 ```
 
 > 注：历史与当前阶段验证结论、豁免项及局限说明详见 [docs/validation.md](docs/validation.md)。
