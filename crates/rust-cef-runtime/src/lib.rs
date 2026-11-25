@@ -8,6 +8,8 @@ mod before_unload;
 mod build_stamp;
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 mod capture;
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+mod jsb_bridge_js;
 pub mod client;
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 mod client_handlers;

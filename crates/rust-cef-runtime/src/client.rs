@@ -3,11 +3,9 @@
 //! the host.
 #![cfg(all(target_os = "windows", target_arch = "x86_64"))]
 
-#[cfg(feature = "test-support")]
-use std::sync::atomic::AtomicU64;
 use std::sync::{
     Arc, Mutex, Weak,
-    atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering},
+    atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering},
 };
 
 use cef::*;
@@ -582,10 +580,26 @@ pub(crate) struct BrowserClientState {
     frame_stats_count: std::sync::atomic::AtomicU64,
     frame_stats_copy_us_sum: std::sync::atomic::AtomicU64,
     pub(crate) routing: Arc<PopupAndNavRoutingState>,
+    pending_post: Mutex<Option<PendingPostLoad>>,
+    next_post_bootstrap_seq: AtomicU64,
     #[cfg(feature = "test-support")]
     probe_console_kinds: AtomicU64,
     #[cfg(feature = "test-support")]
     pub(crate) menu_probe: Arc<crate::menu_probe::MenuProbe>,
+}
+
+/// Pending cross-origin `LoadUrlWithPostData` request held while CEF
+/// commits an in-memory bootstrap document on `target_origin` so the ensuing
+/// `CefFrame::LoadRequest` satisfies Chromium's initiator-origin check
+/// (`.cef/156.0.31_windows_x86_64/include/cef_frame.h:141-146`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PendingPostLoad {
+    pub(crate) bootstrap_url: String,
+    pub(crate) target_origin: String,
+    pub(crate) url: String,
+    pub(crate) post_data: Vec<u8>,
+    pub(crate) content_type: Option<String>,
+    pub(crate) bootstrap_served: bool,
 }
 
 fn frame_stats_enabled() -> bool {
@@ -648,9 +662,121 @@ impl BrowserClientState {
             frame_stats_count: std::sync::atomic::AtomicU64::new(0),
             frame_stats_copy_us_sum: std::sync::atomic::AtomicU64::new(0),
             routing: Arc::new(PopupAndNavRoutingState::new(PopupPolicy::Auto)),
+            pending_post: Mutex::new(None),
+            next_post_bootstrap_seq: AtomicU64::new(0),
             accessibility: crate::accessibility::RuntimeAccessibilityState::new(false),
             policy,
         }
+    }
+
+    /// Builds a `POST` `CefRequest` matching `CefSharp.WebBrowserExtensions.LoadUrlWithPostData`
+    /// (`CefSharp/WebBrowserExtensions.cs:866-885`). Under Site Isolation, cross-origin
+    /// `CefFrame::LoadRequest` fails with `RESULT_CODE_KILLED_BAD_MESSAGE`
+    /// (`INVALID_INITIATOR_ORIGIN`, `.cef/156.0.31_windows_x86_64/include/cef_frame.h:141-146`,
+    /// `CefSharp.Test/OffScreen/OffScreenBrowserTests.cs:69-73`), so callers must first
+    /// ensure the main frame's committed origin matches `url`.
+    pub(crate) fn build_post_cef_request(
+        url: &str,
+        post_data: &[u8],
+        content_type: Option<&str>,
+    ) -> Result<Request, rust_cef_core::ports::EngineError> {
+        let req =
+            cef::request_create().ok_or(rust_cef_core::ports::EngineError::Backend { code: None })?;
+        req.set_url(Some(&CefString::from(url)));
+        req.set_method(Some(&CefString::from("POST")));
+        req.set_flags(cef::sys::cef_urlrequest_flags_t::UR_FLAG_ALLOW_STORED_CREDENTIALS.0);
+        let ct = content_type.unwrap_or("application/x-www-form-urlencoded");
+        req.set_header_by_name(
+            Some(&CefString::from("Content-Type")),
+            Some(&CefString::from(ct)),
+            1,
+        );
+        if !post_data.is_empty() {
+            let mut pd = cef::post_data_create()
+                .ok_or(rust_cef_core::ports::EngineError::Backend { code: None })?;
+            let mut elem = cef::post_data_element_create()
+                .ok_or(rust_cef_core::ports::EngineError::Backend { code: None })?;
+            elem.set_to_bytes(post_data.len(), post_data.as_ptr());
+            if pd.add_element(Some(&mut elem)) == 0 {
+                return Err(rust_cef_core::ports::EngineError::Backend { code: None });
+            }
+            req.set_post_data(Some(&mut pd));
+        }
+        Ok(req)
+    }
+
+    pub(crate) fn arm_pending_post(
+        &self,
+        target_origin: String,
+        url: String,
+        post_data: Vec<u8>,
+        content_type: Option<String>,
+    ) -> String {
+        let seq = self.next_post_bootstrap_seq.fetch_add(1, Ordering::Relaxed) + 1;
+        let bootstrap_url = format!("{target_origin}/__gpui_cef_post_bootstrap_{seq}__");
+        *self
+            .pending_post
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(PendingPostLoad {
+            bootstrap_url: bootstrap_url.clone(),
+            target_origin,
+            url,
+            post_data,
+            content_type,
+            bootstrap_served: false,
+        });
+        bootstrap_url
+    }
+
+    pub(crate) fn clear_pending_post(&self) {
+        *self
+            .pending_post
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+
+    pub(crate) fn is_post_bootstrap_url(&self, url: &str) -> bool {
+        self.pending_post
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(|p| p.bootstrap_url == url)
+    }
+
+    pub(crate) fn claim_post_bootstrap_response(&self, url: &str, method: &str) -> bool {
+        if !self.active.load(Ordering::Acquire) || !method.eq_ignore_ascii_case("GET") {
+            return false;
+        }
+        let mut guard = self
+            .pending_post
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(p) = guard.as_mut()
+            && !p.bootstrap_served
+            && p.bootstrap_url == url
+        {
+            p.bootstrap_served = true;
+            return true;
+        }
+        false
+    }
+
+    pub(crate) fn take_ready_pending_post(&self, loaded_url: &str) -> Option<PendingPostLoad> {
+        let mut guard = self
+            .pending_post
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !self.active.load(Ordering::Acquire) {
+            *guard = None;
+            return None;
+        }
+        let matches_bootstrap = guard.as_ref().is_some_and(|p| p.bootstrap_url == loaded_url);
+        if !matches_bootstrap {
+            return None;
+        }
+        let pending = guard.take()?;
+        let loaded_origin = self.policy.rules.canonical_origin_for(loaded_url);
+        (loaded_origin.as_deref() == Some(pending.target_origin.as_str())).then_some(pending)
     }
 
     pub(crate) fn with_options(mut self, options: BrowserOptions) -> Self {
@@ -1028,6 +1154,7 @@ impl BrowserClientState {
             return false;
         }
         if self.policy.rules.allows_page_navigation(url)
+            || self.policy.allows_chrome_internal_url(url)
             || self.policy.rules.allows_open_web_blob(url)
             || self.policy.rules.allows_open_web_data(url)
             || self.policy.rules.allows_open_web_blank(url, !main, false)
@@ -1050,6 +1177,7 @@ impl BrowserClientState {
     pub(crate) fn allows_resource(&self, url: &str, main_navigation: bool) -> bool {
         self.active.load(Ordering::Acquire)
             && (self.policy.rules.allows_network(url)
+                || self.policy.allows_chrome_internal_url(url)
                 || self.policy.rules.allows_open_web_blob(url)
                 || self.policy.rules.allows_open_web_data(url)
                 || self
@@ -1888,9 +2016,13 @@ wrap_display_handler! {
             frame: Option<&mut Frame>,
             url: Option<&CefString>,
         ) {
-            if frame.is_some_and(|frame| frame.is_main() != 0) {
-                if let Some(url) = url {
-                    self.state.navigation_event(BrowserEvent::AddressChanged(url.to_string()));
+            if frame.is_some_and(|frame| frame.is_main() != 0)
+                && let Some(url) = url
+            {
+                let url_str = url.to_string();
+                if !self.state.is_post_bootstrap_url(&url_str) {
+                    self.state
+                        .navigation_event(BrowserEvent::AddressChanged(url_str));
                 }
             }
         }
@@ -2273,8 +2405,16 @@ wrap_load_handler! {
             _transition_type: TransitionType,
         ) {
             if let Some(frame) = frame {
+                let is_main = frame.is_main() != 0;
+                if is_main
+                    && self
+                        .state
+                        .is_post_bootstrap_url(&CefString::from(&frame.url()).to_string())
+                {
+                    return;
+                }
                 self.state.navigation_event(BrowserEvent::LoadStarted {
-                    is_main_frame: frame.is_main() != 0,
+                    is_main_frame: is_main,
                 });
             }
         }
@@ -2286,10 +2426,26 @@ wrap_load_handler! {
             http_status_code: ::std::os::raw::c_int,
         ) {
             if let Some(frame) = frame {
+                let is_main = frame.is_main() != 0;
+                let frame_url = CefString::from(&frame.url()).to_string();
+                if is_main
+                    && let Some(pending) = self.state.take_ready_pending_post(&frame_url)
+                    && frame.is_valid() != 0
+                {
+                    if let Ok(mut req) = BrowserClientState::build_post_cef_request(
+                        &pending.url,
+                        &pending.post_data,
+                        pending.content_type.as_deref(),
+                    ) {
+                        self.state.audit_native();
+                        frame.load_request(Some(&mut req));
+                    }
+                    return;
+                }
                 self.state.navigation_observation(BrowserEvent::LoadFinished {
-                    is_main_frame: frame.is_main() != 0,
+                    is_main_frame: is_main,
                     http_status_code,
-                }, Some(CefString::from(&frame.url()).to_string()));
+                }, Some(frame_url));
             }
         }
 
@@ -2302,9 +2458,14 @@ wrap_load_handler! {
             failed_url: Option<&CefString>,
         ) {
             if let Some(frame) = frame {
+                let is_main = frame.is_main() != 0;
+                let url_opt = failed_url.map(ToString::to_string);
+                if is_main && url_opt.as_deref().is_some_and(|u| self.state.is_post_bootstrap_url(u)) {
+                    self.state.clear_pending_post();
+                }
                 self.state.navigation_observation(
-                    frame_load_error(frame.is_main() != 0, error_code),
-                    failed_url.map(ToString::to_string),
+                    frame_load_error(is_main, error_code),
+                    url_opt,
                 );
             }
         }
@@ -2332,6 +2493,9 @@ wrap_request_handler! {
             if !self.state.allows_navigation(&url, main) {
                 self.state.deny_disallowed_url(&url);
                 return 1;
+            }
+            if main && self.state.is_post_bootstrap_url(&url) {
+                return 0;
             }
             if let Some(filter) = self.state.routing.navigation_filter() {
                 let req = NavigationRequest {
@@ -2457,6 +2621,7 @@ wrap_request_handler! {
             if let Some(registry)=self.state.registry.upgrade(){registry.renderer_event(self.state.browser,BrowserEvent::Responsive);}
         }
         fn on_render_process_terminated(&self,_browser:Option<&mut Browser>,status:TerminationStatus,error_code:i32,error_string:Option<&CefString>){
+            self.state.clear_pending_post();
             let reason = error_string.map(ToString::to_string).unwrap_or_default();
             eprintln!(
                 "[gpui-cef] Renderer terminated: browser={:?} status={} code={} (0x{:08X}) reason={:?}",
@@ -4105,5 +4270,38 @@ mod tests {
                 false
             )
         );
+    }
+
+    #[test]
+    fn pending_post_bootstrap_claims_once_matches_origin_and_supersedes() {
+        let (_registry, state, _observers) = frame_fixture();
+        let boot1 = state.arm_pending_post(
+            "https://allowed.local".into(),
+            "https://allowed.local/PostDataTest.html".into(),
+            b"a=1".to_vec(),
+            None,
+        );
+        assert!(state.is_post_bootstrap_url(&boot1));
+        assert!(!state.claim_post_bootstrap_response(&boot1, "POST"));
+        assert!(state.claim_post_bootstrap_response(&boot1, "GET"));
+        assert!(!state.claim_post_bootstrap_response(&boot1, "GET"));
+        let taken = state
+            .take_ready_pending_post(&boot1)
+            .expect("bootstrap origin matches");
+        assert_eq!(taken.url, "https://allowed.local/PostDataTest.html");
+        assert_eq!(taken.post_data, b"a=1");
+        assert!(!state.is_post_bootstrap_url(&boot1));
+        assert!(state.take_ready_pending_post(&boot1).is_none());
+
+        let boot2 = state.arm_pending_post(
+            "https://allowed.local".into(),
+            "https://allowed.local/PostDataTest.html".into(),
+            b"b=2".to_vec(),
+            Some("text/plain".into()),
+        );
+        assert_ne!(boot1, boot2);
+        state.clear_pending_post();
+        assert!(!state.is_post_bootstrap_url(&boot2));
+        assert!(!state.claim_post_bootstrap_response(&boot2, "GET"));
     }
 }

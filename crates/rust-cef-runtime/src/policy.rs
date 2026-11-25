@@ -202,6 +202,33 @@ impl CompiledPolicy {
     }
 }
 
+pub(crate) fn allows_chrome_internal_url_syntax(raw: &str) -> bool {
+    if !raw_target_ok(raw) {
+        return false;
+    }
+    let Some(scheme_lower) = raw.split_once("://").map(|(s, _)| s.to_ascii_lowercase()) else {
+        return false;
+    };
+    if !matches!(scheme_lower.as_str(), "chrome" | "chrome-untrusted") {
+        return false;
+    }
+    let Some(auth) = authority(raw) else {
+        return false;
+    };
+    if auth.contains('@') || !auth.is_ascii() {
+        return false;
+    }
+    let Ok(parsed) = Url::parse(raw) else {
+        return false;
+    };
+    !parsed.cannot_be_a_base()
+        && parsed
+            .host_str()
+            .is_some_and(|host| !host.is_empty() && host.is_ascii())
+        && parsed.username().is_empty()
+        && parsed.password().is_none()
+}
+
 pub(crate) fn canonical_origin(raw: &str, custom_schemes: &BTreeSet<String>) -> Option<String> {
     if !raw_target_ok(raw) {
         return None;

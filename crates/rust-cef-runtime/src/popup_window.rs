@@ -553,6 +553,7 @@ wrap_request_handler! {
             let url = CefString::from(&request.url()).to_string();
             let main = frame.is_main() != 0;
             if self.policy.rules.allows_page_navigation(&url)
+                || self.policy.allows_chrome_internal_url(&url)
                 || self.policy.rules.allows_open_web_blob(&url)
                 || self.policy.rules.allows_open_web_data(&url)
                 || self.policy.rules.allows_open_web_blank(&url, !main, false)

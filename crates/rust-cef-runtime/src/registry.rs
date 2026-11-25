@@ -6566,6 +6566,8 @@ impl UiRegistry {
             browser,
             &config.options,
             &client_state.policy.rules,
+            client_state.policy.js_bridge_allow_subframes(),
+            client_state.policy.take_next_browser_legacy_binding(),
         );
         let url = CefString::from(config.initial_url.as_str());
         if client_state.capture.is_abandoned() {
@@ -6663,7 +6665,16 @@ impl UiRegistry {
             self.invalidate_ime(browser);
         }
         match &command {
-            BrowserCommand::Navigate(url) | BrowserCommand::LoadUrlWithPostData { url, .. } => {
+            BrowserCommand::Navigate(url) => {
+                if let Some(policy) = self.policy()
+                    && !policy.rules.allows_host_navigation(url)
+                    && !policy.allows_chrome_internal_url(url)
+                {
+                    policy.deny(Some(browser), PolicyAction::Navigation);
+                    return Err(EngineError::PolicyDenied);
+                }
+            }
+            BrowserCommand::LoadUrlWithPostData { url, .. } => {
                 if let Some(policy) = self.policy()
                     && !policy.rules.allows_host_navigation(url)
                 {
@@ -7892,6 +7903,7 @@ impl BrowserEngine for NativeBrowserEngine<'_> {
         match envelope.command {
             BrowserCommand::Navigate(url) => {
                 if let Some(state) = self.client_state {
+                    state.clear_pending_post();
                     state.approve_host_navigation(&url);
                 }
                 let frame = self.native.main_frame().ok_or(EngineError::NotReady)?;
@@ -7903,48 +7915,63 @@ impl BrowserEngine for NativeBrowserEngine<'_> {
                 post_data,
                 content_type,
             } => {
-                if let Some(state) = self.client_state {
-                    state.approve_host_navigation(&url);
-                }
+                let state = self.client_state.ok_or(EngineError::NotReady)?;
+                let target_origin = state
+                    .policy
+                    .rules
+                    .canonical_origin_for(&url)
+                    .ok_or(EngineError::InvalidRequest)?;
+                state.clear_pending_post();
+                state.approve_host_navigation(&url);
                 let frame = self.native.main_frame().ok_or(EngineError::NotReady)?;
-                let mut req = cef::request_create().ok_or(EngineError::Backend { code: None })?;
-                req.set_url(Some(&CefString::from(url.as_str())));
-                req.set_method(Some(&CefString::from("POST")));
-                let ct = content_type
-                    .as_deref()
-                    .unwrap_or("application/x-www-form-urlencoded");
-                req.set_header_by_name(
-                    Some(&CefString::from("Content-Type")),
-                    Some(&CefString::from(ct)),
-                    1,
-                );
-                if !post_data.is_empty() {
-                    let mut pd =
-                        cef::post_data_create().ok_or(EngineError::Backend { code: None })?;
-                    let mut elem = cef::post_data_element_create()
-                        .ok_or(EngineError::Backend { code: None })?;
-                    elem.set_to_bytes(post_data.len(), post_data.as_ptr());
-                    if pd.add_element(Some(&mut elem)) == 0 {
-                        return Err(EngineError::Backend { code: None });
-                    }
-                    req.set_post_data(Some(&mut pd));
+                let current_url = CefString::from(&frame.url()).to_string();
+                let same_origin = frame.is_valid() != 0
+                    && state
+                        .policy
+                        .rules
+                        .canonical_origin_for(&current_url)
+                        .as_deref()
+                        == Some(target_origin.as_str());
+                if same_origin {
+                    let mut req = crate::client::BrowserClientState::build_post_cef_request(
+                        &url,
+                        &post_data,
+                        content_type.as_deref(),
+                    )?;
+                    self.audit.record();
+                    frame.load_request(Some(&mut req));
+                } else {
+                    let bootstrap_url =
+                        state.arm_pending_post(target_origin, url, post_data, content_type);
+                    self.audit.record();
+                    frame.load_url(Some(&CefString::from(bootstrap_url.as_str())));
                 }
-                self.audit.record();
-                frame.load_request(Some(&mut req));
             }
             BrowserCommand::Back => {
+                if let Some(state) = self.client_state {
+                    state.clear_pending_post();
+                }
                 self.audit.record();
                 self.native.go_back();
             }
             BrowserCommand::Forward => {
+                if let Some(state) = self.client_state {
+                    state.clear_pending_post();
+                }
                 self.audit.record();
                 self.native.go_forward();
             }
             BrowserCommand::Reload => {
+                if let Some(state) = self.client_state {
+                    state.clear_pending_post();
+                }
                 self.audit.record();
                 self.native.reload();
             }
             BrowserCommand::StopLoading => {
+                if let Some(state) = self.client_state {
+                    state.clear_pending_post();
+                }
                 self.audit.record();
                 self.native.stop_load();
             }

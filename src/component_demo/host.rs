@@ -1573,6 +1573,7 @@ pub(super) fn run(config: Config) -> i32 {
             context_menu: config.context_menu,
             initial_url: config.custom_url,
             smoke: config.smoke,
+            verify_tests: false,
         });
     }
     if config.browser_shell {

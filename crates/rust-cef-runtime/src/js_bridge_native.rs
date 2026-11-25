@@ -21,10 +21,11 @@ use rust_cef_core::ports::{
 use crate::client::BrowserClientState;
 use crate::executor::NativeAudit;
 use crate::helper_app::{
-    EXTRA_BROWSER_LOCAL, EXTRA_JS_BRIDGE_ENABLED, EXTRA_JS_BRIDGE_MAX_BYTES,
-    EXTRA_JS_BRIDGE_ORIGINS, EXTRA_RUNTIME_GEN, MSG_CONTEXT_CREATED, MSG_CONTEXT_RELEASED,
-    MSG_EVAL_REQUEST, MSG_EVAL_RESPONSE, MSG_FOCUSED_NODE_CHANGED, MSG_HOST_MESSAGE,
-    MSG_POST_MESSAGE, MSG_UNCAUGHT_EXCEPTION,
+    EXTRA_BROWSER_LOCAL, EXTRA_JS_BRIDGE_ENABLED, EXTRA_JS_BRIDGE_LEGACY,
+    EXTRA_JS_BRIDGE_MAX_BYTES, EXTRA_JS_BRIDGE_ORIGINS, EXTRA_JS_BRIDGE_SUBFRAMES,
+    EXTRA_RUNTIME_GEN, MSG_CONTEXT_CREATED, MSG_CONTEXT_RELEASED, MSG_EVAL_REQUEST,
+    MSG_EVAL_RESPONSE, MSG_FOCUSED_NODE_CHANGED, MSG_HOST_MESSAGE, MSG_POST_MESSAGE,
+    MSG_UNCAUGHT_EXCEPTION,
 };
 use crate::policy::CompiledPolicy;
 
@@ -83,6 +84,8 @@ pub(crate) fn build_browser_extra_info(
     browser: BrowserId,
     options: &BrowserOptions,
     policy: &CompiledPolicy,
+    allow_subframes: bool,
+    legacy_binding: bool,
 ) -> Option<DictionaryValue> {
     let dict = dictionary_value_create()?;
     dict.set_string(
@@ -100,6 +103,14 @@ pub(crate) fn build_browser_extra_info(
     dict.set_bool(
         Some(&CefString::from(EXTRA_JS_BRIDGE_ENABLED)),
         i32::from(enabled),
+    );
+    dict.set_bool(
+        Some(&CefString::from(EXTRA_JS_BRIDGE_SUBFRAMES)),
+        i32::from(enabled && allow_subframes),
+    );
+    dict.set_bool(
+        Some(&CefString::from(EXTRA_JS_BRIDGE_LEGACY)),
+        i32::from(enabled && legacy_binding),
     );
     let max_bytes = i32::try_from(
         options
@@ -240,7 +251,13 @@ pub(crate) fn send_post_js_message(
         1,
         Some(&CefString::from(browser.local().to_string().as_str())),
     );
-    list.set_string(2, Some(&CefString::from(origin.as_str())));
+    let allow_subframes = client.policy.js_bridge_allow_subframes();
+    let expected_origin = if allow_subframes {
+        String::new()
+    } else {
+        origin
+    };
+    list.set_string(2, Some(&CefString::from(expected_origin.as_str())));
     list.set_string(3, Some(&CefString::from(payload_json)));
     audit.record();
     frame.send_process_message(ProcessId::RENDERER, Some(&mut msg));
@@ -313,7 +330,9 @@ pub(crate) fn parse_renderer_process_message(
                 return None;
             }
             let frame = frame?;
-            if frame.is_valid() == 0 || frame.is_main() == 0 {
+            if frame.is_valid() == 0
+                || (frame.is_main() == 0 && !state.policy.js_bridge_allow_subframes())
+            {
                 return None;
             }
             let ipc_origin = CefString::from(&args.string(2)).to_string();

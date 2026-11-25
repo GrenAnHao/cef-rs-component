@@ -12,7 +12,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, RwLock, Weak,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
 
@@ -27,6 +27,9 @@ pub(crate) struct NativePolicy {
     interceptor: RwLock<Option<Arc<dyn ResourceInterceptor>>>,
     host_capabilities: RwLock<HostCapabilities>,
     forbidden_roots: RwLock<Vec<PathBuf>>,
+    allow_chrome_internal_urls: AtomicBool,
+    js_bridge_allow_subframes: AtomicBool,
+    next_browser_legacy_binding: AtomicBool,
 }
 
 impl NativePolicy {
@@ -40,7 +43,39 @@ impl NativePolicy {
             interceptor: RwLock::new(None),
             host_capabilities: RwLock::new(HostCapabilities::default()),
             forbidden_roots: RwLock::new(Vec::new()),
+            allow_chrome_internal_urls: AtomicBool::new(false),
+            js_bridge_allow_subframes: AtomicBool::new(false),
+            next_browser_legacy_binding: AtomicBool::new(false),
         })
+    }
+
+    pub(crate) fn set_allow_chrome_internal_urls(&self, enabled: bool) {
+        self.allow_chrome_internal_urls
+            .store(enabled, Ordering::Release);
+    }
+
+    pub(crate) fn allows_chrome_internal_url(&self, url: &str) -> bool {
+        self.allow_chrome_internal_urls.load(Ordering::Acquire)
+            && crate::policy::allows_chrome_internal_url_syntax(url)
+    }
+
+    pub(crate) fn set_js_bridge_allow_subframes(&self, enabled: bool) {
+        self.js_bridge_allow_subframes
+            .store(enabled, Ordering::Release);
+    }
+
+    pub(crate) fn js_bridge_allow_subframes(&self) -> bool {
+        self.js_bridge_allow_subframes.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn set_next_browser_legacy_binding(&self, enabled: bool) {
+        self.next_browser_legacy_binding
+            .store(enabled, Ordering::Release);
+    }
+
+    pub(crate) fn take_next_browser_legacy_binding(&self) -> bool {
+        self.next_browser_legacy_binding
+            .swap(false, Ordering::AcqRel)
     }
 
     pub(crate) fn set_interceptor(&self, interceptor: Option<Arc<dyn ResourceInterceptor>>) {

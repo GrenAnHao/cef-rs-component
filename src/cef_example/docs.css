@@ -1,5 +1,5 @@
-//! Standalone CSS stylesheet for `https://cefsharp.example/home.html` and
-//! `BindingTest.html`, matching Bootstrap Docs + CefSharp purple palette.
+//! Standalone CSS stylesheet for `https://cef-rs-gpui.example/home.html` and
+//! `BindingTest.html`, matching Bootstrap Docs + purple palette.
 *, *::before, *::after { box-sizing: border-box; }
 body {
   margin: 0;

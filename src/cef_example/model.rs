@@ -22,7 +22,7 @@ use rust_cef_gpui::{
 use super::assets::DEFAULT_HOME_URL;
 use super::assets::format_runtime_summary;
 
-pub const MAX_EXAMPLE_TABS: usize = 12;
+pub const MAX_EXAMPLE_TABS: usize = 32;
 pub const MAX_TEXT_BUFFER_BYTES: usize = 16 * 1024;
 const MAX_TEXT_UNDO_HISTORY: usize = 32;
 
@@ -87,6 +87,7 @@ pub struct ExampleConfig {
     pub context_menu: bool,
     pub initial_url: Option<String>,
     pub smoke: Option<Duration>,
+    pub verify_tests: bool,
 }
 
 impl ExampleConfig {
@@ -113,7 +114,8 @@ impl ExampleConfig {
                     | "--host-mode"
                     | "--context-menu"
                     | "--url"
-                    | "--smoke-ms"),
+                    | "--smoke-ms"
+                    | "--verify-tests"),
                 ) => n.to_owned(),
                 _ => return Err(format!("unknown argument {:?}", arg)),
             };
@@ -196,6 +198,16 @@ impl ExampleConfig {
             })
             .transpose()?;
 
+        let verify_tests = match values
+            .remove("--verify-tests")
+            .as_ref()
+            .and_then(|v| v.to_str())
+        {
+            None | Some("false") => false,
+            Some("true") => true,
+            Some(_) => return Err("--verify-tests must be true or false".into()),
+        };
+
         Ok(Some(Self {
             bundle,
             helper,
@@ -206,12 +218,13 @@ impl ExampleConfig {
             context_menu,
             initial_url,
             smoke,
+            verify_tests,
         }))
     }
 }
 
 #[allow(dead_code)]
-pub const STANDALONE_USAGE: &str = "gpui-cef-example [--bundle <dir>] [--helper <exe>] [--cache-root <dir>] [--mode Threaded|Integrated] [--backend D3d11|Software] [--host-mode osr|native-hwnd] [--context-menu true|false] [--url <url>] [--smoke-ms 100..30000]";
+pub const STANDALONE_USAGE: &str = "gpui-cef-example [--bundle <dir>] [--helper <exe>] [--cache-root <dir>] [--mode Threaded|Integrated] [--backend D3d11|Software] [--host-mode osr|native-hwnd] [--context-menu true|false] [--url <url>] [--smoke-ms 100..30000] [--verify-tests true|false]";
 
 #[allow(dead_code)]
 fn default_cache_root(bundle: &PathBuf) -> PathBuf {
@@ -812,6 +825,12 @@ pub struct PendingJsDialog {
     pub prompt_input: TextBuffer,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NoticeDialog {
+    pub title: String,
+    pub message: String,
+}
+
 #[derive(Clone, Debug)]
 pub struct ExampleTabModel {
     pub id: u64,
@@ -929,6 +948,7 @@ pub struct ExampleAppModel {
     pub active_input: ActiveInput,
     pub open_menu: Option<MenuCategory>,
     pub pending_js_dialog: Option<PendingJsDialog>,
+    pub notice_dialog: Option<NoticeDialog>,
     pub quit_requested: bool,
 }
 
@@ -1022,18 +1042,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn url_normalization_handles_cefsharp_and_web_urls() {
+    fn url_normalization_handles_cef_rs_gpui_and_web_urls() {
         assert_eq!(
-            normalize_user_url("  https://cefsharp.example/home.html "),
-            Some("https://cefsharp.example/home.html".into())
+            normalize_user_url("  https://cef-rs-gpui.example/home.html "),
+            Some("https://cef-rs-gpui.example/home.html".into())
         );
         assert_eq!(
-            normalize_user_url("custom://cefsharp/SchemeTest.html"),
-            Some("custom://cefsharp/SchemeTest.html".into())
+            normalize_user_url("custom://cef-rs-gpui/SchemeTest.html"),
+            Some("custom://cef-rs-gpui/SchemeTest.html".into())
         );
         assert_eq!(
-            normalize_user_url("cefsharp.example/BindingTest.html"),
-            Some("https://cefsharp.example/BindingTest.html".into())
+            normalize_user_url("cef-rs-gpui.example/BindingTest.html"),
+            Some("https://cef-rs-gpui.example/BindingTest.html".into())
         );
         assert_eq!(
             normalize_user_url("chrome://chrome-urls"),
@@ -1062,24 +1082,26 @@ mod tests {
 
     #[test]
     fn text_buffer_cursor_selection_word_ime_and_undo_work_cleanly() {
-        let mut buf = TextBuffer::new("https://cefsharp.example/home");
+        let mut buf = TextBuffer::new("https://cef-rs-gpui.example/home");
         assert_eq!(buf.cursor_offset(), buf.text.len());
         let word_prev = buf.prev_word_boundary(buf.text.len());
         assert_eq!(&buf.text[word_prev..], "home");
         buf.delete_word_backward();
-        assert_eq!(buf.text, "https://cefsharp.example/");
+        assert_eq!(buf.text, "https://cef-rs-gpui.example/");
         assert!(buf.undo());
-        assert_eq!(buf.text, "https://cefsharp.example/home");
+        assert_eq!(buf.text, "https://cef-rs-gpui.example/home");
 
         buf.move_to(buf.text.len());
         buf.select_to(word_prev);
         assert!(buf.selection_reversed);
         assert_eq!(buf.selected_text(), "home");
         buf.insert_str_filtered("index", false);
-        assert_eq!(buf.text, "https://cefsharp.example/index");
+        assert_eq!(buf.text, "https://cef-rs-gpui.example/index");
 
-        buf.select_word_at(10);
-        assert_eq!(buf.selected_text(), "cefsharp");
+        buf.select_word_at(9);
+        assert_eq!(buf.selected_text(), "cef");
+        buf.select_word_at(16);
+        assert_eq!(buf.selected_text(), "gpui");
 
         let mut ime = TextBuffer::new("A🙂Z");
         assert_eq!(ime.text_len_utf16(), 4);
@@ -1108,7 +1130,7 @@ mod tests {
     fn app_model_manages_tabs_and_quits_when_last_closed() {
         let mut model = ExampleAppModel::default();
         assert!(model.add_tab(1, DEFAULT_HOME_URL.into(), true));
-        assert!(model.add_tab(2, "custom://cefsharp/SchemeTest.html".into(), false));
+        assert!(model.add_tab(2, "custom://cef-rs-gpui/SchemeTest.html".into(), false));
         assert_eq!(model.active_tab, Some(2));
         assert!(model.switch_tab(1));
         assert_eq!(model.active_tab().unwrap().show_sidebar, true);
@@ -1141,8 +1163,10 @@ mod tests {
             OsString::from("true"),
             OsString::from("--smoke-ms"),
             OsString::from("1500"),
+            OsString::from("--verify-tests"),
+            OsString::from("true"),
             OsString::from("--url"),
-            OsString::from("custom://cefsharp/diagnostics.html"),
+            OsString::from("custom://cef-rs-gpui/diagnostics.html"),
         ])
         .unwrap()
         .unwrap();
@@ -1151,9 +1175,10 @@ mod tests {
         assert_eq!(custom.host_mode, ExampleHostMode::NativeHwnd);
         assert!(custom.context_menu);
         assert_eq!(custom.smoke, Some(Duration::from_millis(1500)));
+        assert!(custom.verify_tests);
         assert_eq!(
             custom.initial_url.as_deref(),
-            Some("custom://cefsharp/diagnostics.html")
+            Some("custom://cef-rs-gpui/diagnostics.html")
         );
     }
 

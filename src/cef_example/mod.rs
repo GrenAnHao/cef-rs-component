@@ -2,15 +2,17 @@
 //! `rust-cef-gpui` and `rust-cef-core` APIs.
 
 pub mod assets;
+pub mod jsb_rpc;
 pub mod model;
 pub(crate) mod text_input;
 pub mod ui;
+mod verify;
 
 use std::{
     cell::{Cell, RefCell},
     collections::{BTreeMap, VecDeque},
     future::Future,
-    path::Path,
+    path::{Path, PathBuf},
     rc::Rc,
     sync::{
         Arc, Mutex,
@@ -55,9 +57,10 @@ use assets::{
     BENCHMARK_SUITE_URL, CUSTOM_POST_URL, DEFAULT_HOME_URL, RESPONSE_FILTER_TEST_URL,
     ExampleResourceInterceptor, build_custom_schemes, format_runtime_summary,
 };
+use jsb_rpc::CefRsGpuiRpcHost;
 use model::{
-    ActiveInput, BitmapScalingKind, PendingJsDialog, ExampleAppModel, ExampleConfig, ExampleHostMode,
-    normalize_user_url,
+    ActiveInput, BitmapScalingKind, NoticeDialog, PendingJsDialog, ExampleAppModel, ExampleConfig,
+    ExampleHostMode, normalize_user_url,
 };
 use ui::CefExampleRoot;
 
@@ -69,6 +72,7 @@ const PUMP_PERIOD: Duration = Duration::from_millis(4);
 #[derive(Clone, Debug)]
 pub(super) enum ExampleAction {
     NewTab(Option<String>),
+    NewTabLegacy(String),
     SwitchTab(u64),
     CloseTab(u64),
     NavigateHome,
@@ -86,12 +90,16 @@ pub(super) enum ExampleAction {
     ToggleDownloadInfo,
     ExecuteJs(String),
     EvaluateJs(String),
+    PostJsToTab { tab_id: u64, payload_json: String },
     SetRenderAngle(f32),
     SetWatermarkOpacity(f32),
     SetBitmapScaling(BitmapScalingKind),
     LoadCustomPost,
     RunBindingStressTest,
-    ExportPdf,
+    ResizeHackTests,
+    ExportPdfPrompt,
+    ExportPdfToPath(PathBuf),
+    DismissNoticeDialog,
     ResolveJsDialog { accept: bool },
     ExitApp,
 }
@@ -299,6 +307,17 @@ impl ExampleView {
         }
     }
 
+    pub(super) fn post_js_message(&self, payload_json: String, cx: &mut App) {
+        match self {
+            Self::Osr(v) => v.update(cx, |view, _| {
+                let _ = view.post_js_message(payload_json);
+            }),
+            Self::Native(v) => v.update(cx, |view, _| {
+                let _ = view.post_js_message(payload_json);
+            }),
+        }
+    }
+
     pub(super) fn into_any_element(self) -> AnyElement {
         match self {
             Self::Osr(v) => v.into_any_element(),
@@ -314,6 +333,8 @@ struct ExampleCapQueues {
     js_dialogs: Mutex<VecDeque<JsDialogRequest>>,
     auths: Mutex<VecDeque<AuthRequest>>,
     popups: Mutex<VecDeque<PopupRequest>>,
+    js_rpcs: Mutex<VecDeque<(u64, String)>>,
+    evals: Mutex<VecDeque<(u64, u64, EvalOutcome)>>,
 }
 
 struct ExampleCapAdapter {
@@ -404,6 +425,7 @@ impl BrowserEventSink for ExampleObservations {
             }
             BrowserEvent::CaptureFailed(ref err)
                 if !self.strict_capture && err.is_recoverable_capture() => {}
+            BrowserEvent::RendererTerminated { .. } if !self.strict_capture => {}
             fault @ (BrowserEvent::CreateFailed(_)
             | BrowserEvent::CaptureFailed(_)
             | BrowserEvent::RendererTerminated { .. }) => {
@@ -434,6 +456,7 @@ struct TabRuntime {
     smoke_eval_id: Option<EvalRequestId>,
     smoke_rf_eval_id: Option<EvalRequestId>,
     smoke_bench_eval_id: Option<EvalRequestId>,
+    smoke_post_eval_id: Option<EvalRequestId>,
 }
 
 #[derive(Default)]
@@ -445,7 +468,7 @@ struct ExampleAccounting {
 }
 
 macro_rules! wire_view_callbacks {
-    ($view:expr, $tab_id:expr, $root_weak:expr) => {{
+    ($view:expr, $tab_id:expr, $root_weak:expr, $cap_queues:expr, $wake:expr, $log_console:expr) => {{
         let root_w = $root_weak.clone();
         $view.set_on_title_changed(Some(Box::new(move |title, _, _, app| {
             let rw = root_w.clone();
@@ -521,7 +544,14 @@ macro_rules! wire_view_callbacks {
         })));
 
         let root_w = $root_weak.clone();
+        let log_console = $log_console;
         $view.set_on_console_message(Some(Box::new(move |info, _, _, app| {
+            if log_console {
+                println!(
+                    "CEF_EXAMPLE_CONSOLE tab={} {:?}:{} {}",
+                    $tab_id, info.severity, info.line, info.message
+                );
+            }
             let rw = root_w.clone();
             app.defer(move |app| {
                 let _ = rw.update(app, |root, cx| {
@@ -559,6 +589,23 @@ macro_rules! wire_view_callbacks {
                 let _ = rw.update(app, |root, cx| {
                     if let Some(t) = root.model.tab_mut($tab_id) {
                         t.output_message = format_runtime_summary(&format!("LoadError code={}", err.error_code));
+                        cx.notify();
+                    }
+                });
+            });
+        })));
+
+        let root_w = $root_weak.clone();
+        $view.set_on_renderer_terminated(Some(Box::new(move |info, _, _, app| {
+            let rw = root_w.clone();
+            app.defer(move |app| {
+                let _ = rw.update(app, |root, cx| {
+                    if let Some(t) = root.model.tab_mut($tab_id) {
+                        t.is_loading = false;
+                        t.output_message = format!(
+                            "Renderer terminated (status={}, code={:?}) — click Reload or navigate to recover",
+                            info.native_status, info.error_code
+                        );
                         cx.notify();
                     }
                 });
@@ -650,24 +697,15 @@ macro_rules! wire_view_callbacks {
         })));
 
         let root_w = $root_weak.clone();
-        $view.set_on_js_message(Some(Box::new(move |_origin, payload_json, view, _, app| {
-            let trimmed = payload_json.trim();
-            if let Ok(n) = trimmed.parse::<i64>() {
-                let _ = view.execute_javascript(
-                    format!("if (window.PostMessageIntTestCallback) window.PostMessageIntTestCallback({n});"),
-                    JsFrameScope::MainFrame,
-                );
-            } else if trimmed.contains("\"Type\":\"Update\"") || trimmed.contains("\"Type\": \"Update\"") {
-                let _ = view.execute_javascript(
-                    "if (window.__onHostPostMessageCallback) window.__onHostPostMessageCallback(\"Update\");",
-                    JsFrameScope::MainFrame,
-                );
-            } else {
-                let _ = view.execute_javascript(
-                    format!("if (window.__onHostMessage) window.__onHostMessage({trimmed});"),
-                    JsFrameScope::MainFrame,
-                );
-            }
+        let rpc_queues = $cap_queues.clone();
+        let rpc_wake = $wake.clone();
+        $view.set_on_js_message(Some(Box::new(move |_origin, payload_json, _view, _, app| {
+            rpc_queues
+                .js_rpcs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push_back(($tab_id, payload_json.clone()));
+            let _ = rpc_wake.wake();
             let rw = root_w.clone();
             let msg_copy = payload_json;
             app.defer(move |app| {
@@ -681,7 +719,15 @@ macro_rules! wire_view_callbacks {
         })));
 
         let root_w = $root_weak.clone();
+        let eval_queues = $cap_queues.clone();
+        let eval_wake = $wake.clone();
         $view.set_on_eval_completed(Some(Box::new(move |eval_id, outcome, _, _, app| {
+            eval_queues
+                .evals
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push_back(($tab_id, eval_id.sequence, outcome.clone()));
+            let _ = eval_wake.wake();
             let rw = root_w.clone();
             app.defer(move |app| {
                 let _ = rw.update(app, |root, cx| {
@@ -701,6 +747,9 @@ macro_rules! wire_view_callbacks {
                     }
                     if $tab_id == 3 && result_str == "\"BENCHMARK_OK\"" {
                         root.smoke_benchmark_ok = true;
+                    }
+                    if $tab_id == 3 && result_str == "\"POST_OK\"" {
+                        root.smoke_custom_post_ok = true;
                     }
                     cx.notify();
                 });
@@ -763,6 +812,7 @@ async fn service(
     Ok(woke)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_example_tab(
     cx: &mut AsyncApp,
     rt_cell: &Rc<RefCell<Option<Runtime>>>,
@@ -773,6 +823,7 @@ fn spawn_example_tab(
     tab_id: u64,
     url: String,
     show_sidebar: bool,
+    legacy_binding: bool,
     accounting: &mut ExampleAccounting,
     tabs: &mut BTreeMap<u64, TabRuntime>,
 ) -> Result<(), String> {
@@ -810,8 +861,8 @@ fn spawn_example_tab(
             allowed_origins: vec![
                 "https://*".into(),
                 "http://*".into(),
-                "custom://cefsharp".into(),
-                "test://cefsharp".into(),
+                "custom://cef-rs-gpui".into(),
+                "test://cef-rs-gpui".into(),
             ],
             max_message_bytes: MAX_JS_PAYLOAD_BYTES,
             ..Default::default()
@@ -841,6 +892,9 @@ fn spawn_example_tab(
     let (handle, attachment) = {
         let mut guard = rt_cell.borrow_mut();
         let rt = guard.as_mut().ok_or("cef example Runtime absent")?;
+        if legacy_binding {
+            rt.set_next_browser_legacy_binding(true);
+        }
         let profile = Some(rt.default_profile_handle());
         let handle = rt
             .create_browser(BrowserConfig {
@@ -864,6 +918,8 @@ fn spawn_example_tab(
             let mut reg_out = None;
             let popup_cap_osr = cap_adapter.clone();
             let popup_cap_native = cap_adapter.clone();
+            let cap_queues = cap_adapter.queues.clone();
+            let cap_wake = cap_adapter.wake.clone();
             let example_view = match config.host_mode {
                 ExampleHostMode::Osr => {
                     let view =
@@ -891,7 +947,7 @@ fn spawn_example_tab(
                                 },
                             }
                         })));
-                        wire_view_callbacks!(v, tab_id, root_weak);
+                        wire_view_callbacks!(v, tab_id, root_weak, cap_queues, cap_wake, config.verify_tests);
                     });
                     if let Some(menus) = menus {
                         let menu_limits = MenuLimits {
@@ -938,7 +994,7 @@ fn spawn_example_tab(
                                 },
                             }
                         })));
-                        wire_view_callbacks!(v, tab_id, root_weak);
+                        wire_view_callbacks!(v, tab_id, root_weak, cap_queues, cap_wake, config.verify_tests);
                     });
                     ExampleView::Native(view)
                 }
@@ -962,6 +1018,7 @@ fn spawn_example_tab(
             smoke_eval_id: None,
             smoke_rf_eval_id: None,
             smoke_bench_eval_id: None,
+            smoke_post_eval_id: None,
         },
     );
     Ok(())
@@ -1049,8 +1106,8 @@ async fn drive_cef_example(
     settings.custom_schemes = build_custom_schemes();
 
     let mut policy = TrustedContentPolicy::allow_all_http_https(true);
-    policy.allowed_origins.push("custom://cefsharp".into());
-    policy.allowed_origins.push("test://cefsharp".into());
+    policy.allowed_origins.push("custom://cef-rs-gpui".into());
+    policy.allowed_origins.push("test://cef-rs-gpui".into());
 
     let default_profile = if std::fs::create_dir_all(&config.cache_root).is_ok() {
         ProfileStorage::Persistent {
@@ -1093,6 +1150,8 @@ async fn drive_cef_example(
 
     let nz = |n: usize| std::num::NonZeroUsize::new(n).expect("non-zero");
     let _ = rt.set_resource_interceptor(Some(Arc::new(ExampleResourceInterceptor)));
+    rt.set_allow_chrome_internal_urls(true);
+    rt.set_js_bridge_allow_subframes(true);
     let _ = rt.set_host_capabilities(HostCapabilities {
         download: Some(cap_adapter.clone()),
         js_dialog: Some(cap_adapter.clone()),
@@ -1130,8 +1189,10 @@ async fn drive_cef_example(
     let mut tabs: BTreeMap<u64, TabRuntime> = BTreeMap::new();
     let mut accounting = ExampleAccounting::default();
     let mut next_tab_id = 1u64;
-    let mut active_pdf: Option<(u64, PdfExportTicket)> = None;
+    let mut active_pdf: Option<(u64, PathBuf, PdfExportTicket)> = None;
     let mut drop_target_owned: Option<(NativeDropTargetServices, u64)> = None;
+    let mut rpc_host = CefRsGpuiRpcHost::default();
+    let mut verify_driver = config.verify_tests.then(verify::VerifyDriver::new);
     let mut smoke_stage = 0u8;
     let smoke_deadline = config.smoke.map(|d| Instant::now() + d + Duration::from_secs(20));
 
@@ -1166,6 +1227,7 @@ async fn drive_cef_example(
             next_tab_id,
             initial_url,
             true,
+            false,
             &mut accounting,
             &mut tabs,
         ) {
@@ -1236,6 +1298,7 @@ async fn drive_cef_example(
                             window.focus(&handle, cx);
                             window.notify_text_input_changed(&handle);
                         }
+                        r.sync_native_tab_visibility(cx);
                         cx.notify();
                     });
                 });
@@ -1319,6 +1382,7 @@ async fn drive_cef_example(
                 id,
                 popup.target_url,
                 false,
+                false,
                 &mut accounting,
                 &mut tabs,
             ) {
@@ -1327,24 +1391,73 @@ async fn drive_cef_example(
             }
         }
 
+        // Dispatch `cef-rs-gpui` JS Object Repository RPC messages and poll UrlRequest downloads.
+        {
+            let mut rpc_out = Vec::new();
+            let mut incoming_rpcs = cap_queues
+                .js_rpcs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .drain(..)
+                .collect();
+            {
+                let rt_guard = rt_cell.borrow();
+                rpc_host.handle_incoming_messages(
+                    &mut incoming_rpcs,
+                    rt_guard.as_ref(),
+                    cx,
+                    root,
+                    &mut rpc_out,
+                );
+                rpc_host.poll_downloads(&mut rpc_out);
+            }
+            for (tab_id, payload_json) in rpc_out {
+                let _ = root.update(cx, |r, _, cx| {
+                    if let Some(view) = r.views.get(&tab_id).cloned() {
+                        view.post_js_message(payload_json, cx);
+                    }
+                });
+            }
+        }
+
         // Poll active PDF export.
-        if let Some((tab_id, ref ticket)) = active_pdf {
+        if let Some((tab_id, ref dest, ref ticket)) = active_pdf {
             match ticket.poll() {
                 PdfExportStatus::Pending => {}
                 PdfExportStatus::Completed(outcome) => {
+                    let path_str = dest.display().to_string();
+                    let msg = if outcome.ok {
+                        format!("Pdf was saved to {path_str}")
+                    } else {
+                        format!("Unable to save Pdf, check you have write permissions to {path_str}")
+                    };
                     let _ = root.update(cx, |r, _, cx| {
                         if let Some(t) = r.model.tab_mut(tab_id) {
-                            t.output_message = format!("PDF export ok={}", outcome.ok);
+                            t.output_message = msg.clone();
                         }
+                        r.model.notice_dialog = Some(NoticeDialog {
+                            title: "Print Current tab to PDF".into(),
+                            message: msg,
+                        });
+                        r.sync_native_tab_visibility(cx);
                         cx.notify();
                     });
                     active_pdf = None;
                 }
                 PdfExportStatus::Failed(err) => {
+                    let msg = format!(
+                        "Unable to save Pdf, check you have write permissions to {} ({err:?})",
+                        dest.display()
+                    );
                     let _ = root.update(cx, |r, _, cx| {
                         if let Some(t) = r.model.tab_mut(tab_id) {
-                            t.output_message = format!("PDF export failed: {err:?}");
+                            t.output_message = msg.clone();
                         }
+                        r.model.notice_dialog = Some(NoticeDialog {
+                            title: "Print Current tab to PDF".into(),
+                            message: msg,
+                        });
+                        r.sync_native_tab_visibility(cx);
                         cx.notify();
                     });
                     active_pdf = None;
@@ -1374,6 +1487,28 @@ async fn drive_cef_example(
                         id,
                         url,
                         false,
+                        false,
+                        &mut accounting,
+                        &mut tabs,
+                    ) {
+                        run_error = Some(e);
+                        break;
+                    }
+                }
+                ExampleAction::NewTabLegacy(url) => {
+                    let id = next_tab_id;
+                    next_tab_id += 1;
+                    if let Err(e) = spawn_example_tab(
+                        cx,
+                        &rt_cell,
+                        menus.as_ref(),
+                        &cap_adapter,
+                        root,
+                        &config,
+                        id,
+                        url,
+                        false,
+                        true,
                         &mut accounting,
                         &mut tabs,
                     ) {
@@ -1557,6 +1692,16 @@ async fn drive_cef_example(
                         }
                     });
                 }
+                ExampleAction::PostJsToTab {
+                    tab_id,
+                    payload_json,
+                } => {
+                    let _ = root.update(cx, |r, _, cx| {
+                        if let Some(v) = r.views.get(&tab_id).cloned() {
+                            v.post_js_message(payload_json, cx);
+                        }
+                    });
+                }
                 ExampleAction::SetRenderAngle(angle) => {
                     let _ = root.update(cx, |r, window, cx| {
                         let clamped = if angle.is_finite() {
@@ -1623,11 +1768,11 @@ async fn drive_cef_example(
                             if let Some(t) = r.model.tab_mut(id) {
                                 t.address_input.set_from_external(CUSTOM_POST_URL);
                                 t.output_message =
-                                    format_runtime_summary("Submitting LoadUrlWithPostData POST...");
+                                    format_runtime_summary("Submitting Load Custom Request POST...");
                             }
                             v.load_url_with_post_data(
                                 CUSTOM_POST_URL.into(),
-                                b"test=123&data=hello&source=GpuiCef.Example".to_vec(),
+                                b"test=123&data=456".to_vec(),
                                 Some("application/x-www-form-urlencoded".into()),
                                 cx,
                             );
@@ -1636,56 +1781,213 @@ async fn drive_cef_example(
                     });
                 }
                 ExampleAction::RunBindingStressTest => {
-                    let _ = root.update(cx, |r, _, cx| {
-                        if let Some(id) = r.model.active_tab
-                            && let Some(v) = r.views.get(&id).cloned()
-                        {
-                            let already_on_binding = r
-                                .model
-                                .tab_mut(id)
-                                .is_some_and(|t| t.address.starts_with(assets::BINDING_TEST_URL));
-                            if already_on_binding {
-                                v.execute_javascript(
-                                    "for(var i=0;i<25;i++){if(window.__runBindingStressStep)window.__runBindingStressStep();}".into(),
-                                    cx,
+                    let target_tab = root
+                        .update(cx, |r, _, cx| {
+                            let id = r.model.active_tab?;
+                            if let Some(t) = r.model.tab_mut(id) {
+                                t.address_input.set_from_external(assets::BINDING_TEST_URL);
+                                t.output_message = format_runtime_summary(
+                                    "Running Javascript Binding Stress Test...",
                                 );
-                                if let Some(t) = r.model.tab_mut(id) {
-                                    t.output_message =
-                                        format_runtime_summary("Executed 25-step Binding Stress burst");
-                                }
-                            } else {
+                            }
+                            if let Some(v) = r.views.get(&id).cloned() {
                                 v.load_url(assets::BINDING_TEST_URL.into(), cx);
-                                if let Some(t) = r.model.tab_mut(id) {
-                                    t.output_message = format_runtime_summary(
-                                        "Navigated to BindingTest.html; click again for 25x stress burst",
-                                    );
-                                }
                             }
                             cx.notify();
-                        }
-                    });
+                            Some(id)
+                        })
+                        .ok()
+                        .flatten();
+                    if let Some(tab_id) = target_tab {
+                        cx.spawn(async move |cx: &mut AsyncApp| {
+                            for round in 1..=4_u32 {
+                                cx.background_executor()
+                                    .timer(Duration::from_millis(2500))
+                                    .await;
+                                let keep_going = root
+                                    .update(cx, |r, _, cx| {
+                                        let on_binding = r.model.tabs.iter().any(|t| {
+                                            t.id == tab_id
+                                                && t.address.starts_with(assets::BINDING_TEST_URL)
+                                        });
+                                        if on_binding && let Some(v) = r.views.get(&tab_id).cloned()
+                                        {
+                                            v.reload(cx);
+                                            if let Some(t) = r.model.tab_mut(tab_id) {
+                                                t.output_message = format_runtime_summary(
+                                                    &format!("Binding stress reload #{round}/4"),
+                                                );
+                                            }
+                                            cx.notify();
+                                            true
+                                        } else {
+                                            false
+                                        }
+                                    })
+                                    .unwrap_or(false);
+                                if !keep_going {
+                                    break;
+                                }
+                            }
+                        })
+                        .detach();
+                    }
                 }
-                ExampleAction::ExportPdf => {
-                    if let Some(active_id) = root.update(cx, |r, _, _| r.model.active_tab).ok().flatten()
+                ExampleAction::ResizeHackTests => {
+                    let first_new = next_tab_id;
+                    next_tab_id += 1;
+                    let second_new = next_tab_id;
+                    next_tab_id += 1;
+                    let _ = spawn_example_tab(
+                        cx,
+                        &rt_cell,
+                        menus.as_ref(),
+                        &cap_adapter,
+                        root,
+                        &config,
+                        first_new,
+                        DEFAULT_HOME_URL.into(),
+                        true,
+                        false,
+                        &mut accounting,
+                        &mut tabs,
+                    );
+                    let _ = spawn_example_tab(
+                        cx,
+                        &rt_cell,
+                        menus.as_ref(),
+                        &cap_adapter,
+                        root,
+                        &config,
+                        second_new,
+                        assets::BINDING_TEST_URL.into(),
+                        false,
+                        false,
+                        &mut accounting,
+                        &mut tabs,
+                    );
+                    cx.spawn(async move |cx: &mut AsyncApp| {
+                        let sizes = [(1180.0_f32, 740.0_f32), (1290.0, 810.0), (1240.0, 780.0)];
+                        for step in 0..18_usize {
+                            cx.background_executor()
+                                .timer(Duration::from_millis(90))
+                                .await;
+                            let (w, h) = sizes[step % sizes.len()];
+                            let cont = root
+                                .update(cx, |r, window, cx| {
+                                    window.resize(size(px(w), px(h)));
+                                    let active = r.model.active_tab;
+                                    if let Some(next_id) = r
+                                        .model
+                                        .tabs
+                                        .iter()
+                                        .map(|t| t.id)
+                                        .find(|id| Some(*id) != active)
+                                    {
+                                        r.model.switch_tab(next_id);
+                                        r.sync_native_tab_visibility(cx);
+                                    }
+                                    if let Some(t) = r.model.active_tab_mut() {
+                                        t.output_message = format_runtime_summary(&format!(
+                                            "Resize Hack Tests step {}/18",
+                                            step + 1
+                                        ));
+                                    }
+                                    cx.notify();
+                                    !r.model.quit_requested
+                                })
+                                .unwrap_or(false);
+                            if !cont {
+                                break;
+                            }
+                        }
+                        let _ = root.update(cx, |_, window, cx| {
+                            window.resize(size(px(1240.0), px(780.0)));
+                            cx.notify();
+                        });
+                    })
+                    .detach();
+                }
+                ExampleAction::ExportPdfPrompt => {
+                    let dir = output_dir.clone();
+                    cx.spawn(async move |cx: &mut AsyncApp| {
+                        let rx = root
+                            .update(cx, |_, _, cx| {
+                                cx.prompt_for_new_path(&dir, Some("PrintToPdf.pdf"))
+                            })
+                            .ok();
+                        if let Some(rx) = rx
+                            && let Ok(Ok(Some(mut path))) = rx.await
+                        {
+                            let has_pdf_ext = path
+                                .extension()
+                                .and_then(|e| e.to_str())
+                                .is_some_and(|e| e.eq_ignore_ascii_case("pdf"));
+                            if !has_pdf_ext {
+                                let mut os = path.into_os_string();
+                                os.push(".pdf");
+                                path = PathBuf::from(os);
+                            }
+                            let _ = root.update(cx, |r, _, _| {
+                                r.emit(ExampleAction::ExportPdfToPath(path));
+                            });
+                        }
+                    })
+                    .detach();
+                }
+                ExampleAction::ExportPdfToPath(dest) => {
+                    if let Some(active_id) =
+                        root.update(cx, |r, _, _| r.model.active_tab).ok().flatten()
                         && let Some(tab) = tabs.get(&active_id)
                         && let Some(rt) = rt_cell.borrow().as_ref()
                     {
-                        let dest = output_dir.join(format!("tab-{active_id}.pdf"));
-                        if let Ok(ticket) = rt.print_to_pdf(tab.browser_id, dest.clone(), PdfExportOptions::default()) {
-                            active_pdf = Some((active_id, ticket));
-                            let _ = root.update(cx, |r, _, cx| {
-                                if let Some(t) = r.model.tab_mut(active_id) {
-                                    t.output_message = format!("Exporting PDF -> {}", dest.display());
-                                }
-                                cx.notify();
-                            });
+                        match rt.print_to_pdf(
+                            tab.browser_id,
+                            dest.clone(),
+                            PdfExportOptions::default(),
+                        ) {
+                            Ok(ticket) => {
+                                active_pdf = Some((active_id, dest.clone(), ticket));
+                                let _ = root.update(cx, |r, _, cx| {
+                                    if let Some(t) = r.model.tab_mut(active_id) {
+                                        t.output_message =
+                                            format!("Printing PDF -> {}", dest.display());
+                                    }
+                                    cx.notify();
+                                });
+                            }
+                            Err(err) => {
+                                let msg = format!(
+                                    "Unable to save Pdf, check you have write permissions to {} ({err:?})",
+                                    dest.display()
+                                );
+                                let _ = root.update(cx, |r, _, cx| {
+                                    r.model.notice_dialog = Some(NoticeDialog {
+                                        title: "Print Current tab to PDF".into(),
+                                        message: msg.clone(),
+                                    });
+                                    if let Some(t) = r.model.tab_mut(active_id) {
+                                        t.output_message = msg;
+                                    }
+                                    r.sync_native_tab_visibility(cx);
+                                    cx.notify();
+                                });
+                            }
                         }
                     }
+                }
+                ExampleAction::DismissNoticeDialog => {
+                    let _ = root.update(cx, |r, _, cx| {
+                        r.model.notice_dialog = None;
+                        r.sync_native_tab_visibility(cx);
+                        cx.notify();
+                    });
                 }
                 ExampleAction::ResolveJsDialog { accept } => {
                     if let Ok(Some(dlg)) = root.update(cx, |r, _, cx| {
                         r.model.active_input = ActiveInput::None;
                         let taken = r.model.pending_js_dialog.take();
+                        r.sync_native_tab_visibility(cx);
                         cx.notify();
                         taken
                     }) && let Some(rt) = rt_cell.borrow().as_ref()
@@ -1879,6 +2181,7 @@ async fn drive_cef_example(
                     id,
                     RESPONSE_FILTER_TEST_URL.into(),
                     false,
+                    false,
                     &mut accounting,
                     &mut tabs,
                 ) {
@@ -1926,6 +2229,7 @@ async fn drive_cef_example(
                     id,
                     BENCHMARK_SUITE_URL.into(),
                     false,
+                    false,
                     &mut accounting,
                     &mut tabs,
                 ) {
@@ -1946,7 +2250,7 @@ async fn drive_cef_example(
                     .update(cx, |r, _, cx| {
                         r.views.get(&3)?.evaluate_script(
                             "(window.__benchmarkSummary && window.__benchmarkSummary.ok === true) ? 'BENCHMARK_OK' : JSON.stringify(window.__benchmarkSummary)".into(),
-                            5000,
+                            2500,
                             cx,
                         )
                     })
@@ -1962,6 +2266,47 @@ async fn drive_cef_example(
                     .unwrap_or(false)
             {
                 println!("CEF_EXAMPLE_BENCHMARK ok=true");
+                let _ = root.update(cx, |r, _, cx| {
+                    if let Some(t3) = r.model.tab_mut(3) {
+                        t3.address_input.set_from_external(CUSTOM_POST_URL);
+                    }
+                    if let Some(v) = r.views.get(&3).cloned() {
+                        v.load_url_with_post_data(
+                            CUSTOM_POST_URL.into(),
+                            b"test=123&data=456".to_vec(),
+                            Some("application/x-www-form-urlencoded".into()),
+                            cx,
+                        );
+                    }
+                    cx.notify();
+                });
+                smoke_stage = 6;
+            } else if smoke_stage == 6
+                && tabs.get(&3).is_some_and(|t| {
+                    let s = t.handle.snapshot();
+                    !s.navigation.is_loading && s.navigation.address == CUSTOM_POST_URL
+                })
+            {
+                let post_eval_id = root
+                    .update(cx, |r, _, cx| {
+                        r.views.get(&3)?.evaluate_script(
+                            "(document.body && document.body.innerText.includes('Post Data: test=123&data=456')) ? 'POST_OK' : (document.body ? document.body.innerText : 'NO_BODY')".into(),
+                            2500,
+                            cx,
+                        )
+                    })
+                    .ok()
+                    .flatten();
+                if let Some(t3) = tabs.get_mut(&3) {
+                    t3.smoke_post_eval_id = post_eval_id;
+                }
+                smoke_stage = 7;
+            } else if smoke_stage == 7
+                && root
+                    .update(cx, |r, _, _| r.smoke_custom_post_ok)
+                    .unwrap_or(false)
+            {
+                println!("CEF_EXAMPLE_CUSTOM_POST ok=true");
                 break;
             }
 
@@ -1973,11 +2318,50 @@ async fn drive_cef_example(
                 let bench_ok = root
                     .update(cx, |r, _, _| r.smoke_benchmark_ok)
                     .unwrap_or(false);
+                let post_ok = root
+                    .update(cx, |r, _, _| r.smoke_custom_post_ok)
+                    .unwrap_or(false);
                 run_error = Some(format!(
-                    "cef-example smoke timed out (stage={smoke_stage} eval_ok={eval_ok} rf_ok={rf_ok} bench_ok={bench_ok})"
+                    "cef-example smoke timed out (stage={smoke_stage} eval_ok={eval_ok} rf_ok={rf_ok} bench_ok={bench_ok} post_ok={post_ok})"
                 ));
                 break;
             }
+        }
+
+        if let Some(driver) = verify_driver.as_mut() {
+            for (tab_id, seq, outcome) in cap_queues
+                .evals
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .drain(..)
+            {
+                driver.record_eval(tab_id, seq, outcome);
+            }
+            if let Err(err) = driver.step(
+                cx,
+                &rt_cell,
+                menus.as_ref(),
+                &cap_adapter,
+                root,
+                &config,
+                &output_dir,
+                &mut next_tab_id,
+                &mut accounting,
+                &mut tabs,
+                &mut rpc_host,
+            ) {
+                run_error = Some(err);
+                break;
+            }
+            if driver.is_done() {
+                break;
+            }
+        } else {
+            cap_queues
+                .evals
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clear();
         }
 
         if let Err(err) = service(cx, &rt_cell, config.mode, &receiver, None).await {
@@ -1986,6 +2370,9 @@ async fn drive_cef_example(
         }
     }
 
+    if let Some(err) = run_error.as_ref() {
+        eprintln!("{err}");
+    }
     if let Some((mut ds, _)) = drop_target_owned.take() {
         let _ = ds.retire();
     }
@@ -2009,9 +2396,9 @@ async fn drive_cef_example(
                 }
                 break;
             }
-            ShutdownStatus::Draining { .. } | ShutdownStatus::Blocked { .. } => {
+            status @ (ShutdownStatus::Draining { .. } | ShutdownStatus::Blocked { .. }) => {
                 if Instant::now() >= deadline {
-                    eprintln!("cef-example shutdown timed out");
+                    eprintln!("cef-example shutdown timed out: {status:?}");
                     std::mem::forget(rt);
                     return 1;
                 }
@@ -2033,8 +2420,7 @@ async fn drive_cef_example(
         }
     }
 
-    if let Some(err) = run_error {
-        eprintln!("{err}");
+    if run_error.is_some() {
         return 1;
     }
     let d = rt.diagnostics();
@@ -2136,6 +2522,7 @@ pub fn run(config: ExampleConfig) -> i32 {
                         smoke_eval_ok: false,
                         smoke_response_filter_ok: false,
                         smoke_benchmark_ok: false,
+                        smoke_custom_post_ok: false,
                         active_slider: None,
                         angle_track_bounds: Rc::new(Cell::new(Bounds::default())),
                         opacity_track_bounds: Rc::new(Cell::new(Bounds::default())),

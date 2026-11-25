@@ -1581,6 +1581,7 @@ impl BrowserEventSink for ShellObservations {
             }
             BrowserEvent::CaptureFailed(ref err)
                 if !self.strict_capture && err.is_recoverable_capture() => {}
+            BrowserEvent::RendererTerminated { .. } if !self.strict_capture => {}
             fault @ (BrowserEvent::CreateFailed(_)
             | BrowserEvent::CaptureFailed(_)
             | BrowserEvent::RendererTerminated { .. }) => {
@@ -3417,6 +3418,14 @@ mod tests {
         interactive.publish(env(CaptureFailureKind::IncompleteFrame, None));
         interactive.publish(env(CaptureFailureKind::ResizeExhausted, None));
         interactive.publish(env(CaptureFailureKind::Busy, None));
+        interactive.publish(BrowserEventEnvelope {
+            browser,
+            sequence: 2,
+            event: BrowserEvent::RendererTerminated {
+                native_status: 2,
+                code: Some(3),
+            },
+        });
         assert!(
             interactive
                 .first_fault
@@ -3429,6 +3438,22 @@ mod tests {
         strict.publish(env(CaptureFailureKind::IncompleteFrame, None));
         assert!(
             strict
+                .first_fault
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_some()
+        );
+        let strict_term = ShellObservations::new(true);
+        strict_term.publish(BrowserEventEnvelope {
+            browser,
+            sequence: 3,
+            event: BrowserEvent::RendererTerminated {
+                native_status: 2,
+                code: Some(3),
+            },
+        });
+        assert!(
+            strict_term
                 .first_fault
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())

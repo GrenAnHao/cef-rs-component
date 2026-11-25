@@ -1103,6 +1103,18 @@ impl Runtime {
         self.policy.set_interceptor(interceptor);
         Ok(())
     }
+
+    pub fn set_allow_chrome_internal_urls(&self, enabled: bool) {
+        self.policy.set_allow_chrome_internal_urls(enabled);
+    }
+
+    pub fn set_js_bridge_allow_subframes(&self, enabled: bool) {
+        self.policy.set_js_bridge_allow_subframes(enabled);
+    }
+
+    pub fn set_next_browser_legacy_binding(&self, enabled: bool) {
+        self.policy.set_next_browser_legacy_binding(enabled);
+    }
     pub fn register_profile_scheme_handler(
         &self,
         profile: ProfileHandle,
@@ -1723,6 +1735,9 @@ impl Runtime {
             .policy
             .rules
             .allows_host_navigation(&config.initial_url)
+            && !self
+                .policy
+                .allows_chrome_internal_url(&config.initial_url)
         {
             self.policy
                 .deny(None, rust_cef_core::ports::PolicyAction::Navigation);

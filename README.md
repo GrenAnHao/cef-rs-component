@@ -46,11 +46,11 @@
 - **运行时与调度**：支持 `Integrated` 与 `Threaded` 双线程模型、多浏览器实例隔离（每实例独立 `Client` / 视口 / 帧槽）、`Memory` / `Persistent` Profile 与可控租约、Renderer 崩溃/挂起诊断事件与恢复提示。
 - **完整 Per-View 事件回调体系**（`crates/rust-cef-gpui/src/events.rs`）：`CefBrowser` 与 `NativeCefBrowser` 共享统一的加载生命周期（`LoadingStateChange`、`LoadStartInfo`、`LoadEndInfo`、`LoadErrorInfo`）、导航请求（`NavigationRequestEvent`）、标题/地址/状态/控制台（`ConsoleMessageInfo`）、Tooltip、光标变更、`-webkit-app-region` 拖拽区、Frame 与 V8 Context 生命周期（`FrameAttachedInfo`、`FrameDetachedInfo`、`MainFrameChangedInfo`、`V8ContextLifecycleInfo`）、未捕获 JS 异常、焦点 DOM 节点、`BeforeUnloadInfo`、`RendererTerminatedInfo`、`AutoResizeInfo`、`MediaAccessInfo` 与资源响应观测等逐视图回调。
 - **受管原生子弹窗（`PopupLedger` / `PopupClient`）**（`crates/rust-cef-runtime/src/popup_window.rs`）：支持策略受限的原生产生子窗口，受 `TrustedContentPolicy` 约束并在父 Browser 关闭或 Runtime 退出前自动回收。
-- **扩展 CEF Handler 与流式响应重写**：通过 `crates/rust-cef-runtime/src/client_handlers.rs` 提供 `DragHandler`、`FrameHandler` 与可选 `AudioHandler`；支持 `ResourceInterceptor`、`ResponseBodyFilter` 流式响应体替换、`LoadUrlWithPostData` 以及 `ExecuteJavascript` / `EvaluateScript` 异步脚本求值。
+- **扩展 CEF Handler 与流式响应重写**：通过 `crates/rust-cef-runtime/src/client_handlers.rs` 提供 `DragHandler`、`FrameHandler` 与可选 `AudioHandler`；支持 `ResourceInterceptor`、`ResponseBodyFilter` 流式响应体替换、跨站 Site Isolation 安全的 `LoadUrlWithPostData` 以及 `ExecuteJavascript` / `EvaluateScript` 异步脚本求值。
 - **桌面交互与导航**：导航历史与加载进度、音频静音、快捷键拦截（`on_pre_key_event`）、Page Find 有界串行查找、View Source、系统标准光标（21 种）及 ≤256px 自定义位图光标（`OnCursorChange`）、多点触控（`BrowserTouchEvent` / `WM_POINTER*`）与触控板捏合缩放、`accesskit` UIA 无障碍树投影；并提供交互式 GPUI 文本输入组件（`src/cef_example/text_input.rs`，支持光标闪烁、聚焦动效、鼠标拖选与双三击选词、撤销/剪贴板及 Win32 IME `EntityInputHandler`），同时复用于 `gpui-cef-example` 与 `component-demo` 多标签壳。
 - **原生拖放**：默认 `OutboundDragPolicy::Deny`；Opt-in `AllowAsync` 支持基于零新增依赖 COM 虚表的异步 OLE `DoDragDrop`（含虚拟图像拖出）；通过 `IDropTarget` + `IDropTargetHelper` 支持外部文件、URL、纯文本及 HTML 入站与页内拖放。
 - **安全边界与扩展能力**：
-  - `TrustedContentPolicy`、`ResourceInterceptor`、受限 `app://` / `custom://` Scheme 与冻结只读 `window.rustCef` JS 桥接（256 KiB / 32 层深度边界）；
+  - `TrustedContentPolicy`、`ResourceInterceptor`、受限 `app://` / `custom://` Scheme、opt-in `chrome://` 内部页导航（`set_allow_chrome_internal_urls`）、同进程子帧 V8 桥接（`set_js_bridge_allow_subframes`）、冻结只读 `window.rustCef` JS 桥接（256 KiB / 32 层深度边界）与 `window['cef-rs-gpui']` JS Object Repository（`BindObjectAsync`、`PostMessage`、`Date` / JS 回调往返与 Legacy/Sync/Async 绑定）；
   - 可插拔宿主能力（下载管控、JS/文件对话框、权限请求、托管弹窗、禁用内置登录框的 HTTP 401 Basic Auth、TLS 证书确认）；
   - `CookieManager`、`PrintConfirmation` / `PrintToPdf`、独立 `CefURLRequest`、默认关闭且受管释放的无头 CDP。
 
@@ -82,7 +82,7 @@
 | [`crates/rust-cef-ui`](crates/rust-cef-ui) | UI 无关表面管线、原生窗口槽位与输入投影层 |
 | [`crates/rust-cef-gpui`](crates/rust-cef-gpui) | GPUI 视图集成层（`CefBrowser`、`NativeCefBrowser`、统一逐视图事件回调 `events.rs`、`UiComposition`、`DefaultMenuPresenter`） |
 | [`patches/gpui-pre`](patches/gpui-pre) / [`patches/gpui-pre-windows`](patches/gpui-pre-windows) | 本地 GPUI 补丁：外部 D3D11 SRV 表面直绘、`Angle` / `Opacity` / 采样模式、`FLIP_DISCARD`、帧延迟 `MaximumFrameLatency=1` 等 |
-| [`src/cef_example`](src/cef_example) / [`src/bin/cef-example.rs`](src/bin/cef-example.rs) | 全功能桌面浏览器示例（`gpui-cef-example`）：多标签、GPU 旋转/透明度/采样面板、JS 执行/求值、自定义 Scheme、流式响应过滤、PDF/下载、基准自测与交互式 GPUI 文本输入 |
+| [`src/cef_example`](src/cef_example) / [`src/bin/cef-example.rs`](src/bin/cef-example.rs) | 全功能桌面浏览器示例（`gpui-cef-example`）：多标签、GPU 旋转/透明度/采样面板、JS 执行/求值与 JS Object Repository RPC（`window['cef-rs-gpui']`）、26 项 `Tests` 菜单（20 项功能/QUnit 对齐测试 + 6 项本地/外站基准）、3 项 `Chrome Urls`、原生保存对话框 PDF 导出与结果弹窗、`custom://cef-rs-gpui/` 与 `https://cef-rs-gpui.example/` 测试资源及 `--verify-tests true` 自动化套件 |
 | [`examples/bing_cn.rs`](examples/bing_cn.rs) | 轻量在线浏览示例（默认 D3D11 零拷贝 OSR，可选 `-NativeHwnd`、`-SelfTestOsr` 与 `-SelfTestOsrDnd`） |
 | [`src/component_demo`](src/component_demo) | 公开组件演示宿主与多标签桌面壳（`gpui-cef-component-demo`，支持 `--cef-example true`） |
 | [`scripts/`](scripts) | Windows 构建、示例启动（`run-example.ps1` / `run-bing.ps1`）、独立发行打包与自动化验证脚本 |
@@ -101,7 +101,7 @@
 
 ### 1. 运行全功能桌面浏览器示例（`gpui-cef-example`）
 
-在仓库根目录的 PowerShell（5.1 或 7+）中执行 [`scripts/run-example.ps1`](scripts/run-example.ps1)（自动编译 `gpui-cef-example` 与 `rust-cef-helper`、打包至独立 bundle 目录并启动；支持多标签、GPU 旋转/透明度/采样模式面板、JS 执行/异步求值、`custom://cefsharp/` 自定义 Scheme、`ResponseBodyFilter` 流式过滤、下载/PDF 导出与内置基准自测页）：
+在仓库根目录的 PowerShell（5.1 或 7+）中执行 [`scripts/run-example.ps1`](scripts/run-example.ps1)（自动编译 `gpui-cef-example` 与 `rust-cef-helper`、打包至独立 bundle 目录并启动；支持多标签、GPU 旋转/透明度/采样模式面板、JS 执行/异步求值、`window['cef-rs-gpui']` 对象绑定、`custom://cef-rs-gpui/` 自定义 Scheme、`ResponseBodyFilter` 流式过滤、跨站 POST、原生保存对话框 PDF 导出与结果弹窗、26 项 `Tests` 菜单及 `Chrome Urls`）：
 
 ```powershell
 # 默认以 D3D11 零拷贝 OSR + Threaded + CEF 原生右键菜单启动（可仅加 -BuildOnly 构建打包）
@@ -117,7 +117,7 @@
 # 启用 GPUI 自定义菜单桥接或指定启动 URL
 .\scripts\run-example.ps1 -ContextMenu -Url https://cn.bing.com
 
-# 运行自动化 3 标签冒烟自测（含 GPU 变换、JS 求值、ResponseFilter 与 BenchmarkSuite）
+# 运行自动化 3 标签冒烟自测（含 GPU 变换、JS 求值、ResponseFilter、BenchmarkSuite 与跨站 LoadUrlWithPostData）
 .\scripts\run-example.ps1 -Release -SmokeSeconds 8
 ```
 
@@ -127,7 +127,10 @@
 # 打包至项目相对目录 .\dist 后，可直接零参数运行离线可执行文件
 .\scripts\run-example.ps1 -Release -StagingRoot .\dist -BuildOnly
 .\dist\cef-example-release\gpui-cef-example.exe
-# 可选 CLI 参数: [--host-mode osr|native-hwnd] [--backend D3d11|Software] [--mode Threaded|Integrated] [--context-menu true|false] [--url <url>] [--smoke-ms 100..30000]
+
+# 或使用相对缓存目录运行 14 阶段自动化对齐验证套件（6 套 QUnit 共 2280 断言 + 8 项功能检查）
+.\dist\cef-example-release\gpui-cef-example.exe --verify-tests true --cache-root .\dist\verify-cache
+# 可选 CLI 参数: [--host-mode osr|native-hwnd] [--backend D3d11|Software] [--mode Threaded|Integrated] [--context-menu true|false] [--url <url>] [--smoke-ms 100..30000] [--verify-tests true|false]
 ```
 
 ### 2. 运行在线浏览示例（`examples/bing_cn.rs`）
@@ -205,8 +208,11 @@ cargo test --locked --bin gpui-cef-example --bin gpui-cef-component-demo --featu
 ### 集成与发行级验证（PowerShell 7）
 
 ```powershell
-# 全功能桌面示例 Release 自动化冒烟自测
+# 全功能桌面示例 Release 自动化冒烟与 14 阶段对齐套件验证（均使用相对路径 .\dist）
 pwsh -NoProfile -File scripts/run-example.ps1 -Release -SmokeSeconds 8
+.\scripts\run-example.ps1 -Release -StagingRoot .\dist -BuildOnly
+.\dist\cef-example-release\gpui-cef-example.exe --mode Threaded --backend D3d11 --host-mode osr --context-menu true --verify-tests true --cache-root .\dist\verify-osr-cache
+.\dist\cef-example-release\gpui-cef-example.exe --mode Threaded --backend D3d11 --host-mode native-hwnd --verify-tests true --cache-root .\dist\verify-hwnd-cache
 
 # 完整四模式组合被动冒烟（Integrated/Threaded × Software/D3d11）与原生菜单探针
 pwsh -NoProfile -File scripts/test-component-demo.ps1

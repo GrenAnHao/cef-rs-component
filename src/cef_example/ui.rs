@@ -26,10 +26,11 @@ use rust_cef_gpui::{
 
 use super::{
     assets::{
-        BENCHMARK_SUITE_URL, BINDING_TEST_URL, DEFAULT_HOME_URL, DIAGNOSTICS_URL,
-        DOWNLOAD_TEST_URL, DRAG_DROP_CURSORS_TEST_URL, DRAGGABLE_REGION_TEST_URL,
-        EXCEPTION_TEST_URL, POPUP_TEST_URL, POST_MESSAGE_TEST_URL, RESPONSE_FILTER_TEST_URL,
-        SCHEME_TEST_URL, TOOLTIP_TEST_URL,
+        BASIC_SCHEME_TEST_URL, BENCHMARK_SUITE_URL, BINDING_TEST_SINGLE_URL, BINDING_TEST_URL,
+        BINDING_TESTS_ASYNC_TASK_URL, CDM_SUPPORT_TEST_URL, CHROME_INTERNAL_URLS,
+        CHROME_NET_INTERNAL_URLS, CHROME_PROCESS_INTERNAL_URLS, DRAG_DROP_CURSORS_TEST_URL,
+        DRAGGABLE_REGION_TEST_URL, DEFAULT_HOME_URL, LEGACY_BINDING_TEST_URL, POPUP_PARENT_URL,
+        POPUP_TEST_URL, POST_MESSAGE_TEST_URL, RESPONSE_FILTER_TEST_URL, TOOLTIP_TEST_URL,
     },
     model::{
         ActiveInput, MenuCategory, TextBuffer, ExampleAppModel, ExampleHostMode,
@@ -43,7 +44,7 @@ use super::{
 };
 use super::{ExampleAction, ExampleView};
 
-const WATERMARK_SVG: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 460 88" width="460" height="88"><text x="12" y="60" font-family="Segoe UI, Arial, sans-serif" font-size="52" font-weight="700" fill="#000000">CefSharp Rocks!</text></svg>"##;
+const WATERMARK_SVG: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 540 88" width="540" height="88"><text x="12" y="60" font-family="Segoe UI, Arial, sans-serif" font-size="52" font-weight="700" fill="#000000">cef-rs-gpui Rocks!</text></svg>"##;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum SliderKind {
@@ -93,6 +94,7 @@ pub(super) struct CefExampleRoot {
     pub(super) smoke_eval_ok: bool,
     pub(super) smoke_response_filter_ok: bool,
     pub(super) smoke_benchmark_ok: bool,
+    pub(super) smoke_custom_post_ok: bool,
     pub(super) active_slider: Option<SliderKind>,
     pub(super) angle_track_bounds: Rc<Cell<Bounds<Pixels>>>,
     pub(super) opacity_track_bounds: Rc<Cell<Bounds<Pixels>>>,
@@ -109,9 +111,11 @@ impl CefExampleRoot {
             return;
         }
         let active = self.model.active_tab;
-        let menu_blocks_hwnd = self.model.open_menu.is_some();
+        let overlay_blocks_hwnd = self.model.open_menu.is_some()
+            || self.model.pending_js_dialog.is_some()
+            || self.model.notice_dialog.is_some();
         for (id, view) in &self.views {
-            view.set_visible(!menu_blocks_hwnd && active == Some(*id), cx);
+            view.set_visible(!overlay_blocks_hwnd && active == Some(*id), cx);
         }
     }
 
@@ -320,6 +324,11 @@ impl CefExampleRoot {
         }
 
         if self.model.active_input == ActiveInput::None {
+            if self.model.notice_dialog.is_some() && (key == "escape" || key == "enter") {
+                self.emit(ExampleAction::DismissNoticeDialog);
+                cx.stop_propagation();
+                return;
+            }
             if key == "escape" && self.model.open_menu.is_some() {
                 self.model.open_menu = None;
                 self.sync_native_tab_visibility(cx);
@@ -540,7 +549,7 @@ impl CefExampleRoot {
             .id(id)
             .w_full()
             .px(px(12.0))
-            .py(px(5.0))
+            .py(px(4.0))
             .text_size(px(12.0))
             .text_color(rgb(0x212121))
             .hover(|s| s.bg(rgb(0xede7f6)))
@@ -566,10 +575,13 @@ impl CefExampleRoot {
             MenuCategory::ChromeUrls => px(142.0),
         };
         let mut card = div()
+            .id("menu-dropdown-card")
             .absolute()
             .top(px(26.0))
             .left(left_offset)
             .w(px(270.0))
+            .max_h(px(620.0))
+            .overflow_y_scroll()
             .py(px(4.0))
             .bg(rgb(0xffffff))
             .border_1()
@@ -664,6 +676,22 @@ impl CefExampleRoot {
                         cx,
                     ))
                     .child(Self::menu_row(
+                        "m-t-binding-single",
+                        "Binding Test Single",
+                        |this, _, _| {
+                            this.emit(ExampleAction::NewTab(Some(BINDING_TEST_SINGLE_URL.into())))
+                        },
+                        cx,
+                    ))
+                    .child(Self::menu_row(
+                        "m-t-legacy-binding",
+                        "LegacyBinding Test",
+                        |this, _, _| {
+                            this.emit(ExampleAction::NewTabLegacy(LEGACY_BINDING_TEST_URL.into()))
+                        },
+                        cx,
+                    ))
+                    .child(Self::menu_row(
                         "m-t-post",
                         "Post Message Test",
                         |this, _, _| {
@@ -688,18 +716,26 @@ impl CefExampleRoot {
                     .child(Self::menu_row(
                         "m-t-popup",
                         "Popup Test",
+                        |this, _, _| this.emit(ExampleAction::NewTab(Some(POPUP_PARENT_URL.into()))),
+                        cx,
+                    ))
+                    .child(Self::menu_row(
+                        "m-t-popup-scheme",
+                        "Popup Test Custom Scheme",
                         |this, _, _| this.emit(ExampleAction::NewTab(Some(POPUP_TEST_URL.into()))),
                         cx,
                     ))
                     .child(Self::menu_row(
                         "m-t-scheme",
-                        "Basic Scheme Test (custom://)",
-                        |this, _, _| this.emit(ExampleAction::NewTab(Some(SCHEME_TEST_URL.into()))),
+                        "Basic Scheme Test",
+                        |this, _, _| {
+                            this.emit(ExampleAction::NewTab(Some(BASIC_SCHEME_TEST_URL.into())))
+                        },
                         cx,
                     ))
                     .child(Self::menu_row(
                         "m-t-resp-filter",
-                        "Response Filter Test (>32KB)",
+                        "Response Filter Test",
                         |this, _, _| {
                             this.emit(ExampleAction::NewTab(Some(RESPONSE_FILTER_TEST_URL.into())))
                         },
@@ -714,31 +750,78 @@ impl CefExampleRoot {
                         cx,
                     ))
                     .child(Self::menu_row(
-                        "m-t-exception",
-                        "Uncaught Exception Test",
+                        "m-t-fish-gl",
+                        "Fish Gl",
                         |this, _, _| {
-                            this.emit(ExampleAction::NewTab(Some(EXCEPTION_TEST_URL.into())))
+                            this.emit(ExampleAction::NewTab(Some("http://www.fishgl.com/".into())))
                         },
                         cx,
                     ))
                     .child(Self::menu_row(
-                        "m-t-download",
-                        "Download Sample Artifact",
+                        "m-t-ms-test-drive",
+                        "Microsoft Test Drive",
                         |this, _, _| {
-                            this.emit(ExampleAction::NavigateActive(DOWNLOAD_TEST_URL.into()))
+                            this.emit(ExampleAction::NewTab(Some(
+                                "http://dev.modern.ie/testdrive/".into(),
+                            )))
+                        },
+                        cx,
+                    ))
+                    .child(Self::menu_row(
+                        "m-t-drag-demo",
+                        "Drag Demo",
+                        |this, _, _| {
+                            this.emit(ExampleAction::NewTab(Some(
+                                "http://html5demos.com/drag".into(),
+                            )))
                         },
                         cx,
                     ))
                     .child(Self::menu_row(
                         "m-t-pdf",
-                        "Print Current Tab to PDF",
-                        |this, _, _| this.emit(ExampleAction::ExportPdf),
+                        "Print Current tab to PDF",
+                        |this, _, _| this.emit(ExampleAction::ExportPdfPrompt),
                         cx,
                     ))
                     .child(Self::menu_row(
                         "m-t-custom-req",
-                        "Load Custom Request (POST)",
+                        "Load Custom Request",
                         |this, _, _| this.emit(ExampleAction::LoadCustomPost),
+                        cx,
+                    ))
+                    .child(Self::menu_row(
+                        "m-t-cdm",
+                        "CDM/DRM Support Test",
+                        |this, _, _| {
+                            this.emit(ExampleAction::NewTab(Some(CDM_SUPPORT_TEST_URL.into())))
+                        },
+                        cx,
+                    ))
+                    .child(Self::menu_row(
+                        "m-t-async-jsb-task",
+                        "Async JSB Task Tests",
+                        |this, _, _| {
+                            this.emit(ExampleAction::NewTab(Some(
+                                BINDING_TESTS_ASYNC_TASK_URL.into(),
+                            )))
+                        },
+                        cx,
+                    ))
+                    .child(Self::menu_row(
+                        "m-t-resize-hack",
+                        "Resize Hack Tests",
+                        |this, _, _| this.emit(ExampleAction::ResizeHackTests),
+                        cx,
+                    ))
+                    .child(Self::menu_row(
+                        "m-t-sw-demo",
+                        "Google Service Worker Demo",
+                        |this, _, _| {
+                            this.emit(ExampleAction::NewTab(Some(
+                                "https://googlechrome.github.io/samples/service-worker/basic/"
+                                    .into(),
+                            )))
+                        },
                         cx,
                     ))
                     .child(div().h(px(1.0)).mx(px(8.0)).my(px(2.0)).bg(rgb(0xe0e0e0)))
@@ -802,24 +885,28 @@ impl CefExampleRoot {
             MenuCategory::ChromeUrls => {
                 card = card
                     .child(Self::menu_row(
-                        "m-c-diag",
-                        "Runtime Diagnostics (custom://)",
-                        |this, _, _| this.emit(ExampleAction::NewTab(Some(DIAGNOSTICS_URL.into()))),
-                        cx,
-                    ))
-                    .child(Self::menu_row(
                         "m-c-urls",
-                        "chrome://chrome-urls (Policy Guard)",
+                        "List Internal Urls",
                         |this, _, _| {
-                            this.emit(ExampleAction::NavigateActive("chrome://chrome-urls".into()))
+                            this.emit(ExampleAction::NewTab(Some(CHROME_INTERNAL_URLS.into())))
                         },
                         cx,
                     ))
                     .child(Self::menu_row(
                         "m-c-net",
-                        "chrome://net-internals (Policy Guard)",
+                        "Net Internal Urls",
                         |this, _, _| {
-                            this.emit(ExampleAction::NavigateActive("chrome://net-internals".into()))
+                            this.emit(ExampleAction::NewTab(Some(CHROME_NET_INTERNAL_URLS.into())))
+                        },
+                        cx,
+                    ))
+                    .child(Self::menu_row(
+                        "m-c-proc",
+                        "Process Internal Urls",
+                        |this, _, _| {
+                            this.emit(ExampleAction::NewTab(Some(
+                                CHROME_PROCESS_INTERNAL_URLS.into(),
+                            )))
                         },
                         cx,
                     ));
@@ -1728,7 +1815,7 @@ impl Render for CefExampleRoot {
                                     .translate(point(ScaledPixels(-cx_sp), ScaledPixels(-cy_sp)));
                                 let _ = window.paint_svg(
                                     tile_bounds,
-                                    "cefsharp-rocks-watermark.svg".into(),
+                                    "cef-rs-gpui-rocks-watermark.svg".into(),
                                     Some(WATERMARK_SVG),
                                     xform,
                                     color,
@@ -1993,6 +2080,65 @@ impl Render for CefExampleRoot {
 
         if let Some(cat) = self.model.open_menu {
             root = root.child(self.render_menu_dropdown(cat, cx));
+        }
+
+        if let Some(ref notice) = self.model.notice_dialog {
+            root = root.child(
+                div()
+                    .id("notice-modal-backdrop")
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .right_0()
+                    .bottom_0()
+                    .bg(hsla(0.0, 0.0, 0.0, 0.35))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .on_mouse_down(MouseButton::Left, cx.listener(|_, _, _, cx| cx.stop_propagation()))
+                    .child(
+                        div()
+                            .w(px(460.0))
+                            .bg(rgb(0xffffff))
+                            .border_1()
+                            .border_color(rgb(0xbdbdbd))
+                            .rounded(px(4.0))
+                            .shadow_lg()
+                            .overflow_hidden()
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .px(px(14.0))
+                                    .py(px(8.0))
+                                    .bg(rgb(0x5e35b1))
+                                    .text_color(rgb(0xffffff))
+                                    .text_size(px(13.0))
+                                    .child(notice.title.clone()),
+                            )
+                            .child(
+                                div()
+                                    .px(px(16.0))
+                                    .py(px(14.0))
+                                    .text_size(px(13.0))
+                                    .text_color(rgb(0x212121))
+                                    .child(notice.message.clone()),
+                            )
+                            .child(
+                                div()
+                                    .px(px(14.0))
+                                    .pb(px(12.0))
+                                    .flex()
+                                    .justify_end()
+                                    .child(Self::purple_btn(
+                                        "notice-modal-ok",
+                                        "OK",
+                                        |this, _, _| this.emit(ExampleAction::DismissNoticeDialog),
+                                        cx,
+                                    )),
+                            ),
+                    ),
+            );
         }
 
         match menu {

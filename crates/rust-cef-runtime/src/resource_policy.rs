@@ -195,6 +195,7 @@ wrap_resource_request_handler! {
                 Some(state) => state.allows_resource(&url, self.main_navigation),
                 None => {
                     self.policy.rules.allows_network(&url)
+                        || self.policy.allows_chrome_internal_url(&url)
                         || self.policy.rules.allows_open_web_blob(&url)
                         || self.policy.rules.allows_open_web_data(&url)
                         || (!self.main_navigation
@@ -205,6 +206,25 @@ wrap_resource_request_handler! {
             if !allowed {
                 self.policy.deny(self.browser, PolicyAction::Resource);
                 return ReturnValue::CANCEL;
+            }
+            if self.main_navigation
+                && let Some(state) = self.state.as_ref()
+                && state.claim_post_bootstrap_response(
+                    &url,
+                    &CefString::from(&request.method()).to_string(),
+                )
+            {
+                *self
+                    .intercepted_response
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    Some(InterceptedResponse {
+                        status_code: 200,
+                        mime_type: "text/html".into(),
+                        headers: vec![("Cache-Control".into(), "no-store".into())],
+                        body: b"<!DOCTYPE html><html><head><meta charset=\"utf-8\"></head><body></body></html>".to_vec(),
+                    });
+                return ReturnValue::CONTINUE;
             }
             if let Some(interceptor) = self.effective_interceptor() {
                 let method = CefString::from(&request.method()).to_string();
@@ -315,6 +335,15 @@ wrap_resource_request_handler! {
             request: Option<&mut Request>,
             response: Option<&mut Response>,
         ) -> ::std::os::raw::c_int {
+            if self.main_navigation
+                && request.as_ref().is_some_and(|r| {
+                    self.state
+                        .as_ref()
+                        .is_some_and(|s| s.is_post_bootstrap_url(&CefString::from(&r.url()).to_string()))
+                })
+            {
+                return 0;
+            }
             let interceptor = self.effective_interceptor();
             let wants_event = self
                 .state
@@ -340,6 +369,15 @@ wrap_resource_request_handler! {
             request: Option<&mut Request>,
             response: Option<&mut Response>,
         ) -> Option<ResponseFilter> {
+            if self.main_navigation
+                && request.as_ref().is_some_and(|r| {
+                    self.state
+                        .as_ref()
+                        .is_some_and(|s| s.is_post_bootstrap_url(&CefString::from(&r.url()).to_string()))
+                })
+            {
+                return None;
+            }
             let interceptor = self.effective_interceptor()?;
             let info = build_response_info(request, response, self.main_navigation);
             let body_filter = interceptor.response_filter(&info)?;
@@ -355,6 +393,15 @@ wrap_resource_request_handler! {
             status: UrlrequestStatus,
             received_content_length: i64,
         ) {
+            if self.main_navigation
+                && request.as_ref().is_some_and(|r| {
+                    self.state
+                        .as_ref()
+                        .is_some_and(|s| s.is_post_bootstrap_url(&CefString::from(&r.url()).to_string()))
+                })
+            {
+                return;
+            }
             let interceptor = self.effective_interceptor();
             let wants_event = self
                 .state

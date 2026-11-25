@@ -23,6 +23,8 @@ pub(crate) const EXTRA_BROWSER_LOCAL: &str = "rust_cef.browser";
 pub(crate) const EXTRA_JS_BRIDGE_ENABLED: &str = "rust_cef.js_bridge.enabled";
 pub(crate) const EXTRA_JS_BRIDGE_MAX_BYTES: &str = "rust_cef.js_bridge.max_bytes";
 pub(crate) const EXTRA_JS_BRIDGE_ORIGINS: &str = "rust_cef.js_bridge.origins";
+pub(crate) const EXTRA_JS_BRIDGE_SUBFRAMES: &str = "rust_cef.js_bridge.subframes";
+pub(crate) const EXTRA_JS_BRIDGE_LEGACY: &str = "rust_cef.js_bridge.legacy";
 
 pub(crate) const MSG_POST_MESSAGE: &str = "rust_cef.post_message";
 pub(crate) const MSG_HOST_MESSAGE: &str = "rust_cef.host_message";
@@ -33,7 +35,7 @@ pub(crate) const MSG_CONTEXT_RELEASED: &str = "rust_cef.context_released";
 pub(crate) const MSG_FOCUSED_NODE_CHANGED: &str = "rust_cef.focused_node_changed";
 pub(crate) const MSG_UNCAUGHT_EXCEPTION: &str = "rust_cef.uncaught_exception";
 
-const MAX_V8_LISTENERS_PER_BROWSER: usize = 16;
+const MAX_V8_LISTENERS_PER_BROWSER: usize = 64;
 
 struct ContextEntryGuard {
     ctx: V8Context,
@@ -80,6 +82,8 @@ struct HelperBrowserBridge {
     runtime_gen: u64,
     browser_local: u64,
     js_bridge_enabled: bool,
+    allow_subframes: bool,
+    legacy_binding: bool,
     max_bytes: usize,
     allowed_origins: BTreeSet<String>,
     listeners: Vec<(V8Context, V8Value)>,
@@ -121,6 +125,8 @@ impl HelperRenderState {
             return;
         };
         let js_bridge_enabled = info.bool(Some(&CefString::from(EXTRA_JS_BRIDGE_ENABLED))) != 0;
+        let allow_subframes = info.bool(Some(&CefString::from(EXTRA_JS_BRIDGE_SUBFRAMES))) != 0;
+        let legacy_binding = info.bool(Some(&CefString::from(EXTRA_JS_BRIDGE_LEGACY))) != 0;
         let max_raw = info.int(Some(&CefString::from(EXTRA_JS_BRIDGE_MAX_BYTES)));
         let max_bytes = usize::try_from(max_raw)
             .unwrap_or(MAX_JS_PAYLOAD_BYTES)
@@ -145,6 +151,8 @@ impl HelperRenderState {
                 runtime_gen,
                 browser_local,
                 js_bridge_enabled,
+                allow_subframes,
+                legacy_binding,
                 max_bytes,
                 allowed_origins,
                 listeners: Vec::new(),
@@ -182,17 +190,32 @@ impl HelperRenderState {
         native_id: i32,
         frame: &Frame,
     ) -> Option<(u64, u64, usize, String)> {
-        if frame.is_valid() == 0 || frame.is_main() == 0 {
+        self.frame_bridge_config(native_id, frame)
+            .map(|(rt, br, max_bytes, origin, _, _)| (rt, br, max_bytes, origin))
+    }
+
+    fn frame_bridge_config(
+        &self,
+        native_id: i32,
+        frame: &Frame,
+    ) -> Option<(u64, u64, usize, String, bool, bool)> {
+        if frame.is_valid() == 0 {
             return None;
         }
         let url = CefString::from(&frame.url()).to_string();
         let origin = self.origin_for_url(&url)?;
         let guard = self.lock_browsers();
         let bridge = guard.get(&native_id)?;
+        if !bridge.js_bridge_enabled {
+            return None;
+        }
+        if frame.is_main() == 0 && !bridge.allow_subframes {
+            return None;
+        }
         let origin_allowed = bridge.allowed_origins.contains(&origin)
             || (origin.starts_with("https://") && bridge.allowed_origins.contains("https://*"))
             || (origin.starts_with("http://") && bridge.allowed_origins.contains("http://*"));
-        if !bridge.js_bridge_enabled || !origin_allowed {
+        if !origin_allowed {
             return None;
         }
         Some((
@@ -200,6 +223,8 @@ impl HelperRenderState {
             bridge.browser_local,
             bridge.max_bytes,
             origin,
+            bridge.allow_subframes,
+            bridge.legacy_binding,
         ))
     }
 
@@ -436,9 +461,11 @@ wrap_render_process_handler! {
             {
                 send_frame_context_event(frame, MSG_CONTEXT_CREATED, rt, br);
             }
-            if self.state.is_frame_bridge_permitted(native_id, frame).is_none() {
+            let Some((_, _, _, _, _, legacy_binding)) =
+                self.state.frame_bridge_config(native_id, frame)
+            else {
                 return;
-            }
+            };
             let _guard = ContextEntryGuard::enter(context.clone());
             let Some(global) = context.global() else {
                 return;
@@ -461,23 +488,11 @@ wrap_render_process_handler! {
                 bridge_obj.set_value_bykey(Some(&on_name), Some(&mut on_fn), ro);
             }
             global.set_value_bykey(Some(&CefString::from("rustCef")), Some(&mut bridge_obj), ro);
+            let bootstrap_script = crate::jsb_bridge_js::bootstrap_js(legacy_binding);
             let mut eval_ret: Option<V8Value> = None;
             let mut eval_exc: Option<V8Exception> = None;
             let _ = context.eval(
-                Some(&CefString::from(
-                    "if (typeof globalThis !== 'undefined' && globalThis.rustCef) {\
-                       if (Object.freeze) { Object.freeze(globalThis.rustCef); }\
-                       if (typeof globalThis.CefSharp === 'undefined') {\
-                         globalThis.CefSharp = {\
-                           PostMessage: function(msg) { return globalThis.rustCef.postMessage(msg); },\
-                           BindObjectAsync: function() { return Promise.resolve({ Success: true, Message: 'ready' }); },\
-                           DeleteBoundObject: function() { return true; },\
-                           IsObjectCached: function() { return true; },\
-                           RemoveObjectFromCache: function() { return true; }\
-                         };\
-                       }\
-                     }",
-                )),
+                Some(&CefString::from(bootstrap_script.as_str())),
                 Some(&CefString::from("rust-cef://bootstrap")),
                 1,
                 Some(&mut eval_ret),
@@ -646,8 +661,8 @@ wrap_render_process_handler! {
                     let br_ok = CefString::from(&args.string(1)).to_string().parse::<u64>().ok();
                     let expected_origin = CefString::from(&args.string(2)).to_string();
                     let payload = CefString::from(&args.string(3)).to_string();
-                    let Some((runtime_gen, browser_local, max_bytes, origin)) =
-                        self.state.is_frame_bridge_permitted(native_id, frame)
+                    let Some((runtime_gen, browser_local, max_bytes, origin, allow_subframes, _)) =
+                        self.state.frame_bridge_config(native_id, frame)
                     else {
                         return 1;
                     };
@@ -658,21 +673,47 @@ wrap_render_process_handler! {
                     {
                         return 1;
                     }
-                    let Some(mut ctx) = frame.v8_context() else {
-                        return 1;
-                    };
-                    let _guard = ContextEntryGuard::enter(ctx.clone());
-                    let Some(val) = v8_value_create_string(Some(&CefString::from(payload.as_str())))
-                    else {
-                        return 1;
-                    };
-                    for (listener_ctx, listener_fn) in self.state.listeners_for(native_id) {
-                        if listener_ctx.is_same(Some(&mut ctx)) != 0 {
+                    if allow_subframes {
+                        for (mut listener_ctx, listener_fn) in self.state.listeners_for(native_id) {
+                            if listener_ctx.is_valid() == 0 {
+                                continue;
+                            }
+                            let Some(l_frame) = listener_ctx.frame() else {
+                                continue;
+                            };
+                            if self.state.is_frame_bridge_permitted(native_id, &l_frame).is_none() {
+                                continue;
+                            }
+                            let _guard = ContextEntryGuard::enter(listener_ctx.clone());
+                            let Some(val) =
+                                v8_value_create_string(Some(&CefString::from(payload.as_str())))
+                            else {
+                                continue;
+                            };
                             let _ = listener_fn.execute_function_with_context(
-                                Some(&mut ctx),
+                                Some(&mut listener_ctx),
                                 None,
-                                Some(&[Some(val.clone())]),
+                                Some(&[Some(val)]),
                             );
+                        }
+                    } else {
+                        let Some(mut ctx) = frame.v8_context() else {
+                            return 1;
+                        };
+                        let _guard = ContextEntryGuard::enter(ctx.clone());
+                        let Some(val) =
+                            v8_value_create_string(Some(&CefString::from(payload.as_str())))
+                        else {
+                            return 1;
+                        };
+                        for (listener_ctx, listener_fn) in self.state.listeners_for(native_id) {
+                            if listener_ctx.is_same(Some(&mut ctx)) != 0 {
+                                let _ = listener_fn.execute_function_with_context(
+                                    Some(&mut ctx),
+                                    None,
+                                    Some(&[Some(val.clone())]),
+                                );
+                            }
                         }
                     }
                     1
