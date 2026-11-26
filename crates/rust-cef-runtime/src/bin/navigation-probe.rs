@@ -776,9 +776,7 @@ mod windows {
             let center = ((height as usize / 2) * width as usize + width as usize / 2) * 4;
             if width == FRAME_WIDTH_U32
                 && height == FRAME_HEIGHT_U32
-                && frame
-                    .cpu_pixels()
-                    .and_then(|px| px.get(center..center + 4))
+                && frame.cpu_pixels().and_then(|px| px.get(center..center + 4))
                     == Some(&CENTER_BGRA)
             {
                 let mut valid = lock(&self.valid_browser);

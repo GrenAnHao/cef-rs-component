@@ -2,6 +2,8 @@
 //! `rust-cef-gpui` and `rust-cef-core` APIs.
 
 pub mod assets;
+pub(crate) mod dialogs;
+pub(crate) mod find_bar;
 pub mod jsb_rpc;
 pub mod model;
 pub(crate) mod text_input;
@@ -26,10 +28,16 @@ use gpui::{
     AnyElement, App, AppContext as _, AsyncApp, Bounds, Entity, FocusHandle, Focusable as _,
     IntoElement as _, Window, WindowBounds, WindowHandle, WindowOptions, px, size,
 };
+use rust_cef_core::{
+    contracts::{BrowserKeyEventKind, ShortcutFilter, ShortcutId, ShortcutRule},
+    keymap::{EVENTFLAG_ALT_DOWN, EVENTFLAG_COMMAND_DOWN, EVENTFLAG_CONTROL_DOWN},
+    ports::RequestId as BeforeUnloadRequestId,
+};
 use rust_cef_gpui::{
     CefBrowser, ContextMenuConfig, ContextMenuRegistration, ContextMenuServices,
-    DefaultMenuPresenter, NativeCefBrowser, NativeDropTargetServices, PdfExportStatus,
-    PdfExportTicket, Runtime, RuntimeServices, ViewDiagnostics,
+    DefaultMenuPresenter, FindServices, FindUiUpdate, NativeCefBrowser, NativeDropTargetServices,
+    PdfExportStatus, PdfExportTicket, Runtime, RuntimeServices, SourceViewOptions,
+    SourceViewServices, ViewDiagnostics,
     contracts::{
         BrowserConfig, BrowserId, BrowserOptions, BrowserSurfaceMode, CefFeatureState,
         NativeChildHwndConfig, PixelRect, ProfileStorage, RenderPreference, RuntimeConfig,
@@ -37,11 +45,15 @@ use rust_cef_gpui::{
         TrustedContentPolicy, Viewport, step_canonical_zoom_level,
     },
     dispatcher::{self, UiWakeReceiver, UiWakeSender},
+    find::FindLimits,
     host_capabilities::{
-        AuthDecision, AuthRequest, AuthService, DownloadProgress, DownloadRequest,
-        DownloadService, HostCapabilities, JsDialogDecision, JsDialogKind, JsDialogRequest,
-        JsDialogService, PdfExportOptions, PopupDecision, PopupDisposition, PopupPolicy,
-        PopupRequest, PopupService,
+        AuthDecision, AuthRequest, AuthService, CertificateDecision, CertificateErrorRequest,
+        CertificateService, ClientCertificateRequest, DownloadId, DownloadProgress,
+        DownloadRequest, DownloadService, FileDialogDecision, FileDialogKind, FileDialogRequest,
+        FileDialogService, HostCapabilities, HostRequestId, JsDialogDecision, JsDialogKind,
+        JsDialogRequest, JsDialogService, PdfExportOptions, PermissionDecision, PermissionRequest,
+        PermissionService, PopupDecision, PopupDisposition, PopupPolicy, PopupRequest,
+        PopupService, PreKeyDecision,
     },
     js_bridge::{EvalOutcome, EvalRequestId, JsBridgeConfig, JsFrameScope, MAX_JS_PAYLOAD_BYTES},
     menu::{MenuContextLimits, MenuLimits},
@@ -51,16 +63,27 @@ use rust_cef_gpui::{
         OwnedFrame, PublishResult, UiDispatcher as _,
     },
     runtime::{ShutdownStatus, StartError},
+    source::SourceViewLimits,
 };
 
 use assets::{
-    BENCHMARK_SUITE_URL, CUSTOM_POST_URL, DEFAULT_HOME_URL, RESPONSE_FILTER_TEST_URL,
-    ExampleResourceInterceptor, build_custom_schemes, format_runtime_summary,
+    BENCHMARK_SUITE_URL, CUSTOM_POST_URL, DEFAULT_HOME_URL, ExampleResourceInterceptor,
+    RESPONSE_FILTER_TEST_URL, build_custom_schemes, format_runtime_summary,
+};
+use dialogs::{
+    FileDialogTracker, build_auth_decision_and_wipe, build_path_prompt_options,
+    cancel_active_download_on_close, cap_selected_paths, resolve_download_destination,
+    split_save_default_path,
+};
+use find_bar::{
+    DirectFindBook, DirectSourceBook, FindCommandKind, apply_find_status, format_source_failure,
+    handle_find_dispatch_error, plan_close_find_bar, plan_find_command,
 };
 use jsb_rpc::CefRsGpuiRpcHost;
 use model::{
-    ActiveInput, BitmapScalingKind, NoticeDialog, PendingJsDialog, ExampleAppModel, ExampleConfig,
-    ExampleHostMode, normalize_user_url,
+    ActiveInput, BitmapScalingKind, ExampleAppModel, ExampleConfig, ExampleHostMode, NoticeDialog,
+    PendingBeforeUnloadModal, PendingCertKind, PendingCertModal, PendingJsDialog,
+    PendingPermissionModal, TextBuffer, normalize_user_url,
 };
 use ui::CefExampleRoot;
 
@@ -90,7 +113,10 @@ pub(super) enum ExampleAction {
     ToggleDownloadInfo,
     ExecuteJs(String),
     EvaluateJs(String),
-    PostJsToTab { tab_id: u64, payload_json: String },
+    PostJsToTab {
+        tab_id: u64,
+        payload_json: String,
+    },
     SetRenderAngle(f32),
     SetWatermarkOpacity(f32),
     SetBitmapScaling(BitmapScalingKind),
@@ -100,7 +126,38 @@ pub(super) enum ExampleAction {
     ExportPdfPrompt,
     ExportPdfToPath(PathBuf),
     DismissNoticeDialog,
-    ResolveJsDialog { accept: bool },
+    ResolveJsDialog {
+        accept: bool,
+    },
+    OpenFindBar,
+    CloseFindBar,
+    FindToggleCase,
+    FindDispatch {
+        forward: bool,
+        force_find_next: bool,
+    },
+    ViewSource,
+    ToggleAskSaveAs,
+    CancelDownload(u64),
+    OpenContainingFolder(PathBuf),
+    CompleteFileDialog {
+        request_id: HostRequestId,
+        paths: Option<Vec<PathBuf>>,
+    },
+    CompleteSaveAsDownload {
+        request_id: DownloadId,
+        path: Option<PathBuf>,
+    },
+    ResolvePermission {
+        allow: bool,
+    },
+    ResolveAuth {
+        submit: bool,
+    },
+    ResolveCertificate {
+        accept: bool,
+    },
+    ResolveBeforeUnload(bool),
     ExitApp,
 }
 
@@ -285,6 +342,22 @@ impl ExampleView {
         }
     }
 
+    pub(super) fn resolve_before_unload(
+        &self,
+        request: BeforeUnloadRequestId,
+        allow: bool,
+        cx: &mut App,
+    ) {
+        match self {
+            Self::Osr(v) => v.update(cx, |view, _| {
+                let _ = view.resolve_before_unload(request, allow);
+            }),
+            Self::Native(v) => v.update(cx, |view, _| {
+                let _ = view.resolve_before_unload(request, allow);
+            }),
+        }
+    }
+
     pub(super) fn execute_javascript(&self, script: String, cx: &mut App) {
         match self {
             Self::Osr(v) => v.update(cx, |view, _| {
@@ -296,13 +369,20 @@ impl ExampleView {
         }
     }
 
-    pub(super) fn evaluate_script(&self, script: String, timeout_ms: u64, cx: &mut App) -> Option<EvalRequestId> {
+    pub(super) fn evaluate_script(
+        &self,
+        script: String,
+        timeout_ms: u64,
+        cx: &mut App,
+    ) -> Option<EvalRequestId> {
         match self {
             Self::Osr(v) => v.update(cx, |view, _| {
-                view.evaluate_script(script, JsFrameScope::MainFrame, timeout_ms).ok()
+                view.evaluate_script(script, JsFrameScope::MainFrame, timeout_ms)
+                    .ok()
             }),
             Self::Native(v) => v.update(cx, |view, _| {
-                view.evaluate_script(script, JsFrameScope::MainFrame, timeout_ms).ok()
+                view.evaluate_script(script, JsFrameScope::MainFrame, timeout_ms)
+                    .ok()
             }),
         }
     }
@@ -330,11 +410,24 @@ impl ExampleView {
 struct ExampleCapQueues {
     downloads: Mutex<VecDeque<(u64, DownloadRequest)>>,
     progress: Mutex<VecDeque<DownloadProgress>>,
+    file_dialogs: Mutex<VecDeque<FileDialogRequest>>,
+    file_dialog_cancellations: Mutex<VecDeque<HostRequestId>>,
     js_dialogs: Mutex<VecDeque<JsDialogRequest>>,
+    js_dialog_cancellations: Mutex<VecDeque<HostRequestId>>,
+    permissions: Mutex<VecDeque<PermissionRequest>>,
+    permission_cancellations: Mutex<VecDeque<HostRequestId>>,
     auths: Mutex<VecDeque<AuthRequest>>,
+    auth_cancellations: Mutex<VecDeque<HostRequestId>>,
+    cert_errors: Mutex<VecDeque<CertificateErrorRequest>>,
+    client_certs: Mutex<VecDeque<ClientCertificateRequest>>,
+    cert_cancellations: Mutex<VecDeque<HostRequestId>>,
     popups: Mutex<VecDeque<PopupRequest>>,
     js_rpcs: Mutex<VecDeque<(u64, String)>>,
     evals: Mutex<VecDeque<(u64, u64, EvalOutcome)>>,
+    escape_find_tabs: Mutex<VecDeque<u64>>,
+    shortcut_events: Mutex<VecDeque<(u64, ShortcutId)>>,
+    before_unload_events: Mutex<VecDeque<(u64, BeforeUnloadRequestId, bool)>>,
+    close_cancelled_tabs: Mutex<VecDeque<u64>>,
 }
 
 struct ExampleCapAdapter {
@@ -342,57 +435,82 @@ struct ExampleCapAdapter {
     wake: Arc<UiWakeSender>,
 }
 
+fn push_queue<T>(queue: &Mutex<VecDeque<T>>, wake: &UiWakeSender, item: T) {
+    queue
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push_back(item);
+    let _ = wake.wake();
+}
+
 impl DownloadService for ExampleCapAdapter {
     fn on_before_download(&self, request: DownloadRequest) {
         let seq = request.id.sequence;
-        self.queues
-            .downloads
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push_back((seq, request));
-        let _ = self.wake.wake();
+        push_queue(&self.queues.downloads, &self.wake, (seq, request));
     }
 
     fn on_download_updated(&self, progress: DownloadProgress) {
-        self.queues
-            .progress
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push_back(progress);
-        let _ = self.wake.wake();
+        push_queue(&self.queues.progress, &self.wake, progress);
+    }
+}
+
+impl FileDialogService for ExampleCapAdapter {
+    fn on_file_dialog(&self, request: FileDialogRequest) {
+        push_queue(&self.queues.file_dialogs, &self.wake, request);
+    }
+
+    fn on_file_dialog_cancelled(&self, id: HostRequestId) {
+        push_queue(&self.queues.file_dialog_cancellations, &self.wake, id);
     }
 }
 
 impl JsDialogService for ExampleCapAdapter {
     fn on_js_dialog(&self, request: JsDialogRequest) {
-        self.queues
-            .js_dialogs
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push_back(request);
-        let _ = self.wake.wake();
+        push_queue(&self.queues.js_dialogs, &self.wake, request);
+    }
+
+    fn on_js_dialog_cancelled(&self, id: HostRequestId) {
+        push_queue(&self.queues.js_dialog_cancellations, &self.wake, id);
+    }
+}
+
+impl PermissionService for ExampleCapAdapter {
+    fn on_permission_request(&self, request: PermissionRequest) {
+        push_queue(&self.queues.permissions, &self.wake, request);
+    }
+
+    fn on_permission_cancelled(&self, id: HostRequestId) {
+        push_queue(&self.queues.permission_cancellations, &self.wake, id);
     }
 }
 
 impl PopupService for ExampleCapAdapter {
     fn on_popup_request(&self, request: PopupRequest) {
-        self.queues
-            .popups
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push_back(request);
-        let _ = self.wake.wake();
+        push_queue(&self.queues.popups, &self.wake, request);
     }
 }
 
 impl AuthService for ExampleCapAdapter {
     fn on_auth_credentials(&self, request: AuthRequest) {
-        self.queues
-            .auths
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push_back(request);
-        let _ = self.wake.wake();
+        push_queue(&self.queues.auths, &self.wake, request);
+    }
+
+    fn on_auth_cancelled(&self, id: HostRequestId) {
+        push_queue(&self.queues.auth_cancellations, &self.wake, id);
+    }
+}
+
+impl CertificateService for ExampleCapAdapter {
+    fn on_certificate_error(&self, request: CertificateErrorRequest) {
+        push_queue(&self.queues.cert_errors, &self.wake, request);
+    }
+
+    fn on_select_client_certificate(&self, request: ClientCertificateRequest) {
+        push_queue(&self.queues.client_certs, &self.wake, request);
+    }
+
+    fn on_certificate_cancelled(&self, id: HostRequestId) {
+        push_queue(&self.queues.cert_cancellations, &self.wake, id);
     }
 }
 
@@ -452,11 +570,73 @@ struct TabRuntime {
     browser_id: BrowserId,
     handle: BrowserHandle,
     first_paint: bool,
-    menu_reg: Option<ContextMenuRegistration>,
+    closing_pending: bool,
+    menu_reg: Option<Arc<ContextMenuRegistration>>,
     smoke_eval_id: Option<EvalRequestId>,
     smoke_rf_eval_id: Option<EvalRequestId>,
     smoke_bench_eval_id: Option<EvalRequestId>,
     smoke_post_eval_id: Option<EvalRequestId>,
+}
+
+struct UxServices {
+    finds: Option<FindServices>,
+    sources: Option<SourceViewServices>,
+    direct_finds: DirectFindBook,
+    direct_sources: DirectSourceBook,
+    retired_browsers: Vec<BrowserId>,
+    reported_source_ops: Vec<(BrowserId, u64)>,
+}
+
+impl UxServices {
+    fn new(
+        finds: Option<FindServices>,
+        sources: Option<SourceViewServices>,
+        wake: Arc<UiWakeSender>,
+        max_source_bytes: usize,
+    ) -> Self {
+        Self {
+            finds,
+            sources,
+            direct_finds: DirectFindBook::new(wake.clone()),
+            direct_sources: DirectSourceBook::new(wake, max_source_bytes),
+            retired_browsers: Vec::new(),
+            reported_source_ops: Vec::new(),
+        }
+    }
+
+    fn sweep_retired(&mut self, cx: &mut AsyncApp) {
+        if self.retired_browsers.is_empty() {
+            return;
+        }
+        let mut remaining = Vec::new();
+        let _ = cx.update(|_| {
+            for browser in self.retired_browsers.drain(..) {
+                let find_busy = self
+                    .finds
+                    .as_mut()
+                    .is_some_and(|f| f.unregister(browser).is_err());
+                let source_busy = self
+                    .sources
+                    .as_mut()
+                    .is_some_and(|s| s.unregister(browser).is_err());
+                if find_busy || source_busy {
+                    remaining.push(browser);
+                }
+            }
+        });
+        self.retired_browsers = remaining;
+    }
+
+    fn shutdown(&mut self, cx: &mut AsyncApp) {
+        let _ = cx.update(|app| {
+            if let Some(finds) = self.finds.as_mut() {
+                finds.shutdown(app);
+            }
+            if let Some(sources) = self.sources.as_mut() {
+                sources.shutdown(app);
+            }
+        });
+    }
 }
 
 #[derive(Default)]
@@ -468,7 +648,46 @@ struct ExampleAccounting {
 }
 
 macro_rules! wire_view_callbacks {
-    ($view:expr, $tab_id:expr, $root_weak:expr, $cap_queues:expr, $wake:expr, $log_console:expr) => {{
+    ($view:expr, $tab_id:expr, $root_weak:expr, $cap_queues:expr, $wake:expr, $log_console:expr, $find_open_flag:expr) => {{
+        let esc_queues = $cap_queues.clone();
+        let esc_wake = $wake.clone();
+        let find_flag = $find_open_flag;
+        $view.set_pre_key_filter(Some(Arc::new(move |_browser, key| {
+            if key.kind != BrowserKeyEventKind::KeyUp
+                && key.windows_key_code == 0x1B
+                && (key.modifiers
+                    & (EVENTFLAG_CONTROL_DOWN | EVENTFLAG_ALT_DOWN | EVENTFLAG_COMMAND_DOWN))
+                    == 0
+                && find_flag.load(Ordering::Acquire)
+            {
+                push_queue(&esc_queues.escape_find_tabs, &esc_wake, $tab_id);
+                return PreKeyDecision::Handled;
+            }
+            PreKeyDecision::PassThrough
+        })));
+
+        let sc_queues = $cap_queues.clone();
+        let sc_wake = $wake.clone();
+        $view.set_on_shortcut(Some(Box::new(move |id, _, _, _app| {
+            push_queue(&sc_queues.shortcut_events, &sc_wake, ($tab_id, id));
+        })));
+
+        let bu_queues = $cap_queues.clone();
+        let bu_wake = $wake.clone();
+        $view.set_on_before_unload(Some(Box::new(move |info, _, _, _app| {
+            push_queue(
+                &bu_queues.before_unload_events,
+                &bu_wake,
+                ($tab_id, info.request, info.is_reload),
+            );
+        })));
+
+        let cc_queues = $cap_queues.clone();
+        let cc_wake = $wake.clone();
+        $view.set_on_close_cancelled(Some(Box::new(move |(), _, _, _app| {
+            push_queue(&cc_queues.close_cancelled_tabs, &cc_wake, $tab_id);
+        })));
+
         let root_w = $root_weak.clone();
         $view.set_on_title_changed(Some(Box::new(move |title, _, _, app| {
             let rw = root_w.clone();
@@ -492,7 +711,11 @@ macro_rules! wire_view_callbacks {
                     let editing = root.model.active_tab == Some($tab_id)
                         && root.model.active_input == ActiveInput::Address;
                     if let Some(t) = root.model.tab_mut($tab_id) {
+                        let doc_changed = t.address.split('#').next() != addr.split('#').next();
                         t.address = addr.clone();
+                        if doc_changed {
+                            t.find.on_document_navigated();
+                        }
                         if !editing {
                             t.address_input.set_from_external(&addr);
                         }
@@ -812,11 +1035,66 @@ async fn service(
     Ok(woke)
 }
 
+fn example_shortcut_filter() -> ShortcutFilter {
+    ShortcutFilter::new(vec![
+        ShortcutRule {
+            id: ShortcutId(1),
+            windows_key_code: 0x46, // Ctrl+F
+            shift: false,
+            control: true,
+            alt: false,
+            platform: false,
+        },
+        ShortcutRule {
+            id: ShortcutId(2),
+            windows_key_code: 0x72, // F3
+            shift: false,
+            control: false,
+            alt: false,
+            platform: false,
+        },
+        ShortcutRule {
+            id: ShortcutId(3),
+            windows_key_code: 0x72, // Shift+F3
+            shift: true,
+            control: false,
+            alt: false,
+            platform: false,
+        },
+        ShortcutRule {
+            id: ShortcutId(4),
+            windows_key_code: 0x55, // Ctrl+U
+            shift: false,
+            control: true,
+            alt: false,
+            platform: false,
+        },
+        ShortcutRule {
+            id: ShortcutId(5),
+            windows_key_code: 0x54, // Ctrl+T
+            shift: false,
+            control: true,
+            alt: false,
+            platform: false,
+        },
+        ShortcutRule {
+            id: ShortcutId(6),
+            windows_key_code: 0x57, // Ctrl+W
+            shift: false,
+            control: true,
+            alt: false,
+            platform: false,
+        },
+    ])
+    .expect("valid cef example shortcut filter")
+}
+
 #[allow(clippy::too_many_arguments)]
 fn spawn_example_tab(
     cx: &mut AsyncApp,
     rt_cell: &Rc<RefCell<Option<Runtime>>>,
     menus: Option<&Rc<RefCell<ContextMenuServices>>>,
+    ux: &mut UxServices,
     cap_adapter: &Arc<ExampleCapAdapter>,
     root: WindowHandle<CefExampleRoot>,
     config: &ExampleConfig,
@@ -856,6 +1134,7 @@ fn spawn_example_tab(
         .with_tooltip_events(true)
         .with_outbound_drag_policy(OutboundDragPolicy::AllowAsync)
         .with_accessibility_state(CefFeatureState::Enabled)
+        .with_shortcut_filter(example_shortcut_filter())
         .with_js_bridge(JsBridgeConfig {
             enabled: true,
             allowed_origins: vec![
@@ -914,98 +1193,179 @@ fn spawn_example_tab(
 
     let menu_reg = root
         .update(cx, |root, window, cx| {
+            root.model.add_tab(tab_id, url, show_sidebar);
+            let find_open_flag = root
+                .model
+                .tab(tab_id)
+                .expect("newly added tab exists")
+                .find
+                .open_flag
+                .clone();
             let root_weak = cx.entity().downgrade();
-            let mut reg_out = None;
+            let mut reg_out: Option<Arc<ContextMenuRegistration>> = None;
             let popup_cap_osr = cap_adapter.clone();
             let popup_cap_native = cap_adapter.clone();
             let cap_queues = cap_adapter.queues.clone();
             let cap_wake = cap_adapter.wake.clone();
-            let example_view = match config.host_mode {
+            let built = match config.host_mode {
                 ExampleHostMode::Osr => {
-                    let view =
-                        CefBrowser::new(attachment, window, cx).map_err(|e| e.to_string())?;
-                    view.update(cx, |v, _| {
-                        v.set_pinch_zoom_enabled(true);
-                        v.set_ctrl_wheel_zoom_enabled(true);
-                        v.set_transparent_backdrop(true);
-                        v.set_surface_opacity(0.95);
-                        v.set_rotation_angle_deg(0.0);
-                        v.set_nearest_neighbor_scaling(false);
-                        v.set_popup_policy(PopupPolicy::AllowNativePopup);
-                        v.set_popup_filter(Some(Arc::new(move |req| {
-                            if !req.policy_allowed {
-                                return PopupDecision::Cancel;
-                            }
-                            match req.disposition {
-                                PopupDisposition::NewForegroundTab
-                                | PopupDisposition::NewBackgroundTab => {
-                                    popup_cap_osr.on_popup_request(req.clone());
-                                    PopupDecision::Cancel
+                    CefBrowser::new(attachment, window, cx)
+                        .map_err(|e| e.to_string())
+                        .map(|view| {
+                            view.update(cx, |v, _| {
+                                v.set_pinch_zoom_enabled(true);
+                                v.set_ctrl_wheel_zoom_enabled(true);
+                                v.set_transparent_backdrop(true);
+                                v.set_surface_opacity(0.95);
+                                v.set_rotation_angle_deg(0.0);
+                                v.set_nearest_neighbor_scaling(false);
+                                v.set_popup_policy(PopupPolicy::AllowNativePopup);
+                                v.set_popup_filter(Some(Arc::new(move |req| {
+                                    if !req.policy_allowed {
+                                        return PopupDecision::Cancel;
+                                    }
+                                    match req.disposition {
+                                        PopupDisposition::NewForegroundTab
+                                        | PopupDisposition::NewBackgroundTab => {
+                                            popup_cap_osr.on_popup_request(req.clone());
+                                            PopupDecision::Cancel
+                                        }
+                                        _ => PopupDecision::AllowNativePopup {
+                                            no_javascript_access: false,
+                                        },
+                                    }
+                                })));
+                                wire_view_callbacks!(
+                                    v,
+                                    tab_id,
+                                    root_weak,
+                                    cap_queues,
+                                    cap_wake,
+                                    config.verify_tests,
+                                    find_open_flag
+                                );
+                            });
+                            if let Some(menus) = menus {
+                                let menu_limits = MenuLimits {
+                                    max_entries: std::num::NonZeroUsize::new(32).unwrap(),
+                                    max_label_bytes: std::num::NonZeroUsize::new(256).unwrap(),
+                                    max_total_label_bytes: std::num::NonZeroUsize::new(2048).unwrap(),
+                                };
+                                let ctx_limits = MenuContextLimits {
+                                    max_frame_id_bytes: std::num::NonZeroUsize::new(512).unwrap(),
+                                    max_text_bytes: std::num::NonZeroUsize::new(4096).unwrap(),
+                                    max_suggestions: std::num::NonZeroUsize::new(5).unwrap(),
+                                    max_total_bytes: std::num::NonZeroUsize::new(8192).unwrap(),
+                                };
+                                let target_res = menus.borrow_mut().register(&view, window, cx);
+                                if let Ok(target) = target_res
+                                    && let Some(rt) = rt_cell.borrow().as_ref()
+                                    && let Ok(reg) = rt.bind_context_menu(target)
+                                    && let Ok(presenter) = DefaultMenuPresenter::new(
+                                        &view,
+                                        window,
+                                        menu_limits,
+                                        ctx_limits,
+                                        cx,
+                                    )
+                                {
+                                    let reg_arc = Arc::new(reg);
+                                    if let Some(finds) = ux.finds.as_mut() {
+                                        let menus_ref = menus.borrow();
+                                        if let Err(err) = finds.register(
+                                            &view,
+                                            window,
+                                            &menus_ref,
+                                            reg_arc.clone(),
+                                            cx,
+                                        ) {
+                                            eprintln!(
+                                                "cef-example FindServices register tab={tab_id}: {err:?}"
+                                            );
+                                        }
+                                    }
+                                    if let Some(sources) = ux.sources.as_mut() {
+                                        let menus_ref = menus.borrow();
+                                        if let Err(err) = sources.register(
+                                            &view,
+                                            window,
+                                            &menus_ref,
+                                            reg_arc.clone(),
+                                            cx,
+                                        ) {
+                                            eprintln!(
+                                                "cef-example SourceViewServices register tab={tab_id}: {err:?}"
+                                            );
+                                        }
+                                    }
+                                    root.menu_presenters
+                                        .insert(tab_id, Rc::new(RefCell::new(presenter)));
+                                    reg_out = Some(reg_arc);
                                 }
-                                _ => PopupDecision::AllowNativePopup {
-                                    no_javascript_access: false,
-                                },
                             }
-                        })));
-                        wire_view_callbacks!(v, tab_id, root_weak, cap_queues, cap_wake, config.verify_tests);
-                    });
-                    if let Some(menus) = menus {
-                        let menu_limits = MenuLimits {
-                            max_entries: std::num::NonZeroUsize::new(32).unwrap(),
-                            max_label_bytes: std::num::NonZeroUsize::new(256).unwrap(),
-                            max_total_label_bytes: std::num::NonZeroUsize::new(2048).unwrap(),
-                        };
-                        let ctx_limits = MenuContextLimits {
-                            max_frame_id_bytes: std::num::NonZeroUsize::new(512).unwrap(),
-                            max_text_bytes: std::num::NonZeroUsize::new(4096).unwrap(),
-                            max_suggestions: std::num::NonZeroUsize::new(5).unwrap(),
-                            max_total_bytes: std::num::NonZeroUsize::new(8192).unwrap(),
-                        };
-                        if let Ok(target) = menus.borrow_mut().register(&view, window, cx)
-                            && let Some(rt) = rt_cell.borrow().as_ref()
-                            && let Ok(reg) = rt.bind_context_menu(target)
-                            && let Ok(presenter) =
-                                DefaultMenuPresenter::new(&view, window, menu_limits, ctx_limits, cx)
-                        {
-                            root.menu_presenters
-                                .insert(tab_id, Rc::new(RefCell::new(presenter)));
-                            reg_out = Some(reg);
-                        }
-                    }
-                    ExampleView::Osr(view)
+                            ExampleView::Osr(view)
+                        })
                 }
                 ExampleHostMode::NativeHwnd => {
-                    let view =
-                        NativeCefBrowser::new(attachment, window, cx).map_err(|e| e.to_string())?;
-                    view.update(cx, |v, _| {
-                        v.set_popup_policy(PopupPolicy::AllowNativePopup);
-                        v.set_popup_filter(Some(Arc::new(move |req| {
-                            if !req.policy_allowed {
-                                return PopupDecision::Cancel;
-                            }
-                            match req.disposition {
-                                PopupDisposition::NewForegroundTab
-                                | PopupDisposition::NewBackgroundTab => {
-                                    popup_cap_native.on_popup_request(req.clone());
-                                    PopupDecision::Cancel
-                                }
-                                _ => PopupDecision::AllowNativePopup {
-                                    no_javascript_access: false,
-                                },
-                            }
-                        })));
-                        wire_view_callbacks!(v, tab_id, root_weak, cap_queues, cap_wake, config.verify_tests);
-                    });
-                    ExampleView::Native(view)
+                    NativeCefBrowser::new(attachment, window, cx)
+                        .map_err(|e| e.to_string())
+                        .map(|view| {
+                            view.update(cx, |v, _| {
+                                v.set_popup_policy(PopupPolicy::AllowNativePopup);
+                                v.set_popup_filter(Some(Arc::new(move |req| {
+                                    if !req.policy_allowed {
+                                        return PopupDecision::Cancel;
+                                    }
+                                    match req.disposition {
+                                        PopupDisposition::NewForegroundTab
+                                        | PopupDisposition::NewBackgroundTab => {
+                                            popup_cap_native.on_popup_request(req.clone());
+                                            PopupDecision::Cancel
+                                        }
+                                        _ => PopupDecision::AllowNativePopup {
+                                            no_javascript_access: false,
+                                        },
+                                    }
+                                })));
+                                wire_view_callbacks!(
+                                    v,
+                                    tab_id,
+                                    root_weak,
+                                    cap_queues,
+                                    cap_wake,
+                                    config.verify_tests,
+                                    find_open_flag
+                                );
+                            });
+                            ExampleView::Native(view)
+                        })
                 }
             };
-            root.model.add_tab(tab_id, url, show_sidebar);
+            let example_view = match built {
+                Ok(v) => v,
+                Err(err) => {
+                    root.model.close_tab(tab_id);
+                    return Err(err);
+                }
+            };
             root.views.insert(tab_id, example_view);
             root.sync_native_tab_visibility(cx);
             cx.notify();
             Ok::<_, String>(reg_out)
         })
         .map_err(|e| e.to_string())??;
+
+    if menu_reg.is_none() || ux.finds.is_none() {
+        if let Some(rt) = rt_cell.borrow().as_ref() {
+            let _ = rt.set_find_sink(browser_id, Some(ux.direct_finds.sink_for(browser_id)));
+        }
+    }
+    if menu_reg.is_none() || ux.sources.is_none() {
+        if let Some(rt) = rt_cell.borrow().as_ref() {
+            let _ =
+                rt.set_source_viewer(browser_id, Some(ux.direct_sources.viewer_for(browser_id)));
+        }
+    }
 
     accounting.tabs_opened += 1;
     tabs.insert(
@@ -1014,6 +1374,7 @@ fn spawn_example_tab(
             browser_id,
             handle,
             first_paint: false,
+            closing_pending: false,
             menu_reg,
             smoke_eval_id: None,
             smoke_rf_eval_id: None,
@@ -1024,18 +1385,77 @@ fn spawn_example_tab(
     Ok(())
 }
 
-fn close_example_tab(
+fn begin_close_example_tab(
+    cx: &mut AsyncApp,
+    root: WindowHandle<CefExampleRoot>,
+    tab_id: u64,
+    tabs: &mut BTreeMap<u64, TabRuntime>,
+) {
+    let Some(tab_rt) = tabs.get_mut(&tab_id) else {
+        return;
+    };
+    if tab_rt.closing_pending {
+        return;
+    }
+    tab_rt.closing_pending = true;
+    let _ = root.update(cx, |root, _, cx| {
+        if let Some(tab) = root.model.tab_mut(tab_id) {
+            tab.closing_pending = true;
+        }
+        cx.notify();
+    });
+    let _ = tab_rt.handle.request_close(CloseMode::Graceful);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finalize_close_example_tab(
     cx: &mut AsyncApp,
     rt_cell: &Rc<RefCell<Option<Runtime>>>,
     menus: Option<&Rc<RefCell<ContextMenuServices>>>,
+    ux: &mut UxServices,
+    file_dialogs: &mut FileDialogTracker,
+    pending_save_as: &mut BTreeMap<DownloadId, (u64, u64, String, DownloadRequest)>,
     root: WindowHandle<CefExampleRoot>,
     tab_id: u64,
     accounting: &mut ExampleAccounting,
     tabs: &mut BTreeMap<u64, TabRuntime>,
+    force_close: bool,
 ) -> Result<(), String> {
     let Some(tab_rt) = tabs.remove(&tab_id) else {
         return Ok(());
     };
+    let mut cancelled_downloads = Vec::new();
+    if let Ok(Some(dl_id)) = root.update(cx, |root, _, _| {
+        root.model
+            .tab_mut(tab_id)
+            .and_then(|t| cancel_active_download_on_close(&mut t.download, tab_rt.browser_id))
+    }) {
+        cancelled_downloads.push(dl_id);
+    }
+    let pending_ids: Vec<DownloadId> = pending_save_as
+        .keys()
+        .copied()
+        .filter(|id| id.browser == tab_rt.browser_id)
+        .collect();
+    for dl_id in pending_ids {
+        pending_save_as.remove(&dl_id);
+        if !cancelled_downloads.contains(&dl_id) {
+            cancelled_downloads.push(dl_id);
+        }
+    }
+    if let Some(rt) = rt_cell.borrow().as_ref() {
+        for dl_id in cancelled_downloads {
+            let _ = rt.cancel_download(dl_id);
+        }
+        let _ = rt.set_find_sink(tab_rt.browser_id, None);
+        let _ = rt.set_source_viewer(tab_rt.browser_id, None);
+    }
+    file_dialogs.clear_for_browser(tab_rt.browser_id);
+    ux.direct_finds.unregister(tab_rt.browser_id);
+    let _ = cx.update(|app| {
+        ux.direct_sources.unregister_browser(tab_rt.browser_id, app);
+    });
+
     let devtools_open = root
         .update(cx, |root, _, _| {
             root.model
@@ -1048,6 +1468,7 @@ fn close_example_tab(
     if devtools_open && let Some(rt) = rt_cell.borrow().as_ref() {
         let _ = rt.close_dev_tools(tab_rt.browser_id);
     }
+    let had_menu_reg = tab_rt.menu_reg.is_some();
     drop(tab_rt.menu_reg);
     if let Some(menus) = menus {
         let _ = menus.borrow_mut().unregister(tab_rt.browser_id);
@@ -1056,6 +1477,16 @@ fn close_example_tab(
     let removed = root
         .update(cx, |root, _, cx| {
             root.menu_presenters.remove(&tab_id);
+            root.model
+                .clear_modals_for_tab(tab_id, Some(tab_rt.browser_id));
+            if root.model.pending_cert.is_empty() {
+                root.selected_cert_index = None;
+            }
+            if matches!(root.model.active_input, ActiveInput::FindQuery)
+                && root.model.active_tab == Some(tab_id)
+            {
+                root.model.active_input = ActiveInput::None;
+            }
             root.model.close_tab(tab_id);
             let v = root.views.remove(&tab_id);
             root.sync_native_tab_visibility(cx);
@@ -1064,8 +1495,10 @@ fn close_example_tab(
         })
         .map_err(|e| e.to_string())?;
     let diag = if let Some(view) = removed {
-        cx.update_window(root.into(), |_, window, cx| view.release_or_retire(window, cx))
-            .map_err(|e| e.to_string())?
+        cx.update_window(root.into(), |_, window, cx| {
+            view.release_or_retire(window, cx)
+        })
+        .map_err(|e| e.to_string())?
     } else {
         None
     };
@@ -1073,9 +1506,308 @@ fn close_example_tab(
         accounting.created_images += d.created_images;
         accounting.released_images += d.released_images;
     }
-    let _ = tab_rt.handle.request_close(CloseMode::Graceful);
+    if had_menu_reg {
+        ux.retired_browsers.push(tab_rt.browser_id);
+        ux.sweep_retired(cx);
+    }
+    if force_close && tab_rt.handle.snapshot().state != SessionState::Closed {
+        let _ = tab_rt.handle.request_close(CloseMode::Force);
+    }
     accounting.tabs_closed += 1;
     Ok(())
+}
+
+fn find_owner_tab(tabs: &BTreeMap<u64, TabRuntime>, browser: BrowserId) -> Option<u64> {
+    tabs.iter()
+        .find(|(_, t)| t.browser_id == browser)
+        .map(|(id, _)| *id)
+}
+
+fn dispatch_find_command_for_tab(
+    cx: &mut AsyncApp,
+    root: WindowHandle<CefExampleRoot>,
+    tabs: &BTreeMap<u64, TabRuntime>,
+    rt_cell: &Rc<RefCell<Option<Runtime>>>,
+    tab_id: u64,
+    cmd: FindCommandKind,
+) {
+    let Some(browser_id) = tabs.get(&tab_id).map(|t| t.browser_id) else {
+        return;
+    };
+    let rt_guard = rt_cell.borrow();
+    let Some(rt) = rt_guard.as_ref() else {
+        return;
+    };
+    match cmd {
+        FindCommandKind::Start {
+            query,
+            forward,
+            match_case,
+            find_next,
+        } => {
+            if let Err(err) = rt.find(browser_id, &query, forward, match_case, find_next) {
+                let _ = root.update(cx, |r, _, cx| {
+                    if let Some(t) = r.model.tab_mut(tab_id) {
+                        handle_find_dispatch_error(&mut t.find, &err);
+                    }
+                    cx.notify();
+                });
+            }
+        }
+        FindCommandKind::StopClearSelection => {
+            let _ = rt.stop_finding(browser_id, true);
+        }
+    }
+}
+
+fn trigger_find_for_tab(
+    cx: &mut AsyncApp,
+    root: WindowHandle<CefExampleRoot>,
+    tabs: &BTreeMap<u64, TabRuntime>,
+    rt_cell: &Rc<RefCell<Option<Runtime>>>,
+    tab_id: u64,
+    forward: bool,
+    force_find_next: bool,
+) {
+    let planned = root
+        .update(cx, |r, _, cx| {
+            let t = r.model.tab_mut(tab_id)?;
+            let cmd = plan_find_command(&mut t.find, forward, force_find_next);
+            cx.notify();
+            cmd
+        })
+        .ok()
+        .flatten();
+    if let Some(cmd) = planned {
+        dispatch_find_command_for_tab(cx, root, tabs, rt_cell, tab_id, cmd);
+    }
+}
+
+fn open_find_bar_for_tab(
+    cx: &mut AsyncApp,
+    root: WindowHandle<CefExampleRoot>,
+    tab_id: u64,
+) -> bool {
+    cx.update_window(root.into(), |view, window, cx| {
+        let Ok(entity) = view.downcast::<CefExampleRoot>() else {
+            return false;
+        };
+        entity.update(cx, |r, cx| {
+            if r.model.active_tab != Some(tab_id) {
+                r.model.switch_tab(tab_id);
+            }
+            let mut should_search = false;
+            if let Some(t) = r.model.tab_mut(tab_id) {
+                let was_open = t.find.open;
+                t.find.set_open(true);
+                t.find.query.focus_select_all();
+                if !t.find.quarantined {
+                    t.find.last_error = None;
+                }
+                should_search = !was_open && !t.find.query.text.is_empty() && !t.find.quarantined;
+            }
+            r.model.sync_active_find_flag();
+            r.model.active_input = ActiveInput::FindQuery;
+            text_input::ensure_parent_window_win32_focus(window);
+            let handle = r.input_focus.clone();
+            window.focus(&handle, cx);
+            window.request_virtual_keyboard();
+            window.notify_text_input_changed(&handle);
+            r.sync_native_tab_visibility(cx);
+            cx.notify();
+            should_search
+        })
+    })
+    .unwrap_or(false)
+}
+
+fn close_find_bar_for_tab(
+    cx: &mut AsyncApp,
+    root: WindowHandle<CefExampleRoot>,
+    tabs: &BTreeMap<u64, TabRuntime>,
+    rt_cell: &Rc<RefCell<Option<Runtime>>>,
+    tab_id: u64,
+) {
+    let planned = cx
+        .update_window(root.into(), |view, window, cx| {
+            let Ok(entity) = view.downcast::<CefExampleRoot>() else {
+                return None;
+            };
+            entity.update(cx, |r, cx| {
+                let mut closed_query = false;
+                let mut cmd = None;
+                if let Some(t) = r.model.tab_mut(tab_id) {
+                    cmd = plan_close_find_bar(&mut t.find);
+                    closed_query = r.model.active_tab == Some(tab_id)
+                        && r.model.active_input == ActiveInput::FindQuery;
+                }
+                r.model.sync_active_find_flag();
+                if closed_query {
+                    r.model.active_input = ActiveInput::None;
+                    if let Some(browser_view) = r.views.get(&tab_id).cloned() {
+                        let handle = browser_view.focus_handle(cx);
+                        window.focus(&handle, cx);
+                    } else {
+                        let root_focus = r.focus.clone();
+                        window.focus(&root_focus, cx);
+                    }
+                }
+                cx.notify();
+                cmd
+            })
+        })
+        .ok()
+        .flatten();
+    if let Some(cmd) = planned {
+        dispatch_find_command_for_tab(cx, root, tabs, rt_cell, tab_id, cmd);
+    }
+}
+
+fn apply_find_status_update(
+    cx: &mut AsyncApp,
+    root: WindowHandle<CefExampleRoot>,
+    tabs: &BTreeMap<u64, TabRuntime>,
+    rt_cell: &Rc<RefCell<Option<Runtime>>>,
+    browser_id: BrowserId,
+    status: &rust_cef_core::find::FindStatus,
+) {
+    let Some(tab_id) = find_owner_tab(tabs, browser_id) else {
+        return;
+    };
+    let next_cmd = root
+        .update(cx, |r, _, cx| {
+            let t = r.model.tab_mut(tab_id)?;
+            let cmd = apply_find_status(&mut t.find, status);
+            cx.notify();
+            cmd
+        })
+        .ok()
+        .flatten();
+    if let Some(cmd) = next_cmd {
+        dispatch_find_command_for_tab(cx, root, tabs, rt_cell, tab_id, cmd);
+    }
+}
+
+fn drain_find_updates(
+    cx: &mut AsyncApp,
+    root: WindowHandle<CefExampleRoot>,
+    tabs: &BTreeMap<u64, TabRuntime>,
+    rt_cell: &Rc<RefCell<Option<Runtime>>>,
+    ux: &mut UxServices,
+) {
+    if let Some(finds) = ux.finds.as_mut() {
+        let updates = cx.update(|app| finds.dispatch(app));
+        for upd in updates {
+            apply_find_status_update(cx, root, tabs, rt_cell, upd.browser, &upd.status);
+        }
+    }
+    for FindUiUpdate { browser, status } in ux.direct_finds.drain_updates() {
+        apply_find_status_update(cx, root, tabs, rt_cell, browser, &status);
+    }
+}
+
+fn report_source_failure(
+    cx: &mut AsyncApp,
+    root: WindowHandle<CefExampleRoot>,
+    tabs: &BTreeMap<u64, TabRuntime>,
+    ux: &mut UxServices,
+    browser_id: BrowserId,
+    status: &rust_cef_core::source_view::SourceOperationStatus,
+) {
+    let Some(ref failure) = status.first_failure else {
+        return;
+    };
+    let key = (status.operation.browser, status.operation.sequence);
+    if ux.reported_source_ops.contains(&key) {
+        return;
+    }
+    ux.reported_source_ops.push(key);
+    let (title, message) = format_source_failure(status.operation, failure);
+    let tab_id = find_owner_tab(tabs, browser_id);
+    let _ = root.update(cx, |r, _, cx| {
+        if let Some(tid) = tab_id
+            && let Some(t) = r.model.tab_mut(tid)
+        {
+            t.output_message = message.clone();
+        }
+        r.model.notice_dialog = Some(NoticeDialog { title, message });
+        r.sync_native_tab_visibility(cx);
+        cx.notify();
+    });
+}
+
+fn spawn_os_file_dialog(
+    cx: &mut AsyncApp,
+    root: WindowHandle<CefExampleRoot>,
+    req: &FileDialogRequest,
+    fallback_dir: &Path,
+) {
+    let request_id = req.id;
+    let mode = req.mode;
+    let default_path = req.default_file_path.clone();
+    let dir_fallback = fallback_dir.to_path_buf();
+    cx.spawn(async move |cx: &mut AsyncApp| {
+        let paths = match mode {
+            FileDialogKind::Save => {
+                let (dir, suggested) = split_save_default_path(&default_path, &dir_fallback);
+                let rx = root
+                    .update(cx, |_, _, cx| {
+                        cx.prompt_for_new_path(&dir, suggested.as_deref())
+                    })
+                    .ok();
+                match rx {
+                    Some(rx) => match rx.await {
+                        Ok(Ok(Some(path))) => Some(vec![path]),
+                        _ => None,
+                    },
+                    None => None,
+                }
+            }
+            _ => {
+                let opts = build_path_prompt_options(mode);
+                let rx = root.update(cx, |_, _, cx| cx.prompt_for_paths(opts)).ok();
+                match rx {
+                    Some(rx) => match rx.await {
+                        Ok(Ok(Some(selected))) => Some(selected),
+                        _ => None,
+                    },
+                    None => None,
+                }
+            }
+        };
+        let _ = root.update(cx, |r, _, _| {
+            r.emit(ExampleAction::CompleteFileDialog { request_id, paths });
+        });
+    })
+    .detach();
+}
+
+fn spawn_download_save_as_dialog(
+    cx: &mut AsyncApp,
+    root: WindowHandle<CefExampleRoot>,
+    req: &DownloadRequest,
+    fallback_dir: &Path,
+    suggested_name: &str,
+) {
+    let request_id = req.id;
+    let dir = fallback_dir.to_path_buf();
+    let name = suggested_name.to_owned();
+    cx.spawn(async move |cx: &mut AsyncApp| {
+        let rx = root
+            .update(cx, |_, _, cx| cx.prompt_for_new_path(&dir, Some(&name)))
+            .ok();
+        let path = match rx {
+            Some(rx) => match rx.await {
+                Ok(Ok(chosen)) => chosen,
+                _ => None,
+            },
+            None => None,
+        };
+        let _ = root.update(cx, |r, _, _| {
+            r.emit(ExampleAction::CompleteSaveAsDownload { request_id, path });
+        });
+    })
+    .detach();
 }
 
 async fn drive_cef_example(
@@ -1154,11 +1886,22 @@ async fn drive_cef_example(
     rt.set_js_bridge_allow_subframes(true);
     let _ = rt.set_host_capabilities(HostCapabilities {
         download: Some(cap_adapter.clone()),
+        file_dialog: Some(cap_adapter.clone()),
         js_dialog: Some(cap_adapter.clone()),
+        permission: Some(cap_adapter.clone()),
         auth: Some(cap_adapter.clone()),
+        certificate: Some(cap_adapter.clone()),
         ..Default::default()
     });
     let _ = rt.configure_devtools(nz(MAX_EXAMPLE_TABS));
+    let _ = rt.configure_finds(FindLimits {
+        capacity: nz(MAX_EXAMPLE_TABS),
+        max_query_bytes: nz(256),
+    });
+    let _ = rt.configure_source_views(SourceViewLimits {
+        capacity: nz(MAX_EXAMPLE_TABS),
+        max_source_bytes: nz(2 * 1024 * 1024),
+    });
     let menus = (config.context_menu && config.host_mode == ExampleHostMode::Osr).then(|| {
         let menu_limits = MenuLimits {
             max_entries: nz(32),
@@ -1185,6 +1928,26 @@ async fn drive_cef_example(
             ctx_limits,
         )))
     });
+    let source_bounds = cx.update(|app| Bounds::centered(None, size(px(900.0), px(700.0)), app));
+    let finds = menus
+        .as_ref()
+        .map(|_| FindServices::new(nz(MAX_EXAMPLE_TABS), nz(256)));
+    let sources = menus.as_ref().map(|_| {
+        SourceViewServices::new(
+            nz(MAX_EXAMPLE_TABS),
+            SourceViewOptions {
+                max_operations: nz(4),
+                max_source_bytes: nz(2 * 1024 * 1024),
+                bounds: source_bounds,
+                focus: true,
+            },
+        )
+    });
+    let mut ux = UxServices::new(finds, sources, sender.clone(), 2 * 1024 * 1024);
+    let mut file_dialogs = FileDialogTracker::new();
+    let mut pending_file_dialogs: BTreeMap<HostRequestId, FileDialogKind> = BTreeMap::new();
+    let mut pending_save_as: BTreeMap<DownloadId, (u64, u64, String, DownloadRequest)> =
+        BTreeMap::new();
     let rt_cell = Rc::new(RefCell::new(Some(rt)));
     let mut tabs: BTreeMap<u64, TabRuntime> = BTreeMap::new();
     let mut accounting = ExampleAccounting::default();
@@ -1194,7 +1957,9 @@ async fn drive_cef_example(
     let mut rpc_host = CefRsGpuiRpcHost::default();
     let mut verify_driver = config.verify_tests.then(verify::VerifyDriver::new);
     let mut smoke_stage = 0u8;
-    let smoke_deadline = config.smoke.map(|d| Instant::now() + d + Duration::from_secs(20));
+    let smoke_deadline = config
+        .smoke
+        .map(|d| Instant::now() + d + Duration::from_secs(20));
 
     let startup = Instant::now() + STARTUP_BUDGET;
     while !close.get() && Instant::now() < startup {
@@ -1221,6 +1986,7 @@ async fn drive_cef_example(
             cx,
             &rt_cell,
             menus.as_ref(),
+            &mut ux,
             &cap_adapter,
             root,
             &config,
@@ -1237,8 +2003,10 @@ async fn drive_cef_example(
         }
     }
 
+    let mut window_close_pending = false;
+    let mut force_quit = false;
     let _ = receiver.try_recv();
-    while run_error.is_none() && !close.get() {
+    while run_error.is_none() && !force_quit {
         if let Some(err) = obs
             .first_fault
             .lock()
@@ -1248,6 +2016,22 @@ async fn drive_cef_example(
             run_error = Some(err);
             break;
         }
+        if close.get() {
+            if config.smoke.is_some() || config.verify_tests || tabs.is_empty() {
+                break;
+            }
+            if !window_close_pending {
+                window_close_pending = true;
+                let _ = root.update(cx, |r, _, cx| {
+                    r.model.window_close_pending = true;
+                    cx.notify();
+                });
+                let open_ids: Vec<u64> = tabs.keys().copied().collect();
+                for id in open_ids {
+                    begin_close_example_tab(cx, root, id, &mut tabs);
+                }
+            }
+        }
         let quit_from_tabs = root
             .update(cx, |r, _, _| r.model.quit_requested)
             .unwrap_or(true);
@@ -1255,15 +2039,386 @@ async fn drive_cef_example(
             break;
         }
 
-        // Process host capability queues (JS dialogs, auth, downloads, popups).
+        // Process host capability cancellations first so stale modals are pruned.
+        for id in cap_queues
+            .file_dialog_cancellations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain(..)
+        {
+            file_dialogs.cancel_request(id);
+            pending_file_dialogs.remove(&id);
+            let _ = root.update(cx, |r, _, cx| {
+                if r.model.clear_active_file_dialog_if(id) {
+                    r.sync_native_tab_visibility(cx);
+                    cx.notify();
+                }
+            });
+        }
+        for id in cap_queues
+            .js_dialog_cancellations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain(..)
+        {
+            let _ = root.update(cx, |r, _, cx| {
+                if r.model
+                    .pending_js_dialog
+                    .as_ref()
+                    .is_some_and(|d| d.id == id)
+                {
+                    r.model.pending_js_dialog = None;
+                    if r.model.active_input == ActiveInput::JsPrompt {
+                        r.model.active_input = ActiveInput::None;
+                    }
+                    r.sync_native_tab_visibility(cx);
+                    cx.notify();
+                }
+            });
+        }
+        for id in cap_queues
+            .permission_cancellations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain(..)
+        {
+            let _ = root.update(cx, |r, _, cx| {
+                if r.model.cancel_permission(id) {
+                    r.sync_native_tab_visibility(cx);
+                    cx.notify();
+                }
+            });
+        }
+        for id in cap_queues
+            .auth_cancellations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain(..)
+        {
+            let _ = cx.update_window(root.into(), |view, window, cx| {
+                let Ok(entity) = view.downcast::<CefExampleRoot>() else {
+                    return;
+                };
+                entity.update(cx, |r, cx| {
+                    if r.model.cancel_auth(id) {
+                        if !r.model.pending_auth.is_empty()
+                            && r.model.active_input == ActiveInput::None
+                        {
+                            r.model.active_input = ActiveInput::AuthUser;
+                            text_input::ensure_parent_window_win32_focus(window);
+                            let handle = r.input_focus.clone();
+                            window.focus(&handle, cx);
+                        }
+                        r.sync_native_tab_visibility(cx);
+                        cx.notify();
+                    }
+                });
+            });
+        }
+        for id in cap_queues
+            .cert_cancellations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain(..)
+        {
+            let _ = root.update(cx, |r, _, cx| {
+                if r.model.cancel_cert(id) {
+                    r.selected_cert_index =
+                        r.model.pending_cert.front().and_then(|c| match &c.kind {
+                            PendingCertKind::ClientSelect(req) => {
+                                req.certificates.first().map(|x| x.index)
+                            }
+                            PendingCertKind::ServerError(_) => None,
+                        });
+                    r.sync_native_tab_visibility(cx);
+                    cx.notify();
+                }
+            });
+        }
+
+        // Drain finished Find updates before dispatching new shortcuts/actions in this turn.
+        drain_find_updates(cx, root, &tabs, &rt_cell, &mut ux);
+
+        // Process browser-originated shortcuts, PreKeyFilter Esc, and BeforeUnload events.
+        for tab_id in cap_queues
+            .escape_find_tabs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain(..)
+        {
+            close_find_bar_for_tab(cx, root, &tabs, &rt_cell, tab_id);
+        }
+        for (tab_id, shortcut_id) in cap_queues
+            .shortcut_events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain(..)
+        {
+            let blocked = root
+                .update(cx, |r, _, _| r.model.has_blocking_modal())
+                .unwrap_or(false);
+            if blocked {
+                continue;
+            }
+            match shortcut_id.0 {
+                1 => {
+                    if open_find_bar_for_tab(cx, root, tab_id) {
+                        trigger_find_for_tab(cx, root, &tabs, &rt_cell, tab_id, true, false);
+                    }
+                }
+                2 => {
+                    let is_open = root
+                        .update(cx, |r, _, _| {
+                            r.model.tab(tab_id).is_some_and(|t| t.find.open)
+                        })
+                        .unwrap_or(false);
+                    if !is_open {
+                        if open_find_bar_for_tab(cx, root, tab_id) {
+                            trigger_find_for_tab(cx, root, &tabs, &rt_cell, tab_id, true, false);
+                        }
+                    } else {
+                        trigger_find_for_tab(cx, root, &tabs, &rt_cell, tab_id, true, true);
+                    }
+                }
+                3 => {
+                    let is_open = root
+                        .update(cx, |r, _, _| {
+                            r.model.tab(tab_id).is_some_and(|t| t.find.open)
+                        })
+                        .unwrap_or(false);
+                    if !is_open {
+                        if open_find_bar_for_tab(cx, root, tab_id) {
+                            trigger_find_for_tab(cx, root, &tabs, &rt_cell, tab_id, true, false);
+                        }
+                    } else {
+                        trigger_find_for_tab(cx, root, &tabs, &rt_cell, tab_id, false, true);
+                    }
+                }
+                4 => {
+                    if let Some(browser_id) = tabs.get(&tab_id).map(|t| t.browser_id)
+                        && let Some(rt) = rt_cell.borrow().as_ref()
+                        && let Err(err) = rt.view_source(browser_id)
+                    {
+                        let _ = root.update(cx, |r, _, cx| {
+                            if let Some(t) = r.model.tab_mut(tab_id) {
+                                t.output_message = format!("View Source failed: {err:?}");
+                            }
+                            cx.notify();
+                        });
+                    }
+                }
+                5 => {
+                    let id = next_tab_id;
+                    next_tab_id += 1;
+                    if let Err(e) = spawn_example_tab(
+                        cx,
+                        &rt_cell,
+                        menus.as_ref(),
+                        &mut ux,
+                        &cap_adapter,
+                        root,
+                        &config,
+                        id,
+                        DEFAULT_HOME_URL.into(),
+                        false,
+                        false,
+                        &mut accounting,
+                        &mut tabs,
+                    ) {
+                        run_error = Some(e);
+                        break;
+                    }
+                }
+                6 => begin_close_example_tab(cx, root, tab_id, &mut tabs),
+                _ => {}
+            }
+        }
+        for (tab_id, request, is_reload) in cap_queues
+            .before_unload_events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain(..)
+        {
+            if config.smoke.is_some() {
+                let _ = root.update(cx, |r, _, cx| {
+                    if let Some(v) = r.views.get(&tab_id).cloned() {
+                        v.resolve_before_unload(request, true, cx);
+                    }
+                });
+            } else if let Some(browser_id) = tabs.get(&tab_id).map(|t| t.browser_id) {
+                let _ = root.update(cx, |r, _, cx| {
+                    r.model.enqueue_before_unload(PendingBeforeUnloadModal {
+                        tab_id,
+                        browser_id,
+                        request,
+                        is_reload,
+                    });
+                    r.sync_native_tab_visibility(cx);
+                    cx.notify();
+                });
+            }
+        }
+        for tab_id in cap_queues
+            .close_cancelled_tabs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain(..)
+        {
+            if let Some(t) = tabs.get_mut(&tab_id) {
+                t.closing_pending = false;
+            }
+            window_close_pending = false;
+            close.set(false);
+            let _ = root.update(cx, |r, _, cx| {
+                if let Some(t) = r.model.tab_mut(tab_id) {
+                    t.closing_pending = false;
+                }
+                r.model.window_close_pending = false;
+                cx.notify();
+            });
+        }
+
+        // Process host capability queues (file dialogs, permissions, auth, certs, JS dialogs, downloads, popups).
+        for req in cap_queues
+            .file_dialogs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain(..)
+        {
+            if config.smoke.is_some() {
+                if let Some(rt) = rt_cell.borrow().as_ref() {
+                    let _ = rt.resolve_file_dialog(req.id, FileDialogDecision::Cancel);
+                }
+            } else if !file_dialogs.record_request(req.id) {
+                if let Some(rt) = rt_cell.borrow().as_ref() {
+                    let _ = rt.resolve_file_dialog(req.id, FileDialogDecision::Cancel);
+                }
+            } else {
+                pending_file_dialogs.insert(req.id, req.mode);
+                let _ = root.update(cx, |r, _, cx| {
+                    r.model.active_native_file_dialog = Some(req.id);
+                    r.sync_native_tab_visibility(cx);
+                    cx.notify();
+                });
+                spawn_os_file_dialog(cx, root, &req, &output_dir);
+            }
+        }
+        for req in cap_queues
+            .permissions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain(..)
+        {
+            if config.smoke.is_some() {
+                if let Some(rt) = rt_cell.borrow().as_ref() {
+                    let _ = rt.resolve_permission(req.id, PermissionDecision::Deny);
+                }
+            } else {
+                let owner_id = find_owner_tab(&tabs, req.id.browser);
+                let _ = root.update(cx, |r, _, cx| {
+                    let tab_id = owner_id.or(r.model.active_tab).unwrap_or(0);
+                    r.model.enqueue_permission(PendingPermissionModal {
+                        tab_id,
+                        browser_id: req.id.browser,
+                        request: req,
+                    });
+                    r.sync_native_tab_visibility(cx);
+                    cx.notify();
+                });
+            }
+        }
         for req in cap_queues
             .auths
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .drain(..)
         {
-            if let Some(rt) = rt_cell.borrow().as_ref() {
-                let _ = rt.resolve_auth(req.id, AuthDecision::Cancel);
+            if config.smoke.is_some() {
+                if let Some(rt) = rt_cell.borrow().as_ref() {
+                    let _ = rt.resolve_auth(req.id, AuthDecision::Cancel);
+                }
+            } else {
+                let owner_id = find_owner_tab(&tabs, req.id.browser);
+                let _ = cx.update_window(root.into(), |view, window, cx| {
+                    let Ok(entity) = view.downcast::<CefExampleRoot>() else {
+                        return;
+                    };
+                    entity.update(cx, |r, cx| {
+                        let tab_id = owner_id.or(r.model.active_tab).unwrap_or(0);
+                        let was_empty = r.model.pending_auth.is_empty();
+                        r.model.enqueue_auth(model::PendingAuthModal {
+                            tab_id,
+                            browser_id: req.id.browser,
+                            request: req,
+                            username_input: TextBuffer::default(),
+                            password_input: TextBuffer::default(),
+                        });
+                        if was_empty {
+                            r.model.active_input = ActiveInput::AuthUser;
+                            text_input::ensure_parent_window_win32_focus(window);
+                            let handle = r.input_focus.clone();
+                            window.focus(&handle, cx);
+                            window.notify_text_input_changed(&handle);
+                        }
+                        r.sync_native_tab_visibility(cx);
+                        cx.notify();
+                    });
+                });
+            }
+        }
+        for req in cap_queues
+            .cert_errors
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain(..)
+        {
+            if config.smoke.is_some() {
+                if let Some(rt) = rt_cell.borrow().as_ref() {
+                    let _ = rt.resolve_certificate(req.id, CertificateDecision::Cancel);
+                }
+            } else {
+                let owner_id = find_owner_tab(&tabs, req.id.browser);
+                let _ = root.update(cx, |r, _, cx| {
+                    let tab_id = owner_id.or(r.model.active_tab).unwrap_or(0);
+                    r.model.enqueue_cert(PendingCertModal {
+                        tab_id,
+                        browser_id: req.id.browser,
+                        kind: PendingCertKind::ServerError(req),
+                    });
+                    if r.model.pending_cert.len() == 1 {
+                        r.selected_cert_index = None;
+                    }
+                    r.sync_native_tab_visibility(cx);
+                    cx.notify();
+                });
+            }
+        }
+        for req in cap_queues
+            .client_certs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain(..)
+        {
+            if config.smoke.is_some() {
+                if let Some(rt) = rt_cell.borrow().as_ref() {
+                    let _ = rt.resolve_certificate(req.id, CertificateDecision::Cancel);
+                }
+            } else {
+                let owner_id = find_owner_tab(&tabs, req.id.browser);
+                let first_idx = req.certificates.first().map(|c| c.index);
+                let _ = root.update(cx, |r, _, cx| {
+                    let tab_id = owner_id.or(r.model.active_tab).unwrap_or(0);
+                    r.model.enqueue_cert(PendingCertModal {
+                        tab_id,
+                        browser_id: req.id.browser,
+                        kind: PendingCertKind::ClientSelect(req),
+                    });
+                    if r.model.pending_cert.len() == 1 {
+                        r.selected_cert_index = first_idx;
+                    }
+                    r.sync_native_tab_visibility(cx);
+                    cx.notify();
+                });
             }
         }
         for req in cap_queues
@@ -1274,7 +2429,8 @@ async fn drive_cef_example(
         {
             if config.smoke.is_some() {
                 if let Some(rt) = rt_cell.borrow().as_ref() {
-                    let _ = rt.resolve_js_dialog(req.id, JsDialogDecision::Accept { prompt_input: None });
+                    let _ = rt
+                        .resolve_js_dialog(req.id, JsDialogDecision::Accept { prompt_input: None });
                 }
             } else {
                 let _ = cx.update_window(root.into(), |view, window, cx| {
@@ -1310,37 +2466,75 @@ async fn drive_cef_example(
             .unwrap_or_else(|e| e.into_inner())
             .drain(..)
         {
-            let clean_name = Path::new(&req.suggested_name)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .filter(|s| !s.is_empty())
-                .unwrap_or("download.bin")
-                .to_owned();
-            let dest = output_dir.join(format!("{seq}-{clean_name}"));
-            let owner_id = tabs
-                .iter()
-                .find(|(_, t)| t.browser_id == req.id.browser)
-                .map(|(id, _)| *id);
-            let _ = root.update(cx, |r, _, cx| {
-                let tid = owner_id.or(r.model.active_tab);
-                if let Some(t) = tid.and_then(|id| r.model.tab_mut(id)) {
-                    t.download.last_action = "OnBeforeDownload".into();
-                    t.download.id = Some(seq);
-                    t.download.url = req.url.clone();
-                    t.download.original_url = req.original_url.clone();
-                    t.download.suggested_file_name = clean_name.clone();
-                    t.download.mime_type = req.mime_type.clone();
-                    t.download.total_bytes = req.total_bytes;
-                    t.download.full_path = dest.to_string_lossy().into_owned();
-                    t.download.is_in_progress = true;
-                    t.download.is_complete = false;
-                    t.download.is_cancelled = false;
-                    t.show_download_info = true;
+            let clean_name = dialogs::sanitize_download_filename(&req.suggested_name);
+            let owner_id = find_owner_tab(&tabs, req.id.browser);
+            let ask_save_as = root
+                .update(cx, |r, _, _| r.model.ask_save_as)
+                .unwrap_or(false)
+                && config.smoke.is_none();
+            if ask_save_as {
+                let mut target_tab_id = owner_id.unwrap_or(0);
+                let _ = root.update(cx, |r, _, cx| {
+                    let tid = owner_id.or(r.model.active_tab);
+                    if let Some(tid) = tid
+                        && let Some(t) = r.model.tab_mut(tid)
+                    {
+                        target_tab_id = tid;
+                        t.apply_download_request(req.id.browser, &req);
+                        t.download.last_action = "PromptSaveAs".into();
+                        t.download.suggested_file_name = clean_name.clone();
+                        t.download.full_path.clear();
+                        t.show_download_info = true;
+                    }
+                    r.model.active_save_as_download = Some(req.id);
+                    r.sync_native_tab_visibility(cx);
+                    cx.notify();
+                });
+                pending_save_as.insert(
+                    req.id,
+                    (target_tab_id, seq, clean_name.clone(), req.clone()),
+                );
+                spawn_download_save_as_dialog(cx, root, &req, &output_dir, &clean_name);
+            } else {
+                let dest = match resolve_download_destination(
+                    &output_dir,
+                    seq,
+                    &req.suggested_name,
+                    None,
+                    &[],
+                ) {
+                    Ok(p) => p,
+                    Err(err) => {
+                        let _ = root.update(cx, |r, _, cx| {
+                            if let Some(t) = owner_id
+                                .or(r.model.active_tab)
+                                .and_then(|id| r.model.tab_mut(id))
+                            {
+                                t.apply_download_request(req.id.browser, &req);
+                                t.mark_download_cancelled(format!("Invalid destination: {err:?}"));
+                                t.show_download_info = true;
+                            }
+                            cx.notify();
+                        });
+                        if let Some(rt) = rt_cell.borrow().as_ref() {
+                            let _ = rt.cancel_download(req.id);
+                        }
+                        continue;
+                    }
+                };
+                let _ = root.update(cx, |r, _, cx| {
+                    let tid = owner_id.or(r.model.active_tab);
+                    if let Some(t) = tid.and_then(|id| r.model.tab_mut(id)) {
+                        t.apply_download_request(req.id.browser, &req);
+                        t.download.suggested_file_name = clean_name.clone();
+                        t.download.full_path = dest.to_string_lossy().into_owned();
+                        t.show_download_info = true;
+                    }
+                    cx.notify();
+                });
+                if let Some(rt) = rt_cell.borrow().as_ref() {
+                    let _ = rt.confirm_download(req.id, dest);
                 }
-                cx.notify();
-            });
-            if let Some(rt) = rt_cell.borrow().as_ref() {
-                let _ = rt.confirm_download(req.id, dest);
             }
         }
         for prog in cap_queues
@@ -1349,10 +2543,7 @@ async fn drive_cef_example(
             .unwrap_or_else(|e| e.into_inner())
             .drain(..)
         {
-            let owner_id = tabs
-                .iter()
-                .find(|(_, t)| t.browser_id == prog.id.browser)
-                .map(|(id, _)| *id);
+            let owner_id = find_owner_tab(&tabs, prog.id.browser);
             let _ = root.update(cx, |r, _, cx| {
                 let tid = owner_id.or(r.model.active_tab);
                 if let Some(t) = tid.and_then(|id| r.model.tab_mut(id)) {
@@ -1376,6 +2567,7 @@ async fn drive_cef_example(
                 cx,
                 &rt_cell,
                 menus.as_ref(),
+                &mut ux,
                 &cap_adapter,
                 root,
                 &config,
@@ -1429,7 +2621,9 @@ async fn drive_cef_example(
                     let msg = if outcome.ok {
                         format!("Pdf was saved to {path_str}")
                     } else {
-                        format!("Unable to save Pdf, check you have write permissions to {path_str}")
+                        format!(
+                            "Unable to save Pdf, check you have write permissions to {path_str}"
+                        )
                     };
                     let _ = root.update(cx, |r, _, cx| {
                         if let Some(t) = r.model.tab_mut(tab_id) {
@@ -1470,8 +2664,22 @@ async fn drive_cef_example(
         for action in pending_actions {
             match action {
                 ExampleAction::ExitApp => {
+                    if config.smoke.is_some() || config.verify_tests || tabs.is_empty() {
+                        force_quit = true;
+                        break;
+                    }
                     close.set(true);
-                    break;
+                    if !window_close_pending {
+                        window_close_pending = true;
+                        let _ = root.update(cx, |r, _, cx| {
+                            r.model.window_close_pending = true;
+                            cx.notify();
+                        });
+                        let open_ids: Vec<u64> = tabs.keys().copied().collect();
+                        for id in open_ids {
+                            begin_close_example_tab(cx, root, id, &mut tabs);
+                        }
+                    }
                 }
                 ExampleAction::NewTab(opt_url) => {
                     let id = next_tab_id;
@@ -1481,6 +2689,7 @@ async fn drive_cef_example(
                         cx,
                         &rt_cell,
                         menus.as_ref(),
+                        &mut ux,
                         &cap_adapter,
                         root,
                         &config,
@@ -1502,6 +2711,7 @@ async fn drive_cef_example(
                         cx,
                         &rt_cell,
                         menus.as_ref(),
+                        &mut ux,
                         &cap_adapter,
                         root,
                         &config,
@@ -1532,7 +2742,7 @@ async fn drive_cef_example(
                     });
                 }
                 ExampleAction::CloseTab(id) => {
-                    let _ = close_example_tab(cx, &rt_cell, menus.as_ref(), root, id, &mut accounting, &mut tabs);
+                    begin_close_example_tab(cx, root, id, &mut tabs);
                 }
                 ExampleAction::NavigateHome => {
                     let _ = root.update(cx, |r, _, cx| {
@@ -1567,28 +2777,32 @@ async fn drive_cef_example(
                 }
                 ExampleAction::Back => {
                     let _ = root.update(cx, |r, _, cx| {
-                        if let Some(v) = r.model.active_tab.and_then(|id| r.views.get(&id)).cloned() {
+                        if let Some(v) = r.model.active_tab.and_then(|id| r.views.get(&id)).cloned()
+                        {
                             v.go_back(cx);
                         }
                     });
                 }
                 ExampleAction::Forward => {
                     let _ = root.update(cx, |r, _, cx| {
-                        if let Some(v) = r.model.active_tab.and_then(|id| r.views.get(&id)).cloned() {
+                        if let Some(v) = r.model.active_tab.and_then(|id| r.views.get(&id)).cloned()
+                        {
                             v.go_forward(cx);
                         }
                     });
                 }
                 ExampleAction::Reload => {
                     let _ = root.update(cx, |r, _, cx| {
-                        if let Some(v) = r.model.active_tab.and_then(|id| r.views.get(&id)).cloned() {
+                        if let Some(v) = r.model.active_tab.and_then(|id| r.views.get(&id)).cloned()
+                        {
                             v.reload(cx);
                         }
                     });
                 }
                 ExampleAction::StopLoading => {
                     let _ = root.update(cx, |r, _, cx| {
-                        if let Some(v) = r.model.active_tab.and_then(|id| r.views.get(&id)).cloned() {
+                        if let Some(v) = r.model.active_tab.and_then(|id| r.views.get(&id)).cloned()
+                        {
                             v.stop_loading(cx);
                         }
                     });
@@ -1622,17 +2836,21 @@ async fn drive_cef_example(
                 }
                 ExampleAction::ToggleAudioMute => {
                     let _ = root.update(cx, |r, _, cx| {
-                        if let Some(v) = r.model.active_tab.and_then(|id| r.views.get(&id)).cloned() {
+                        if let Some(v) = r.model.active_tab.and_then(|id| r.views.get(&id)).cloned()
+                        {
                             v.toggle_audio_muted(cx);
                         }
                     });
                 }
                 ExampleAction::ToggleDevTools => {
-                    if let Some(active_id) = root.update(cx, |r, _, _| r.model.active_tab).ok().flatten()
+                    if let Some(active_id) =
+                        root.update(cx, |r, _, _| r.model.active_tab).ok().flatten()
                         && let Some(tab) = tabs.get(&active_id)
                     {
                         let open_now = root
-                            .update(cx, |r, _, _| r.model.active_tab().is_some_and(|t| t.devtools_open))
+                            .update(cx, |r, _, _| {
+                                r.model.active_tab().is_some_and(|t| t.devtools_open)
+                            })
                             .unwrap_or(false);
                         if let Some(rt) = rt_cell.borrow().as_ref() {
                             let ok = if open_now {
@@ -1653,10 +2871,12 @@ async fn drive_cef_example(
                 }
                 ExampleAction::ClearHttpAuthCredentials => {
                     if let Some(rt) = rt_cell.borrow().as_ref() {
-                        let res = rt.clear_profile_http_auth_credentials(rt.default_profile_handle());
+                        let res =
+                            rt.clear_profile_http_auth_credentials(rt.default_profile_handle());
                         let _ = root.update(cx, |r, _, cx| {
                             if let Some(t) = r.model.active_tab_mut() {
-                                t.output_message = format!("ClearHttpAuthCredentials: {:?}", res.is_ok());
+                                t.output_message =
+                                    format!("ClearHttpAuthCredentials: {:?}", res.is_ok());
                             }
                             cx.notify();
                         });
@@ -1680,14 +2900,16 @@ async fn drive_cef_example(
                 }
                 ExampleAction::ExecuteJs(script) => {
                     let _ = root.update(cx, |r, _, cx| {
-                        if let Some(v) = r.model.active_tab.and_then(|id| r.views.get(&id)).cloned() {
+                        if let Some(v) = r.model.active_tab.and_then(|id| r.views.get(&id)).cloned()
+                        {
                             v.execute_javascript(script, cx);
                         }
                     });
                 }
                 ExampleAction::EvaluateJs(script) => {
                     let _ = root.update(cx, |r, _, cx| {
-                        if let Some(v) = r.model.active_tab.and_then(|id| r.views.get(&id)).cloned() {
+                        if let Some(v) = r.model.active_tab.and_then(|id| r.views.get(&id)).cloned()
+                        {
                             let _ = v.evaluate_script(script, 5000, cx);
                         }
                     });
@@ -1767,8 +2989,9 @@ async fn drive_cef_example(
                         {
                             if let Some(t) = r.model.tab_mut(id) {
                                 t.address_input.set_from_external(CUSTOM_POST_URL);
-                                t.output_message =
-                                    format_runtime_summary("Submitting Load Custom Request POST...");
+                                t.output_message = format_runtime_summary(
+                                    "Submitting Load Custom Request POST...",
+                                );
                             }
                             v.load_url_with_post_data(
                                 CUSTOM_POST_URL.into(),
@@ -1842,6 +3065,7 @@ async fn drive_cef_example(
                         cx,
                         &rt_cell,
                         menus.as_ref(),
+                        &mut ux,
                         &cap_adapter,
                         root,
                         &config,
@@ -1856,6 +3080,7 @@ async fn drive_cef_example(
                         cx,
                         &rt_cell,
                         menus.as_ref(),
+                        &mut ux,
                         &cap_adapter,
                         root,
                         &config,
@@ -2003,6 +3228,306 @@ async fn drive_cef_example(
                         let _ = rt.resolve_js_dialog(dlg.id, decision);
                     }
                 }
+                ExampleAction::OpenFindBar => {
+                    if let Ok(Some(id)) = root.update(cx, |r, _, _| r.model.active_tab)
+                        && open_find_bar_for_tab(cx, root, id)
+                    {
+                        trigger_find_for_tab(cx, root, &tabs, &rt_cell, id, true, false);
+                    }
+                }
+                ExampleAction::CloseFindBar => {
+                    if let Ok(Some(id)) = root.update(cx, |r, _, _| r.model.active_tab) {
+                        close_find_bar_for_tab(cx, root, &tabs, &rt_cell, id);
+                    }
+                }
+                ExampleAction::FindToggleCase => {
+                    if let Ok(Some(tab_id)) = root.update(cx, |r, _, cx| {
+                        let id = r.model.active_tab?;
+                        if let Some(t) = r.model.tab_mut(id) {
+                            t.find.match_case = !t.find.match_case;
+                        }
+                        cx.notify();
+                        Some(id)
+                    }) {
+                        trigger_find_for_tab(cx, root, &tabs, &rt_cell, tab_id, true, false);
+                    }
+                }
+                ExampleAction::FindDispatch {
+                    forward,
+                    force_find_next,
+                } => {
+                    if let Ok(Some((tab_id, was_open))) = root.update(cx, |r, _, _| {
+                        let id = r.model.active_tab?;
+                        let open = r.model.tab(id).is_some_and(|t| t.find.open);
+                        Some((id, open))
+                    }) {
+                        if !was_open {
+                            let _ = open_find_bar_for_tab(cx, root, tab_id);
+                        }
+                        trigger_find_for_tab(
+                            cx,
+                            root,
+                            &tabs,
+                            &rt_cell,
+                            tab_id,
+                            forward,
+                            force_find_next,
+                        );
+                    }
+                }
+                ExampleAction::ViewSource => {
+                    if let Ok(Some(tab_id)) = root.update(cx, |r, _, _| r.model.active_tab)
+                        && let Some(browser_id) = tabs.get(&tab_id).map(|t| t.browser_id)
+                        && let Some(rt) = rt_cell.borrow().as_ref()
+                        && let Err(err) = rt.view_source(browser_id)
+                    {
+                        let _ = root.update(cx, |r, _, cx| {
+                            if let Some(t) = r.model.tab_mut(tab_id) {
+                                t.output_message = format!("View Source failed: {err:?}");
+                            }
+                            cx.notify();
+                        });
+                    }
+                }
+                ExampleAction::ToggleAskSaveAs => {
+                    let _ = root.update(cx, |r, _, cx| {
+                        r.model.ask_save_as = !r.model.ask_save_as;
+                        r.model.open_menu = None;
+                        r.sync_native_tab_visibility(cx);
+                        cx.notify();
+                    });
+                }
+                ExampleAction::CancelDownload(tab_id) => {
+                    if let Ok(Some(dl_id)) = root.update(cx, |r, _, cx| {
+                        let dl_id = r.model.tab_mut(tab_id).and_then(|t| {
+                            if t.download.is_complete || t.download.is_cancelled {
+                                return None;
+                            }
+                            let id = t.download.download_id?;
+                            t.mark_download_cancelled("Cancelled by user");
+                            Some(id)
+                        });
+                        if let Some(id) = dl_id
+                            && r.model.active_save_as_download == Some(id)
+                        {
+                            r.model.active_save_as_download = None;
+                        }
+                        r.sync_native_tab_visibility(cx);
+                        cx.notify();
+                        dl_id
+                    }) {
+                        pending_save_as.remove(&dl_id);
+                        if let Some(rt) = rt_cell.borrow().as_ref() {
+                            let _ = rt.cancel_download(dl_id);
+                        }
+                    }
+                }
+                ExampleAction::OpenContainingFolder(path) => {
+                    let _ = cx.update(|app| {
+                        app.reveal_path(&path);
+                    });
+                }
+                ExampleAction::CompleteFileDialog { request_id, paths } => {
+                    let _ = root.update(cx, |r, _, cx| {
+                        if r.model.clear_active_file_dialog_if(request_id) {
+                            r.sync_native_tab_visibility(cx);
+                            cx.notify();
+                        }
+                    });
+                    let mode = pending_file_dialogs.remove(&request_id);
+                    if file_dialogs.take_for_resolution(request_id)
+                        && let Some(kind) = mode
+                        && let Some(rt) = rt_cell.borrow().as_ref()
+                    {
+                        let decision = match paths {
+                            Some(list) => cap_selected_paths(list, kind),
+                            None => FileDialogDecision::Cancel,
+                        };
+                        let _ = rt.resolve_file_dialog(request_id, decision);
+                    }
+                }
+                ExampleAction::CompleteSaveAsDownload { request_id, path } => {
+                    let _ = root.update(cx, |r, _, cx| {
+                        if r.model.active_save_as_download == Some(request_id) {
+                            r.model.active_save_as_download = None;
+                            r.sync_native_tab_visibility(cx);
+                            cx.notify();
+                        }
+                    });
+                    if let Some((tab_id, seq, clean_name, _req)) =
+                        pending_save_as.remove(&request_id)
+                    {
+                        match path {
+                            Some(chosen) => {
+                                match resolve_download_destination(
+                                    &output_dir,
+                                    seq,
+                                    &clean_name,
+                                    Some(chosen),
+                                    &[],
+                                ) {
+                                    Ok(dest) => {
+                                        let _ = root.update(cx, |r, _, cx| {
+                                            if let Some(t) = r.model.tab_mut(tab_id) {
+                                                t.download.last_action = "OnBeforeDownload".into();
+                                                t.download.full_path =
+                                                    dest.to_string_lossy().into_owned();
+                                            }
+                                            cx.notify();
+                                        });
+                                        if let Some(rt) = rt_cell.borrow().as_ref() {
+                                            let _ = rt.confirm_download(request_id, dest);
+                                        }
+                                    }
+                                    Err(err) => {
+                                        let _ = root.update(cx, |r, _, cx| {
+                                            if let Some(t) = r.model.tab_mut(tab_id) {
+                                                t.mark_download_cancelled(format!(
+                                                    "Invalid destination: {err:?}"
+                                                ));
+                                            }
+                                            cx.notify();
+                                        });
+                                        if let Some(rt) = rt_cell.borrow().as_ref() {
+                                            let _ = rt.cancel_download(request_id);
+                                        }
+                                    }
+                                }
+                            }
+                            None => {
+                                let _ = root.update(cx, |r, _, cx| {
+                                    if let Some(t) = r.model.tab_mut(tab_id) {
+                                        t.mark_download_cancelled("Cancelled by user");
+                                    }
+                                    cx.notify();
+                                });
+                                if let Some(rt) = rt_cell.borrow().as_ref() {
+                                    let _ = rt.cancel_download(request_id);
+                                }
+                            }
+                        }
+                    }
+                }
+                ExampleAction::ResolvePermission { allow } => {
+                    if let Ok(Some(modal)) = root.update(cx, |r, _, cx| {
+                        let m = r.model.pop_front_permission();
+                        r.sync_native_tab_visibility(cx);
+                        cx.notify();
+                        m
+                    }) && let Some(rt) = rt_cell.borrow().as_ref()
+                    {
+                        let decision = if allow {
+                            PermissionDecision::Allow {
+                                media_mask: modal.request.requested_permissions,
+                            }
+                        } else {
+                            PermissionDecision::Deny
+                        };
+                        let _ = rt.resolve_permission(modal.request.id, decision);
+                    }
+                }
+                ExampleAction::ResolveAuth { submit } => {
+                    if let Ok(Some(mut modal)) = root.update(cx, |r, _, cx| {
+                        let m = r.model.pop_front_auth();
+                        r.sync_native_tab_visibility(cx);
+                        cx.notify();
+                        m
+                    }) {
+                        let req_id = modal.request.id;
+                        let decision = build_auth_decision_and_wipe(&mut modal, submit);
+                        if let Some(rt) = rt_cell.borrow().as_ref() {
+                            let _ = rt.resolve_auth(req_id, decision);
+                        }
+                        let _ = cx.update_window(root.into(), |view, window, cx| {
+                            if let Ok(entity) = view.downcast::<CefExampleRoot>() {
+                                entity.update(cx, |r, cx| {
+                                    if !r.model.pending_auth.is_empty() {
+                                        r.model.active_input = ActiveInput::AuthUser;
+                                        text_input::ensure_parent_window_win32_focus(window);
+                                        let handle = r.input_focus.clone();
+                                        window.focus(&handle, cx);
+                                        window.notify_text_input_changed(&handle);
+                                        cx.notify();
+                                    }
+                                });
+                            }
+                        });
+                    }
+                }
+                ExampleAction::ResolveCertificate { accept } => {
+                    if let Ok(Some((modal, selected))) = root.update(cx, |r, _, cx| {
+                        let sel = r.selected_cert_index;
+                        let m = r.model.pop_front_cert();
+                        r.selected_cert_index =
+                            r.model.pending_cert.front().and_then(|c| match &c.kind {
+                                PendingCertKind::ClientSelect(req) => {
+                                    req.certificates.first().map(|x| x.index)
+                                }
+                                PendingCertKind::ServerError(_) => None,
+                            });
+                        r.sync_native_tab_visibility(cx);
+                        cx.notify();
+                        m.map(|modal| (modal, sel))
+                    }) && let Some(rt) = rt_cell.borrow().as_ref()
+                    {
+                        let req_id = modal.request_id();
+                        let decision = match &modal.kind {
+                            PendingCertKind::ServerError(_) => {
+                                if accept {
+                                    CertificateDecision::Accept {
+                                        certificate_index: None,
+                                    }
+                                } else {
+                                    CertificateDecision::Cancel
+                                }
+                            }
+                            PendingCertKind::ClientSelect(req) => {
+                                if accept {
+                                    let chosen = selected
+                                        .filter(|idx| {
+                                            req.certificates.iter().any(|c| c.index == *idx)
+                                        })
+                                        .or_else(|| req.certificates.first().map(|c| c.index));
+                                    CertificateDecision::Accept {
+                                        certificate_index: chosen,
+                                    }
+                                } else {
+                                    CertificateDecision::Cancel
+                                }
+                            }
+                        };
+                        let _ = rt.resolve_certificate(req_id, decision);
+                    }
+                }
+                ExampleAction::ResolveBeforeUnload(allow) => {
+                    if let Ok(Some(modal)) = root.update(cx, |r, _, cx| {
+                        let m = r.model.pop_front_before_unload();
+                        if !allow {
+                            if let Some(ref info) = m
+                                && let Some(t) = r.model.tab_mut(info.tab_id)
+                            {
+                                t.closing_pending = false;
+                            }
+                            r.model.window_close_pending = false;
+                        }
+                        r.sync_native_tab_visibility(cx);
+                        cx.notify();
+                        m
+                    }) {
+                        if !allow {
+                            if let Some(t) = tabs.get_mut(&modal.tab_id) {
+                                t.closing_pending = false;
+                            }
+                            window_close_pending = false;
+                            close.set(false);
+                        }
+                        let _ = root.update(cx, |r, _, cx| {
+                            if let Some(v) = r.views.get(&modal.tab_id).cloned() {
+                                v.resolve_before_unload(modal.request, allow, cx);
+                            }
+                        });
+                    }
+                }
             }
         }
 
@@ -2013,7 +3538,19 @@ async fn drive_cef_example(
                 continue;
             };
             if tab.handle.snapshot().state == SessionState::Closed {
-                let _ = close_example_tab(cx, &rt_cell, menus.as_ref(), root, tab_id, &mut accounting, &mut tabs);
+                let _ = finalize_close_example_tab(
+                    cx,
+                    &rt_cell,
+                    menus.as_ref(),
+                    &mut ux,
+                    &mut file_dialogs,
+                    &mut pending_save_as,
+                    root,
+                    tab_id,
+                    &mut accounting,
+                    &mut tabs,
+                    false,
+                );
                 continue;
             }
             let view = root
@@ -2021,9 +3558,11 @@ async fn drive_cef_example(
                 .ok()
                 .flatten();
             let diag = if let Some(view) = view {
-                cx.update_window(root.into(), |_, window, cx| view.consume_and_sample(window, cx))
-                    .ok()
-                    .flatten()
+                cx.update_window(root.into(), |_, window, cx| {
+                    view.consume_and_sample(window, cx)
+                })
+                .ok()
+                .flatten()
             } else {
                 None
             };
@@ -2080,9 +3619,12 @@ async fn drive_cef_example(
             {
                 let _ = root.update(cx, |r, window, cx| {
                     if let Some(pres) = r.menu_presenters.get(&tab_id) {
-                        let _ = menus.borrow_mut().dispatch(tab.browser_id, window, cx, |upd, w, cx| {
-                            pres.borrow_mut().update(&upd, w, cx)
-                        });
+                        let _ = menus.borrow_mut().dispatch(
+                            tab.browser_id,
+                            window,
+                            cx,
+                            |upd, w, cx| pres.borrow_mut().update(&upd, w, cx),
+                        );
                     }
                 });
             }
@@ -2123,12 +3665,41 @@ async fn drive_cef_example(
             }
         }
 
+        drain_find_updates(cx, root, &tabs, &rt_cell, &mut ux);
+        let mut source_failures = Vec::new();
+        if let Some(sources) = ux.sources.as_mut() {
+            cx.update(|app| sources.dispatch(app));
+            let active_browsers: Vec<BrowserId> = tabs.values().map(|t| t.browser_id).collect();
+            for browser_id in active_browsers {
+                if let Ok(ops) = sources.operations(browser_id) {
+                    for op in ops {
+                        if op.phase == rust_cef_core::source_view::SourcePhase::Finished
+                            && op.first_failure.is_some()
+                        {
+                            source_failures.push((browser_id, op));
+                        }
+                    }
+                }
+            }
+        }
+        for (browser_id, op) in source_failures {
+            report_source_failure(cx, root, &tabs, &mut ux, browser_id, &op);
+        }
+        let direct_source_failures = cx.update(|app| ux.direct_sources.drain_and_apply(app));
+        for (browser_id, status) in direct_source_failures {
+            report_source_failure(cx, root, &tabs, &mut ux, browser_id, &status);
+        }
+        ux.sweep_retired(cx);
+        if window_close_pending && tabs.is_empty() {
+            break;
+        }
+
         // Automated `--smoke-ms` self-check sequence.
         if config.smoke.is_some() {
             if smoke_stage == 0
-                && tabs.get(&1).is_some_and(|t| {
-                    t.first_paint && !t.handle.snapshot().navigation.is_loading
-                })
+                && tabs
+                    .get(&1)
+                    .is_some_and(|t| t.first_paint && !t.handle.snapshot().navigation.is_loading)
             {
                 let _ = root.update(cx, |r, window, cx| {
                     if let Some(t) = r.model.tab_mut(1) {
@@ -2175,6 +3746,7 @@ async fn drive_cef_example(
                     cx,
                     &rt_cell,
                     menus.as_ref(),
+                    &mut ux,
                     &cap_adapter,
                     root,
                     &config,
@@ -2223,6 +3795,7 @@ async fn drive_cef_example(
                     cx,
                     &rt_cell,
                     menus.as_ref(),
+                    &mut ux,
                     &cap_adapter,
                     root,
                     &config,
@@ -2341,6 +3914,9 @@ async fn drive_cef_example(
                 cx,
                 &rt_cell,
                 menus.as_ref(),
+                &mut ux,
+                &mut file_dialogs,
+                &mut pending_save_as,
                 &cap_adapter,
                 root,
                 &config,
@@ -2376,9 +3952,22 @@ async fn drive_cef_example(
     if let Some((mut ds, _)) = drop_target_owned.take() {
         let _ = ds.retire();
     }
+    ux.shutdown(cx);
     let remaining: Vec<u64> = tabs.keys().copied().collect();
     for id in remaining {
-        let _ = close_example_tab(cx, &rt_cell, menus.as_ref(), root, id, &mut accounting, &mut tabs);
+        let _ = finalize_close_example_tab(
+            cx,
+            &rt_cell,
+            menus.as_ref(),
+            &mut ux,
+            &mut file_dialogs,
+            &mut pending_save_as,
+            root,
+            id,
+            &mut accounting,
+            &mut tabs,
+            true,
+        );
     }
 
     let mut rt = match rt_cell.borrow_mut().take() {
@@ -2414,7 +4003,12 @@ async fn drive_cef_example(
         } else {
             Duration::from_millis(25)
         };
-        let _ = wait(cx, &receiver, Some(deadline.saturating_duration_since(Instant::now()).min(step))).await;
+        let _ = wait(
+            cx,
+            &receiver,
+            Some(deadline.saturating_duration_since(Instant::now()).min(step)),
+        )
+        .await;
         if config.mode == ThreadMode::Integrated {
             let _ = rt.pump();
         }
@@ -2500,10 +4094,13 @@ pub fn run(config: ExampleConfig) -> i32 {
                 });
                 cx.new(|cx| {
                     let input_focus = cx.focus_handle();
-                    let focus_out_sub =
-                        cx.on_focus_out(&input_focus, window, |this: &mut CefExampleRoot, _, _, cx| {
+                    let focus_out_sub = cx.on_focus_out(
+                        &input_focus,
+                        window,
+                        |this: &mut CefExampleRoot, _, _, cx| {
                             this.blur_active_input(cx);
-                        });
+                        },
+                    );
                     CefExampleRoot {
                         model: ExampleAppModel::default(),
                         host_mode,
@@ -2526,6 +4123,7 @@ pub fn run(config: ExampleConfig) -> i32 {
                         active_slider: None,
                         angle_track_bounds: Rc::new(Cell::new(Bounds::default())),
                         opacity_track_bounds: Rc::new(Cell::new(Bounds::default())),
+                        selected_cert_index: None,
                     }
                 })
             },
@@ -2548,4 +4146,141 @@ pub fn run(config: ExampleConfig) -> i32 {
         .detach();
     });
     result.take().unwrap_or(1)
+}
+
+#[cfg(test)]
+mod before_unload_tests {
+    use super::assets::DESKTOP_UX_FIXTURES_URL;
+    use super::*;
+    use rust_cef_gpui::{
+        contracts::RuntimeGeneration,
+        host_capabilities::{
+            AuthRequest, CertificateErrorRequest, DownloadId, DownloadRequest, HostRequestId,
+            PermissionKind, PermissionRequest,
+        },
+    };
+
+    fn test_browser(local: u64) -> BrowserId {
+        BrowserId::new(RuntimeGeneration::new(1), local)
+    }
+
+    fn test_req_id(browser: BrowserId, seq: u64) -> HostRequestId {
+        HostRequestId {
+            browser,
+            sequence: seq,
+        }
+    }
+
+    #[test]
+    fn before_unload_stay_clears_closing_pending_and_aborts_window_close() {
+        let b1 = test_browser(1);
+        let mut model = ExampleAppModel::default();
+        assert!(model.add_tab(1, DEFAULT_HOME_URL.into(), false));
+        model.tab_mut(1).unwrap().closing_pending = true;
+        model.window_close_pending = true;
+        model.enqueue_before_unload(PendingBeforeUnloadModal {
+            tab_id: 1,
+            browser_id: b1,
+            request: BeforeUnloadRequestId {
+                browser: b1,
+                sequence: 10,
+            },
+            is_reload: false,
+        });
+        assert!(model.has_blocking_modal());
+
+        // Simulate user choosing "Stay" (allow = false) on two-phase close.
+        let popped = model.pop_front_before_unload().expect("modal present");
+        assert_eq!(popped.tab_id, 1);
+        model.tab_mut(popped.tab_id).unwrap().closing_pending = false;
+        model.window_close_pending = false;
+
+        assert_eq!(model.tabs.len(), 1);
+        assert!(!model.tabs[0].closing_pending);
+        assert!(!model.window_close_pending);
+        assert!(!model.quit_requested);
+        assert!(!model.has_blocking_modal());
+    }
+
+    #[test]
+    fn before_unload_leave_finalizes_tab_cancels_downloads_and_prunes_modals() {
+        let b1 = test_browser(1);
+        let b2 = test_browser(2);
+        let mut model = ExampleAppModel::default();
+        assert!(model.add_tab(1, DEFAULT_HOME_URL.into(), false));
+        assert!(model.add_tab(2, DESKTOP_UX_FIXTURES_URL.into(), false));
+        let dl_id = DownloadId {
+            browser: b1,
+            cef_id: 1,
+            sequence: 7,
+        };
+        model.tab_mut(1).unwrap().apply_download_request(
+            b1,
+            &DownloadRequest {
+                id: dl_id,
+                url: "https://example.test/a.bin".into(),
+                original_url: "https://example.test/a.bin".into(),
+                suggested_name: "a.bin".into(),
+                mime_type: "application/octet-stream".into(),
+                total_bytes: Some(128),
+            },
+        );
+        model.active_native_file_dialog = Some(test_req_id(b1, 1));
+        model.active_save_as_download = Some(dl_id);
+        model.enqueue_permission(PendingPermissionModal {
+            tab_id: 1,
+            browser_id: b1,
+            request: PermissionRequest {
+                id: test_req_id(b1, 2),
+                kind: PermissionKind::MediaAccess,
+                requesting_origin: "https://a.test".into(),
+                requested_permissions: 1,
+            },
+        });
+        model.enqueue_auth(model::PendingAuthModal {
+            tab_id: 1,
+            browser_id: b1,
+            request: AuthRequest {
+                id: test_req_id(b1, 3),
+                origin_url: "https://a.test".into(),
+                is_proxy: false,
+                host: "a.test".into(),
+                port: 443,
+                realm: "Test".into(),
+                scheme: "basic".into(),
+            },
+            username_input: TextBuffer::new("alice"),
+            password_input: TextBuffer::new("secret"),
+        });
+        model.enqueue_cert(PendingCertModal {
+            tab_id: 2,
+            browser_id: b2,
+            kind: PendingCertKind::ServerError(CertificateErrorRequest {
+                id: test_req_id(b2, 4),
+                cert_error: -200,
+                request_url: "https://b.test".into(),
+            }),
+        });
+        model.active_input = ActiveInput::AuthPass;
+
+        let cancelled =
+            cancel_active_download_on_close(&mut model.tab_mut(1).unwrap().download, b1);
+        assert_eq!(cancelled, Some(dl_id));
+        assert!(model.tab_mut(1).unwrap().download.is_cancelled);
+
+        model.clear_modals_for_tab(1, Some(b1));
+        assert_eq!(model.active_native_file_dialog, None);
+        assert_eq!(model.active_save_as_download, None);
+        assert!(model.pending_permission.is_empty());
+        assert!(model.pending_auth.is_empty());
+        assert_eq!(model.active_input, ActiveInput::None);
+        assert_eq!(model.pending_cert.len(), 1);
+
+        assert!(model.close_tab(1));
+        assert_eq!(model.tabs.len(), 1);
+        assert!(!model.quit_requested);
+
+        assert!(model.close_tab(2));
+        assert!(model.quit_requested);
+    }
 }

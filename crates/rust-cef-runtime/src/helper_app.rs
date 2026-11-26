@@ -25,6 +25,7 @@ pub(crate) const EXTRA_JS_BRIDGE_MAX_BYTES: &str = "rust_cef.js_bridge.max_bytes
 pub(crate) const EXTRA_JS_BRIDGE_ORIGINS: &str = "rust_cef.js_bridge.origins";
 pub(crate) const EXTRA_JS_BRIDGE_SUBFRAMES: &str = "rust_cef.js_bridge.subframes";
 pub(crate) const EXTRA_JS_BRIDGE_LEGACY: &str = "rust_cef.js_bridge.legacy";
+pub(crate) const EXTRA_JS_REPO_CONFIG: &str = "rust_cef.js_bridge.repo_config";
 
 pub(crate) const MSG_POST_MESSAGE: &str = "rust_cef.post_message";
 pub(crate) const MSG_HOST_MESSAGE: &str = "rust_cef.host_message";
@@ -86,6 +87,7 @@ struct HelperBrowserBridge {
     legacy_binding: bool,
     max_bytes: usize,
     allowed_origins: BTreeSet<String>,
+    repo_config_json: Option<String>,
     listeners: Vec<(V8Context, V8Value)>,
 }
 
@@ -131,6 +133,11 @@ impl HelperRenderState {
         let max_bytes = usize::try_from(max_raw)
             .unwrap_or(MAX_JS_PAYLOAD_BYTES)
             .clamp(1, MAX_JS_PAYLOAD_BYTES);
+        let raw_repo =
+            CefString::from(&info.string(Some(&CefString::from(EXTRA_JS_REPO_CONFIG)))).to_string();
+        let repo_config_json = (!raw_repo.is_empty()
+            && validate_bounded_json(&raw_repo, MAX_JS_PAYLOAD_BYTES, MAX_JS_JSON_DEPTH).is_ok())
+        .then_some(raw_repo);
         let mut allowed_origins = BTreeSet::new();
         if let Some(list) = info.list(Some(&CefString::from(EXTRA_JS_BRIDGE_ORIGINS))) {
             let count = list.size().min(64);
@@ -155,6 +162,7 @@ impl HelperRenderState {
                 legacy_binding,
                 max_bytes,
                 allowed_origins,
+                repo_config_json,
                 listeners: Vec::new(),
             },
         );
@@ -191,14 +199,14 @@ impl HelperRenderState {
         frame: &Frame,
     ) -> Option<(u64, u64, usize, String)> {
         self.frame_bridge_config(native_id, frame)
-            .map(|(rt, br, max_bytes, origin, _, _)| (rt, br, max_bytes, origin))
+            .map(|(rt, br, max_bytes, origin, _, _, _)| (rt, br, max_bytes, origin))
     }
 
     fn frame_bridge_config(
         &self,
         native_id: i32,
         frame: &Frame,
-    ) -> Option<(u64, u64, usize, String, bool, bool)> {
+    ) -> Option<(u64, u64, usize, String, bool, bool, Option<String>)> {
         if frame.is_valid() == 0 {
             return None;
         }
@@ -225,6 +233,7 @@ impl HelperRenderState {
             origin,
             bridge.allow_subframes,
             bridge.legacy_binding,
+            bridge.repo_config_json.clone(),
         ))
     }
 
@@ -461,7 +470,7 @@ wrap_render_process_handler! {
             {
                 send_frame_context_event(frame, MSG_CONTEXT_CREATED, rt, br);
             }
-            let Some((_, _, _, _, _, legacy_binding)) =
+            let Some((_, _, _, _, _, legacy_binding, repo_config_json)) =
                 self.state.frame_bridge_config(native_id, frame)
             else {
                 return;
@@ -488,7 +497,10 @@ wrap_render_process_handler! {
                 bridge_obj.set_value_bykey(Some(&on_name), Some(&mut on_fn), ro);
             }
             global.set_value_bykey(Some(&CefString::from("rustCef")), Some(&mut bridge_obj), ro);
-            let bootstrap_script = crate::jsb_bridge_js::bootstrap_js(legacy_binding);
+            let bootstrap_script = crate::jsb_bridge_js::bootstrap_js_with_config(
+                legacy_binding,
+                repo_config_json.as_deref(),
+            );
             let mut eval_ret: Option<V8Value> = None;
             let mut eval_exc: Option<V8Exception> = None;
             let _ = context.eval(
@@ -661,8 +673,15 @@ wrap_render_process_handler! {
                     let br_ok = CefString::from(&args.string(1)).to_string().parse::<u64>().ok();
                     let expected_origin = CefString::from(&args.string(2)).to_string();
                     let payload = CefString::from(&args.string(3)).to_string();
-                    let Some((runtime_gen, browser_local, max_bytes, origin, allow_subframes, _)) =
-                        self.state.frame_bridge_config(native_id, frame)
+                    let Some((
+                        runtime_gen,
+                        browser_local,
+                        max_bytes,
+                        origin,
+                        allow_subframes,
+                        _,
+                        _,
+                    )) = self.state.frame_bridge_config(native_id, frame)
                     else {
                         return 1;
                     };
@@ -1061,5 +1080,26 @@ mod tests {
             Some("app://local".into())
         );
         assert_eq!(state.origin_for_url("file:///c:/secret.txt"), None);
+    }
+
+    #[test]
+    fn bootstrap_js_supports_custom_global_object_names_and_compat_defaults() {
+        let compat = crate::jsb_bridge_js::bootstrap_js(false);
+        assert!(compat.contains("globalThis['cef-rs-gpui']"));
+        assert!(compat.contains("globalThis.CefRsGpui"));
+        assert!(compat.contains("PostMessageIntTestCallback"));
+        assert!(compat.contains("(0, eval)"));
+
+        let camel_cfg = r#"{"enabled":true,"compatDefault":false,"globalObjectName":"myCustomBridge","camelCaseMethods":true,"legacyBinding":false,"objects":[]}"#;
+        let camel_js = crate::jsb_bridge_js::bootstrap_js_with_config(false, Some(camel_cfg));
+        assert!(camel_js.contains("myCustomBridge"));
+        assert!(camel_js.contains("bindObjectAsync"));
+        assert!(camel_js.contains("NotifyIfAlreadyBound"));
+        assert!(camel_js.contains("IgnoreCache"));
+        assert!(camel_js.contains("DeleteBoundObject"));
+        assert!(camel_js.contains("IsObjectCached"));
+        assert!(camel_js.contains("RemoveObjectFromCache"));
+        assert!(camel_js.contains("__cefDateMs"));
+        assert!(camel_js.contains("__cefCbId"));
     }
 }

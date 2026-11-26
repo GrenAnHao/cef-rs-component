@@ -49,6 +49,10 @@ use crate::{
 
 pub use crate::capture::CaptureDiagnostics;
 pub use crate::executor::ExecutorStats as RuntimeExecutorStats;
+pub use crate::policy_native::{
+    JsRepositoryMethodStyle, JsRepositoryObjectDescriptor, JsRepositoryPropertyDescriptor,
+    JsRepositorySettings,
+};
 pub use crate::profile_flush::{CookieFlushStatus, CookieFlushTicket};
 pub use crate::profiles::{
     ProfileComparison, ProfileComparisonTicket, ProfileCreateError,
@@ -918,7 +922,11 @@ impl Runtime {
             .with_ax_tree(ax_tree)
             .with_cursor_slot(cursor_slot)
             .with_native_context_menu(native_context_menu)
-            .with_surface_mode(surface_mode))
+            .with_surface_mode(surface_mode)
+            .with_runtime_bridge(crate::attachment::RuntimeBrowserBridge::new(
+                browser,
+                Arc::downgrade(&self.registry),
+            )))
     }
 
     pub fn native_browser_hwnd(&self, browser: BrowserId) -> Option<std::num::NonZeroUsize> {
@@ -1087,6 +1095,49 @@ impl Runtime {
     pub fn find_diagnostics(&self) -> crate::FindDiagnostics {
         self.registry.finds.snapshot()
     }
+    pub fn set_find_sink(
+        &self,
+        browser: BrowserId,
+        sink: Option<Arc<dyn rust_cef_core::find::FindResultSink>>,
+    ) -> Result<(), EngineError> {
+        if browser.runtime() != self.generation() {
+            return Err(EngineError::WrongRuntime);
+        }
+        if self.finished {
+            return Err(EngineError::Closed);
+        }
+        self.registry.set_host_find_sink(browser, sink)
+    }
+    pub fn find(
+        &self,
+        browser: BrowserId,
+        search_text: &str,
+        forward: bool,
+        match_case: bool,
+        find_next: bool,
+    ) -> Result<rust_cef_core::find::FindOperationId, EngineError> {
+        if browser.runtime() != self.generation() {
+            return Err(EngineError::WrongRuntime);
+        }
+        if self.finished {
+            return Err(EngineError::Closed);
+        }
+        self.registry
+            .host_find(browser, search_text, forward, match_case, find_next)
+    }
+    pub fn stop_finding(
+        &self,
+        browser: BrowserId,
+        clear_selection: bool,
+    ) -> Result<(), EngineError> {
+        if browser.runtime() != self.generation() {
+            return Err(EngineError::WrongRuntime);
+        }
+        if self.finished {
+            return Err(EngineError::Closed);
+        }
+        self.registry.host_stop_finding(browser, clear_selection)
+    }
     pub fn js_bridge_diagnostics(&self) -> (u64, u64, u64, u64, u64) {
         self.registry.js_bridge_stats()
     }
@@ -1114,6 +1165,13 @@ impl Runtime {
 
     pub fn set_next_browser_legacy_binding(&self, enabled: bool) {
         self.policy.set_next_browser_legacy_binding(enabled);
+    }
+
+    pub fn set_js_repository_settings(
+        &self,
+        settings: Option<JsRepositorySettings>,
+    ) -> Result<(), EngineError> {
+        self.policy.set_js_repository_settings(settings)
     }
     pub fn register_profile_scheme_handler(
         &self,
@@ -1562,6 +1620,31 @@ impl Runtime {
     pub fn source_view_diagnostics(&self) -> crate::SourceViewDiagnostics {
         self.registry.sources.snapshot()
     }
+    pub fn set_source_viewer(
+        &self,
+        browser: BrowserId,
+        viewer: Option<Arc<dyn rust_cef_core::source_view::SourceViewSink>>,
+    ) -> Result<(), EngineError> {
+        if browser.runtime() != self.generation() {
+            return Err(EngineError::WrongRuntime);
+        }
+        if self.finished {
+            return Err(EngineError::Closed);
+        }
+        self.registry.set_host_source_viewer(browser, viewer)
+    }
+    pub fn view_source(
+        &self,
+        browser: BrowserId,
+    ) -> Result<rust_cef_core::source_view::SourceOperationId, EngineError> {
+        if browser.runtime() != self.generation() {
+            return Err(EngineError::WrongRuntime);
+        }
+        if self.finished {
+            return Err(EngineError::Closed);
+        }
+        self.registry.host_view_source(browser)
+    }
 
     #[cfg(feature = "test-support")]
     pub fn probe_hold_source_visitor(&self, browser: BrowserId) -> Result<(), EngineError> {
@@ -1735,9 +1818,7 @@ impl Runtime {
             .policy
             .rules
             .allows_host_navigation(&config.initial_url)
-            && !self
-                .policy
-                .allows_chrome_internal_url(&config.initial_url)
+            && !self.policy.allows_chrome_internal_url(&config.initial_url)
         {
             self.policy
                 .deny(None, rust_cef_core::ports::PolicyAction::Navigation);

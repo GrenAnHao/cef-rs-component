@@ -644,8 +644,8 @@ async fn live(
     } else {
         gpui_cef_poc::demo_url()
     };
-    let mut options =
-        BrowserOptions::default().with_frame_rate(rust_cef_gpui::recommended_windowless_frame_rate());
+    let mut options = BrowserOptions::default()
+        .with_frame_rate(rust_cef_gpui::recommended_windowless_frame_rate());
     if config.ux_controls {
         options = options
             .with_tooltip_events(true)
@@ -746,20 +746,18 @@ async fn live(
                         })));
                     }
                     if config.js_bridge_page {
-                        view.set_on_js_message(Some(Box::new(
-                            |origin, payload, view, _, _| {
-                                println!(
-                                    "COMPONENT_DEMO_JS_MSG origin={origin} bytes={}",
-                                    payload.len()
-                                );
-                                let _ = view.post_js_message(r#"{"from":"host","ack":true}"#);
-                                let _ = view.evaluate_script(
-                                    "document.title",
-                                    JsFrameScope::MainFrame,
-                                    2000,
-                                );
-                            },
-                        )));
+                        view.set_on_js_message(Some(Box::new(|origin, payload, view, _, _| {
+                            println!(
+                                "COMPONENT_DEMO_JS_MSG origin={origin} bytes={}",
+                                payload.len()
+                            );
+                            let _ = view.post_js_message(r#"{"from":"host","ack":true}"#);
+                            let _ = view.evaluate_script(
+                                "document.title",
+                                JsFrameScope::MainFrame,
+                                2000,
+                            );
+                        })));
                         view.set_on_eval_completed(Some(Box::new(|id, outcome, _, _, _| {
                             let ok = matches!(outcome, EvalOutcome::Value(_));
                             println!("COMPONENT_DEMO_EVAL id={} ok={ok}", id.sequence);
@@ -1845,16 +1843,20 @@ mod win32_menu_gpui_tests {
         assert!(CaptureFailureKind::Busy.is_recoverable_resize_transition());
         assert!(!CaptureFailureKind::DeviceRemoved.is_recoverable_resize_transition());
 
-        assert!(EngineError::Capture {
-            kind: CaptureFailureKind::IncompleteFrame,
-            code: None,
-        }
-        .is_recoverable_capture());
-        assert!(!EngineError::Capture {
-            kind: CaptureFailureKind::IncompleteFrame,
-            code: Some(-1),
-        }
-        .is_recoverable_capture());
+        assert!(
+            EngineError::Capture {
+                kind: CaptureFailureKind::IncompleteFrame,
+                code: None,
+            }
+            .is_recoverable_capture()
+        );
+        assert!(
+            !EngineError::Capture {
+                kind: CaptureFailureKind::IncompleteFrame,
+                code: Some(-1),
+            }
+            .is_recoverable_capture()
+        );
 
         let browser = BrowserId::new(RuntimeGeneration::new(1), 1);
         let obs = Observations::default();

@@ -4,9 +4,7 @@
 use crate::{client::BrowserClientState, policy_native::NativePolicy};
 use cef::*;
 use rust_cef_core::{
-    contracts::{
-        BrowserId, ResourceLoadCompleteInfo, ResourceResponseInfo, truncate_utf8_bytes,
-    },
+    contracts::{BrowserId, ResourceLoadCompleteInfo, ResourceResponseInfo, truncate_utf8_bytes},
     custom_schemes::{
         InterceptAction, InterceptRequest, MAX_INTERCEPT_HEADERS, MAX_INTERCEPT_POST_BODY_BYTES,
         MAX_SCHEME_ASSET_BYTES, ResourceInterceptor, ResponseBodyFilter, ResponseFilterStep,
@@ -629,8 +627,7 @@ mod tests {
         let owner = BrowserId::new(rust_cef_core::contracts::RuntimeGeneration::new(1), 1);
         let open_policy = NativePolicy::new(
             Arc::new(
-                CompiledPolicy::compile(&TrustedContentPolicy::allow_all_http_https(true))
-                    .unwrap(),
+                CompiledPolicy::compile(&TrustedContentPolicy::allow_all_http_https(true)).unwrap(),
             ),
             std::sync::Weak::new(),
         );
@@ -678,7 +675,11 @@ mod tests {
     fn response_filter_rewrites_bytes_without_shrinking_output_buffer() {
         struct UppercaseFilter;
         impl ResponseBodyFilter for UppercaseFilter {
-            fn filter(&mut self, input: &[u8], output: &mut [u8]) -> (usize, usize, ResponseFilterStep) {
+            fn filter(
+                &mut self,
+                input: &[u8],
+                output: &mut [u8],
+            ) -> (usize, usize, ResponseFilterStep) {
                 let n = input.len().min(output.len());
                 for (dst, &src) in output[..n].iter_mut().zip(&input[..n]) {
                     *dst = src.to_ascii_uppercase();
@@ -691,7 +692,10 @@ mod tests {
             fn intercept(&self, _request: &InterceptRequest) -> InterceptAction {
                 InterceptAction::Continue
             }
-            fn response_filter(&self, _info: &ResourceResponseInfo) -> Option<Box<dyn ResponseBodyFilter>> {
+            fn response_filter(
+                &self,
+                _info: &ResourceResponseInfo,
+            ) -> Option<Box<dyn ResponseBodyFilter>> {
                 Some(Box::new(UppercaseFilter))
             }
         }

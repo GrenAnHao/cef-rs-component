@@ -1070,7 +1070,8 @@ impl UiRegistry {
                             browser: scope.browser,
                             target_url: url.to_string(),
                             target_frame_name: String::new(),
-                            disposition: rust_cef_core::host_capabilities::PopupDisposition::NewForegroundTab,
+                            disposition:
+                                rust_cef_core::host_capabilities::PopupDisposition::NewForegroundTab,
                             user_gesture: true,
                             policy_allowed,
                         };
@@ -1094,11 +1095,12 @@ impl UiRegistry {
                                 if !policy_allowed {
                                     state.deny_disallowed_url(url);
                                 } else if let Some(registry) = scope.registry.upgrade()
-                                    && let Ok(mut popup_client) = registry.open_managed_popup_client(
-                                        scope.browser,
-                                        -1,
-                                        state.policy.clone(),
-                                    )
+                                    && let Ok(mut popup_client) = registry
+                                        .open_managed_popup_client(
+                                            scope.browser,
+                                            -1,
+                                            state.policy.clone(),
+                                        )
                                 {
                                     let win_info = crate::popup_window::build_popup_window_info(
                                         None,

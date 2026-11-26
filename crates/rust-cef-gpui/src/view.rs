@@ -59,8 +59,8 @@ use rust_cef_core::{
         step_canonical_zoom_level, truncate_utf8_bytes, zoom_level_to_milli,
     },
     file_drop::{FileDragPhase, FileDropPaths},
-    host_capabilities::PopupRequest,
     frame_budget::FrameError,
+    host_capabilities::PopupRequest,
     input::{
         BrowserTouchEvent, InputKind, InputResetReason, MAX_INPUT_RANGE_UTF16,
         MAX_INPUT_TEXT_UTF16, MouseButton as InputButton, TouchEventType, Utf16Range,
@@ -387,7 +387,12 @@ fn drag_cursor_style(op: DragOperationMask) -> CursorStyle {
 fn drag_preview_from_start(
     start: &OutboundDragStart,
     window_scale: f32,
-) -> (Option<Arc<RenderImage>>, (f32, f32), (f32, f32), Option<String>) {
+) -> (
+    Option<Arc<RenderImage>>,
+    (f32, f32),
+    (f32, f32),
+    Option<String>,
+) {
     if let Some(img) = &start.payload.image {
         let mut premul = img.bgra.clone();
         // GPUI's DirectX atlas uses PremultipliedBgra8; apply slight ghost
@@ -399,7 +404,8 @@ fn drag_preview_from_start(
             px[2] = ((u32::from(px[2]) * eff_a + 127) / 255) as u8;
             px[3] = eff_a as u8;
         }
-        if let Some(buffer) = ImageBuffer::<Rgba<u8>, Vec<u8>>::from_raw(img.width, img.height, premul)
+        if let Some(buffer) =
+            ImageBuffer::<Rgba<u8>, Vec<u8>>::from_raw(img.width, img.height, premul)
         {
             let scale = if img.scale_milli > 0 {
                 img.scale_milli as f32 / 1000.0
@@ -805,6 +811,7 @@ pub struct CefBrowser {
     native_cursor: rust_cef_core::cursor::NativeCursorData,
     pointer_over_surface: bool,
     right_mouse_down: bool,
+    async_ops: Arc<crate::async_ops::AsyncOpLedger>,
 }
 
 const NATIVE_CONTEXT_MENU_REOPEN_WINDOW: Duration = Duration::from_millis(400);
@@ -863,6 +870,8 @@ impl CefBrowser {
         let initial_ax_snapshot = close_ax_tree.snapshot();
         let menu = Rc::new(RefCell::new(std::rc::Weak::new()));
         let close_menu = menu.clone();
+        let async_ops = crate::async_ops::AsyncOpLedger::new();
+        let close_async_ops = Arc::clone(&async_ops);
         let view = cx.new(|cx| Self {
             attachment,
             browser,
@@ -948,6 +957,7 @@ impl CefBrowser {
             native_cursor: rust_cef_core::cursor::NativeCursorData::default(),
             pointer_over_surface: false,
             right_mouse_down: false,
+            async_ops,
         });
 
         // Release runs while the entity still exists but before it is dropped.
@@ -968,6 +978,7 @@ impl CefBrowser {
             crate::menu::retire_projection(&close_menu);
             close_token.retire();
             close_ax_tree.clear();
+            close_async_ops.retire_and_cancel_all();
             if close_view
                 .update(app, |view, _| {
                     view.clear_callbacks_and_filters();
@@ -1582,6 +1593,140 @@ impl CefBrowser {
             .map_err(ViewError::Input)
     }
 
+    pub fn evaluate_script_async(
+        &self,
+        script: impl Into<String>,
+        frame_scope: JsFrameScope,
+        timeout: Option<Duration>,
+    ) -> crate::async_ops::AsyncOpFuture<Option<String>> {
+        if !self.token.is_live() {
+            return crate::async_ops::AsyncOpFuture::ready(Err(
+                crate::async_ops::AsyncOpError::Closed,
+            ));
+        }
+        let dur = timeout.unwrap_or(crate::async_ops::DEFAULT_ASYNC_OP_TIMEOUT);
+        let timeout_ms = dur.as_millis().clamp(1, i64::MAX as u128) as u64;
+        let id =
+            match self
+                .attachment
+                .handle()
+                .evaluate_script(script.into(), frame_scope, timeout_ms)
+            {
+                Ok(id) => id,
+                Err(err) => {
+                    return crate::async_ops::AsyncOpFuture::ready(Err(
+                        crate::async_ops::AsyncOpError::Runtime(err),
+                    ));
+                }
+            };
+        match self.async_ops.begin_eval(id, Some(dur)) {
+            Ok(fut) => fut,
+            Err(err) => crate::async_ops::AsyncOpFuture::ready(Err(err)),
+        }
+    }
+
+    pub fn get_source_async(
+        &self,
+        frame_scope: JsFrameScope,
+        timeout: Option<Duration>,
+    ) -> crate::async_ops::AsyncOpFuture<String> {
+        if !self.token.is_live() {
+            return crate::async_ops::AsyncOpFuture::ready(Err(
+                crate::async_ops::AsyncOpError::Closed,
+            ));
+        }
+        crate::async_ops::request_frame_text_async(
+            &self.async_ops,
+            self.attachment.runtime_bridge(),
+            rust_cef_runtime::FrameTextKind::Source,
+            frame_scope,
+            timeout,
+        )
+    }
+
+    pub fn get_text_async(
+        &self,
+        frame_scope: JsFrameScope,
+        timeout: Option<Duration>,
+    ) -> crate::async_ops::AsyncOpFuture<String> {
+        if !self.token.is_live() {
+            return crate::async_ops::AsyncOpFuture::ready(Err(
+                crate::async_ops::AsyncOpError::Closed,
+            ));
+        }
+        crate::async_ops::request_frame_text_async(
+            &self.async_ops,
+            self.attachment.runtime_bridge(),
+            rust_cef_runtime::FrameTextKind::Text,
+            frame_scope,
+            timeout,
+        )
+    }
+
+    pub fn wait_for_initial_load_async(
+        &self,
+        timeout: Option<Duration>,
+    ) -> crate::async_ops::AsyncOpFuture<crate::async_ops::InitialLoadResult> {
+        if !self.token.is_live() {
+            return crate::async_ops::AsyncOpFuture::ready(Err(
+                crate::async_ops::AsyncOpError::Closed,
+            ));
+        }
+        let nav = self.attachment.handle().snapshot().navigation;
+        let hint = (!nav.is_loading && !nav.address.is_empty()).then_some(
+            crate::async_ops::InitialLoadResult {
+                http_status_code: 200,
+            },
+        );
+        self.async_ops.wait_for_initial_load(
+            hint,
+            Some(timeout.unwrap_or(crate::async_ops::DEFAULT_ASYNC_OP_TIMEOUT)),
+        )
+    }
+
+    fn latest_osr_frame(&self) -> Option<Arc<OwnedFrame>> {
+        if let Some(slot) = self.image.as_ref()
+            && let PresentedContent::GpuTexture(ref frame) = slot.content
+        {
+            return Some(Arc::clone(frame));
+        }
+        self.attachment.frame_source().snapshot().view.frame
+    }
+
+    pub fn capture_screenshot_bgra(
+        &self,
+        timeout: Option<Duration>,
+    ) -> crate::async_ops::AsyncOpFuture<crate::async_ops::ScreenshotBgra> {
+        if !self.token.is_live() {
+            return crate::async_ops::AsyncOpFuture::ready(Err(
+                crate::async_ops::AsyncOpError::Closed,
+            ));
+        }
+        crate::async_ops::capture_osr_bgra(
+            &self.async_ops,
+            self.attachment.runtime_bridge(),
+            self.latest_osr_frame(),
+            timeout,
+        )
+    }
+
+    pub fn capture_screenshot_png(
+        &self,
+        timeout: Option<Duration>,
+    ) -> crate::async_ops::AsyncOpFuture<Vec<u8>> {
+        if !self.token.is_live() {
+            return crate::async_ops::AsyncOpFuture::ready(Err(
+                crate::async_ops::AsyncOpError::Closed,
+            ));
+        }
+        crate::async_ops::capture_osr_png(
+            &self.async_ops,
+            self.attachment.runtime_bridge(),
+            self.latest_osr_frame(),
+            timeout,
+        )
+    }
+
     pub fn post_js_message(&self, payload_json: impl Into<String>) -> Result<CommandId, ViewError> {
         if !self.token.is_live() {
             return Err(ViewError::RetiredBinding);
@@ -2093,13 +2238,11 @@ impl CefBrowser {
                         if (milli - pending.target_milli).abs() <= 2 {
                             self.ux.zoom_level_milli = milli;
                             self.pending_zoom = None;
-                            self.zoom_gate
-                                .sync_external(f64::from(milli) / 1000.0);
+                            self.zoom_gate.sync_external(f64::from(milli) / 1000.0);
                         }
                     } else {
                         self.ux.zoom_level_milli = milli;
-                        self.zoom_gate
-                            .sync_external(f64::from(milli) / 1000.0);
+                        self.zoom_gate.sync_external(f64::from(milli) / 1000.0);
                     }
                 }
                 other => {
@@ -2373,6 +2516,7 @@ impl CefBrowser {
                     }
                 }
                 BrowserEvent::EvalCompleted { id, outcome } => {
+                    let _ = self.async_ops.on_eval_completed(id, &outcome);
                     if let Some(mut cb) = self.on_eval_completed.take() {
                         cb(id, outcome, self, window, cx);
                         if self.on_eval_completed.is_none() {
@@ -2392,6 +2536,7 @@ impl CefBrowser {
     fn sync_view_events(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let events = self.attachment.handle().take_view_events();
         for event in events {
+            self.async_ops.on_browser_event(&event);
             if let BrowserEvent::DraggableRegionsChanged(ref regions) = event {
                 self.ux.draggable_regions.clone_from(regions);
             }
@@ -3129,6 +3274,7 @@ impl CefBrowser {
         self.attachment.native_context_menu().clear();
         crate::native_view::clear_surface_cursor(self.hwnd_raw, surface_cursor_key(self.browser));
         self.reset_input(InputResetReason::Closing);
+        self.async_ops.retire_and_cancel_all();
         self.token.retire();
         self.needs_resync = false;
         let view = self.image.take();
@@ -3668,7 +3814,11 @@ impl CefBrowser {
             self.project_menu_focus(window, cx);
             self.was_focused = true;
             self.cef_focus_accepted.set(false);
-            if let Err(error) = self.attachment.handle().submit(BrowserCommand::SetFocus(true)) {
+            if let Err(error) = self
+                .attachment
+                .handle()
+                .submit(BrowserCommand::SetFocus(true))
+            {
                 self.record_message(format!("orphan right-up focus refused: {error:?}"));
                 return;
             }
@@ -3996,7 +4146,9 @@ impl CefBrowser {
             return;
         }
         let (mut delta_x, mut delta_y) = match event.delta {
-            ScrollDelta::Lines(delta) => self.scroll_accumulator.accumulate_lines((delta.x, delta.y)),
+            ScrollDelta::Lines(delta) => {
+                self.scroll_accumulator.accumulate_lines((delta.x, delta.y))
+            }
             ScrollDelta::Pixels(delta) => self
                 .scroll_accumulator
                 .accumulate_pixels((f32::from(delta.x), f32::from(delta.y))),
@@ -4200,6 +4352,7 @@ impl Drop for CefBrowser {
         self.ax_snapshot = None;
         self.attachment.ax_tree().clear();
         self.reset_input(InputResetReason::Closing);
+        self.async_ops.retire_and_cancel_all();
         self.token.retire();
     }
 }
@@ -4566,7 +4719,9 @@ impl Render for CefBrowser {
             .size_full()
             .when(use_opaque_backdrop, |el| el.bg(gpui::rgb(backdrop_rgb)))
             .role(Role::WebView)
-            .cursor(active_drag_op.map_or_else(|| cursor_style_for(self.ux.cursor), drag_cursor_style))
+            .cursor(
+                active_drag_op.map_or_else(|| cursor_style_for(self.ux.cursor), drag_cursor_style),
+            )
             .track_focus(&focus)
             .on_any_mouse_down(move |event, window, app| {
                 // Only eligible GPUI bubble/hitbox input may begin a click; an
@@ -4887,7 +5042,8 @@ impl Render for CefBrowser {
                                             view.drag_pointer_move(event, window, cx)
                                         });
                                     }
-                                } else if input_move.borrow().held_button() && !app.has_active_drag()
+                                } else if input_move.borrow().held_button()
+                                    && !app.has_active_drag()
                                 {
                                     if let Some(entity) = moving.upgrade() {
                                         entity.update(app, |view, _| {
@@ -5011,17 +5167,18 @@ impl Render for CefBrowser {
                             // device-pixel size divided by the window scale, anchored at
                             // the surface origin. No stretching of a stale image.
                             let paint_result = match &frame.content {
-                                PresentedContent::CpuImage(image) => window.paint_image_transformed(
-                                    bounds,
-                                    target,
-                                    Corners::default(),
-                                    image.clone(),
-                                    0,
-                                    false,
-                                    Some(surface_opacity),
-                                    transformation,
-                                    nearest_neighbor_scaling,
-                                ),
+                                PresentedContent::CpuImage(image) => window
+                                    .paint_image_transformed(
+                                        bounds,
+                                        target,
+                                        Corners::default(),
+                                        image.clone(),
+                                        0,
+                                        false,
+                                        Some(surface_opacity),
+                                        transformation,
+                                        nearest_neighbor_scaling,
+                                    ),
                                 PresentedContent::GpuTexture(owned) => {
                                     #[cfg(target_os = "windows")]
                                     {
@@ -6482,7 +6639,7 @@ mod tests {
 
     #[test]
     fn align_view_frame_target_fills_bounds_across_dpi_and_subpixel_rounding_without_stretching_resize()
-    {
+     {
         let bounds = Bounds {
             origin: Point {
                 x: px(10.0),
@@ -6743,18 +6900,9 @@ mod tests {
             translate_point(bounds, (1199.6667, 805.6667), false),
             Some((1199, 761))
         );
-        assert_eq!(
-            normalize_click_count(InputButton::Right, 1),
-            1
-        );
-        assert_eq!(
-            normalize_click_count(InputButton::Right, 2),
-            1
-        );
-        assert_eq!(
-            normalize_click_count(InputButton::Right, 3),
-            1
-        );
+        assert_eq!(normalize_click_count(InputButton::Right, 1), 1);
+        assert_eq!(normalize_click_count(InputButton::Right, 2), 1);
+        assert_eq!(normalize_click_count(InputButton::Right, 3), 1);
         assert_eq!(normalize_click_count(InputButton::Left, 2), 2);
         assert_eq!(normalize_click_count(InputButton::Left, 4), 1);
     }
@@ -6932,7 +7080,10 @@ mod tests {
         handle.set_popup_ui_listener_active(true);
         assert!(stub.ui_active.load(Ordering::Acquire));
         handle.set_extended_event_mask(EXT_EVENT_FRAME_LIFECYCLE);
-        assert_eq!(stub.extended_mask.load(Ordering::Acquire), EXT_EVENT_FRAME_LIFECYCLE);
+        assert_eq!(
+            stub.extended_mask.load(Ordering::Acquire),
+            EXT_EVENT_FRAME_LIFECYCLE
+        );
 
         let pfilter: PopupFilter = Arc::new(|req| {
             assert_eq!(req.disposition, PopupDisposition::NewForegroundTab);

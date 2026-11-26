@@ -339,14 +339,9 @@ fn invoke_slot<V: 'static, T>(
 
 macro_rules! dispatch_to {
     ($view:expr, $payload:expr, $window:expr, $cx:expr, $callbacks_mut:expr, $field:ident) => {
-        invoke_slot(
-            $view,
-            $payload,
-            $window,
-            $cx,
-            $callbacks_mut,
-            |c| &mut c.$field,
-        )
+        invoke_slot($view, $payload, $window, $cx, $callbacks_mut, |c| {
+            &mut c.$field
+        })
     };
 }
 
@@ -358,8 +353,12 @@ pub(crate) fn dispatch_single_view_event<V: 'static>(
     callbacks_mut: fn(&mut V) -> &mut BrowserViewCallbacks<V>,
 ) {
     match event {
-        BrowserEvent::Created => dispatch_to!(view, (), window, cx, callbacks_mut, on_browser_created),
-        BrowserEvent::Closed => dispatch_to!(view, (), window, cx, callbacks_mut, on_browser_closed),
+        BrowserEvent::Created => {
+            dispatch_to!(view, (), window, cx, callbacks_mut, on_browser_created)
+        }
+        BrowserEvent::Closed => {
+            dispatch_to!(view, (), window, cx, callbacks_mut, on_browser_closed)
+        }
         BrowserEvent::CreateFailed(err) => {
             dispatch_to!(view, err, window, cx, callbacks_mut, on_create_failed)
         }
@@ -485,7 +484,14 @@ pub(crate) fn dispatch_single_view_event<V: 'static>(
             dispatch_to!(view, text, window, cx, callbacks_mut, on_status_message)
         }
         BrowserEvent::FaviconUrlsChanged(urls) => {
-            dispatch_to!(view, urls, window, cx, callbacks_mut, on_favicon_urls_changed)
+            dispatch_to!(
+                view,
+                urls,
+                window,
+                cx,
+                callbacks_mut,
+                on_favicon_urls_changed
+            )
         }
         BrowserEvent::FullscreenModeChanged(fullscreen) => dispatch_to!(
             view,
@@ -548,7 +554,14 @@ pub(crate) fn dispatch_single_view_event<V: 'static>(
             on_zoom_level_changed
         ),
         BrowserEvent::AudioMutedChanged(muted) => {
-            dispatch_to!(view, muted, window, cx, callbacks_mut, on_audio_muted_changed)
+            dispatch_to!(
+                view,
+                muted,
+                window,
+                cx,
+                callbacks_mut,
+                on_audio_muted_changed
+            )
         }
         BrowserEvent::DraggableRegionsChanged(regions) => dispatch_to!(
             view,
@@ -620,7 +633,14 @@ pub(crate) fn dispatch_single_view_event<V: 'static>(
             on_context_released
         ),
         BrowserEvent::FocusedNodeChanged(node) => {
-            dispatch_to!(view, node, window, cx, callbacks_mut, on_focused_node_changed)
+            dispatch_to!(
+                view,
+                node,
+                window,
+                cx,
+                callbacks_mut,
+                on_focused_node_changed
+            )
         }
         BrowserEvent::UncaughtJsException(info) => {
             dispatch_to!(view, info, window, cx, callbacks_mut, on_uncaught_exception)
@@ -701,8 +721,7 @@ macro_rules! impl_view_callback_setter {
 macro_rules! impl_view_surface_api {
     () => {
         pub fn is_browser_initialized(&self) -> bool {
-            self.handle().snapshot().state
-                == rust_cef_core::contracts::SessionState::Alive
+            self.handle().snapshot().state == rust_cef_core::contracts::SessionState::Alive
         }
 
         pub fn address(&self) -> &str {
@@ -733,9 +752,7 @@ macro_rules! impl_view_surface_api {
             self.ux.last_main_frame_error
         }
 
-        pub fn draggable_regions(
-            &self,
-        ) -> &[rust_cef_core::contracts::DraggableRegionRect] {
+        pub fn draggable_regions(&self) -> &[rust_cef_core::contracts::DraggableRegionRect] {
             &self.ux.draggable_regions
         }
 
@@ -811,10 +828,7 @@ macro_rules! impl_view_surface_api {
                 .map_err(ViewError::Input)
         }
 
-        pub fn set_popup_policy(
-            &mut self,
-            policy: rust_cef_core::host_capabilities::PopupPolicy,
-        ) {
+        pub fn set_popup_policy(&mut self, policy: rust_cef_core::host_capabilities::PopupPolicy) {
             self.handle().set_popup_policy(policy);
         }
 
@@ -937,8 +951,16 @@ macro_rules! impl_view_surface_api {
             on_document_available_in_main_frame,
             ()
         );
-        $crate::events::impl_view_callback_setter!(set_on_tooltip_changed, on_tooltip_changed, String);
-        $crate::events::impl_view_callback_setter!(set_on_status_message, on_status_message, String);
+        $crate::events::impl_view_callback_setter!(
+            set_on_tooltip_changed,
+            on_tooltip_changed,
+            String
+        );
+        $crate::events::impl_view_callback_setter!(
+            set_on_status_message,
+            on_status_message,
+            String
+        );
         $crate::events::impl_view_callback_setter!(
             set_on_favicon_urls_changed,
             on_favicon_urls_changed,
@@ -969,7 +991,11 @@ macro_rules! impl_view_surface_api {
             on_media_access_changed,
             $crate::events::MediaAccessInfo
         );
-        $crate::events::impl_view_callback_setter!(set_on_zoom_level_changed, on_zoom_level_changed, f64);
+        $crate::events::impl_view_callback_setter!(
+            set_on_zoom_level_changed,
+            on_zoom_level_changed,
+            f64
+        );
         $crate::events::impl_view_callback_setter!(
             set_on_audio_muted_changed,
             on_audio_muted_changed,
@@ -1030,7 +1056,11 @@ macro_rules! impl_view_surface_api {
             on_resource_load_complete,
             rust_cef_core::contracts::ResourceLoadCompleteInfo
         );
-        $crate::events::impl_view_callback_setter!(set_on_render_view_ready, on_render_view_ready, ());
+        $crate::events::impl_view_callback_setter!(
+            set_on_render_view_ready,
+            on_render_view_ready,
+            ()
+        );
         $crate::events::impl_view_callback_setter!(
             set_on_renderer_terminated,
             on_renderer_terminated,
@@ -1062,23 +1092,41 @@ mod tests {
         let mut callbacks = BrowserViewCallbacks::<DummyView>::default();
         assert_eq!(callbacks.extended_event_mask(), 0);
 
-        callbacks.on_tooltip_changed.set(Some(Box::new(|_, _, _, _| {})));
+        callbacks
+            .on_tooltip_changed
+            .set(Some(Box::new(|_, _, _, _| {})));
         assert_eq!(callbacks.extended_event_mask(), EXT_EVENT_TOOLTIP);
 
-        callbacks.on_console_message.set(Some(Box::new(|_, _, _, _| {})));
-        callbacks.on_auto_resize.set(Some(Box::new(|_, _, _, _| {})));
-        callbacks.on_media_access_changed.set(Some(Box::new(|_, _, _, _| {})));
+        callbacks
+            .on_console_message
+            .set(Some(Box::new(|_, _, _, _| {})));
+        callbacks
+            .on_auto_resize
+            .set(Some(Box::new(|_, _, _, _| {})));
+        callbacks
+            .on_media_access_changed
+            .set(Some(Box::new(|_, _, _, _| {})));
         callbacks
             .on_document_available_in_main_frame
             .set(Some(Box::new(|_, _, _, _| {})));
         callbacks
             .on_draggable_regions_changed
             .set(Some(Box::new(|_, _, _, _| {})));
-        callbacks.on_frame_created.set(Some(Box::new(|_, _, _, _| {})));
-        callbacks.on_context_created.set(Some(Box::new(|_, _, _, _| {})));
-        callbacks.on_focused_node_changed.set(Some(Box::new(|_, _, _, _| {})));
-        callbacks.on_uncaught_exception.set(Some(Box::new(|_, _, _, _| {})));
-        callbacks.on_resource_response.set(Some(Box::new(|_, _, _, _| {})));
+        callbacks
+            .on_frame_created
+            .set(Some(Box::new(|_, _, _, _| {})));
+        callbacks
+            .on_context_created
+            .set(Some(Box::new(|_, _, _, _| {})));
+        callbacks
+            .on_focused_node_changed
+            .set(Some(Box::new(|_, _, _, _| {})));
+        callbacks
+            .on_uncaught_exception
+            .set(Some(Box::new(|_, _, _, _| {})));
+        callbacks
+            .on_resource_response
+            .set(Some(Box::new(|_, _, _, _| {})));
 
         let expected = EXT_EVENT_TOOLTIP
             | EXT_EVENT_CONSOLE
@@ -1094,7 +1142,9 @@ mod tests {
         assert_eq!(callbacks.extended_event_mask(), expected);
 
         callbacks.on_frame_created.set(None);
-        callbacks.on_frame_detached.set(Some(Box::new(|_, _, _, _| {})));
+        callbacks
+            .on_frame_detached
+            .set(Some(Box::new(|_, _, _, _| {})));
         assert_ne!(
             callbacks.extended_event_mask() & EXT_EVENT_FRAME_LIFECYCLE,
             0

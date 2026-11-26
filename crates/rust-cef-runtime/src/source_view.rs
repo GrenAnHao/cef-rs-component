@@ -15,10 +15,68 @@ use std::{
 };
 type Status = Arc<Mutex<SourceOperationStatus>>;
 #[derive(Clone)]
-struct Data {
-    scope: Arc<Scope>,
-    sink: Arc<dyn SourceViewSink>,
-    status: Status,
+pub(crate) enum SourceScope {
+    Menu(Arc<Scope>),
+    HostMenu(Arc<Scope>),
+    HostDirect {
+        browser: BrowserId,
+        context: Arc<rust_cef_core::menu_context::MenuContext>,
+        registry: Weak<UiRegistry>,
+    },
+}
+impl SourceScope {
+    pub(crate) fn serial(&self) -> Option<u64> {
+        match self {
+            Self::Menu(s) | Self::HostMenu(s) => Some(s.serial),
+            Self::HostDirect { .. } => None,
+        }
+    }
+    pub(crate) fn context(&self) -> &Arc<rust_cef_core::menu_context::MenuContext> {
+        match self {
+            Self::Menu(s) | Self::HostMenu(s) => &s.context,
+            Self::HostDirect { context, .. } => context,
+        }
+    }
+    pub(crate) fn registry(&self) -> &Weak<UiRegistry> {
+        match self {
+            Self::Menu(s) | Self::HostMenu(s) => &s.registry,
+            Self::HostDirect { registry, .. } => registry,
+        }
+    }
+    pub(crate) fn current(&self) -> bool {
+        match self {
+            Self::Menu(s) => s.current(),
+            Self::HostMenu(s) => s
+                .registry
+                .upgrade()
+                .is_some_and(|r| r.host_menu_scope_alive(s)),
+            Self::HostDirect {
+                browser, registry, ..
+            } => registry
+                .upgrade()
+                .is_some_and(|r| r.host_direct_source_alive(*browser)),
+        }
+    }
+    pub(crate) fn operation_alive(&self) -> bool {
+        match self {
+            Self::Menu(s) => s.operation_alive(),
+            Self::HostMenu(s) => s
+                .registry
+                .upgrade()
+                .is_some_and(|r| r.host_menu_scope_alive(s)),
+            Self::HostDirect {
+                browser, registry, ..
+            } => registry
+                .upgrade()
+                .is_some_and(|r| r.host_direct_source_alive(*browser)),
+        }
+    }
+}
+#[derive(Clone)]
+pub(crate) struct Data {
+    pub(crate) scope: SourceScope,
+    pub(crate) sink: Arc<dyn SourceViewSink>,
+    pub(crate) status: Status,
 }
 struct Row {
     data: Data,
@@ -189,6 +247,15 @@ impl SourceViews {
     pub fn configured(&self) -> bool {
         self.lock().limits.is_some()
     }
+    pub(crate) fn max_source_bytes(&self) -> Option<usize> {
+        self.lock().limits.map(|l| l.max_source_bytes.get())
+    }
+    pub(crate) fn is_cancelled(&self, id: SourceOperationId) -> bool {
+        self.lock()
+            .rows
+            .get(&id)
+            .is_none_or(|r| status(&r.data.status).cancelled)
+    }
     pub fn pending(&self) -> u64 {
         let s = self.lock();
         s.rows.len() as u64 + u64::from(s.faulted)
@@ -215,6 +282,14 @@ impl SourceViews {
         self: &Arc<Self>,
         menu: ContextMenuRequestId,
         scope: &Arc<Scope>,
+        sink: &Arc<dyn SourceViewSink>,
+    ) -> Result<(SourceOperationId, usize), EngineError> {
+        self.begin_host(menu, SourceScope::Menu(scope.clone()), sink)
+    }
+    pub(crate) fn begin_host(
+        self: &Arc<Self>,
+        menu: ContextMenuRequestId,
+        scope: SourceScope,
         sink: &Arc<dyn SourceViewSink>,
     ) -> Result<(SourceOperationId, usize), EngineError> {
         let mut s = self.lock();
@@ -247,7 +322,7 @@ impl SourceViews {
             id,
             Row {
                 data: Data {
-                    scope: scope.clone(),
+                    scope,
                     sink: sink.clone(),
                     status: shared,
                 },
@@ -257,7 +332,19 @@ impl SourceViews {
         s.started += 1;
         Ok((id, limits.max_source_bytes.get()))
     }
-    fn data(&self, id: SourceOperationId) -> Option<Data> {
+    pub(crate) fn abort_unstarted(&self, id: SourceOperationId) {
+        let old = {
+            let mut s = self.lock();
+            if let Some(row) = s.rows.remove(&id) {
+                s.started = s.started.saturating_sub(1);
+                Some(row)
+            } else {
+                None
+            }
+        };
+        drop(old);
+    }
+    pub(crate) fn data(&self, id: SourceOperationId) -> Option<Data> {
         self.lock().rows.get(&id).map(|r| r.data.clone())
     }
     fn failure_locked(s: &mut State, id: SourceOperationId, e: SourceFailure) {
@@ -334,7 +421,7 @@ impl SourceViews {
         }
         accepted
     }
-    fn unissued(&self, id: SourceOperationId) {
+    pub(crate) fn unissued(&self, id: SourceOperationId) {
         let old = {
             let mut s = self.lock();
             if let Some(r) = s.rows.get(&id) {
@@ -366,7 +453,7 @@ impl SourceViews {
         };
         drop(old);
     }
-    fn begin_publish(&self, id: SourceOperationId, bytes: usize) -> Option<Data> {
+    pub(crate) fn begin_publish(&self, id: SourceOperationId, bytes: usize) -> Option<Data> {
         let s = self.lock();
         let r = s.rows.get(&id)?;
         let mut q = r.data.status.lock().unwrap_or_else(|e| e.into_inner());
@@ -378,7 +465,11 @@ impl SourceViews {
         q.host_live = true;
         Some(r.data.clone())
     }
-    fn control(self: &Arc<Self>, id: SourceOperationId, data: &Data) -> Arc<dyn SourceViewControl> {
+    pub(crate) fn control(
+        self: &Arc<Self>,
+        id: SourceOperationId,
+        data: &Data,
+    ) -> Arc<dyn SourceViewControl> {
         Arc::new(Control {
             id,
             book: Arc::downgrade(self),
@@ -411,7 +502,7 @@ impl SourceViews {
                 .iter()
                 .filter(|(id, r)| {
                     browser.is_none_or(|b| id.browser == b)
-                        && serial.is_none_or(|n| r.data.scope.serial == n)
+                        && serial.is_none_or(|n| r.data.scope.serial() == Some(n))
                         && only.is_none_or(|n| **id == n)
                 })
                 .map(|(id, _)| *id)
@@ -442,7 +533,7 @@ impl SourceViews {
                 self.data_failure(id, &d, SourceFailure::Close(e.clone()));
                 error.get_or_insert(e);
             }
-            if let Some(registry) = d.scope.registry.upgrade() {
+            if let Some(registry) = d.scope.registry().upgrade() {
                 if let Err(e) = registry.menu_wake() {
                     self.data_failure(id, &d, SourceFailure::Wake(e.clone()));
                     error.get_or_insert(e);
@@ -654,6 +745,29 @@ impl UiRegistry {
         drop(visitor);
         Ok(id)
     }
+    pub(crate) fn issue_host_visitor(
+        &self,
+        id: SourceOperationId,
+        limit: usize,
+        registry: Weak<UiRegistry>,
+        frame: &Frame,
+    ) {
+        let field = VisitorField(Arc::new(VisitorLife {
+            book: self.sources.clone(),
+            registry,
+            id,
+            limit,
+            ui: std::thread::current().id(),
+            fields: AtomicUsize::new(1),
+        }));
+        let mut visitor = SourceVisitor::new(field);
+        self.menu_audit().record();
+        frame.source(Some(&mut visitor));
+        #[cfg(feature = "test-support")]
+        self.sources.drop_or_hold_visitor(id, visitor);
+        #[cfg(not(feature = "test-support"))]
+        drop(visitor);
+    }
     pub(crate) fn deliver_source(
         &self,
         id: SourceOperationId,
@@ -668,18 +782,47 @@ impl UiRegistry {
             return;
         }
         let source = result.unwrap();
-        let permit = if data.scope.admission() {
-            data.scope.lease.try_enter(&data.scope.stamp).ok()
-        } else {
-            None
+        let (permit, pair, current) = match &data.scope {
+            SourceScope::Menu(scope) => {
+                let permit = if scope.admission() {
+                    scope.lease.try_enter(&scope.stamp).ok()
+                } else {
+                    None
+                };
+                let pair = permit
+                    .as_ref()
+                    .and_then(|_| self.menu_original_frame(scope));
+                let current = !self.is_draining() && scope.current();
+                (permit, pair, current)
+            }
+            SourceScope::HostMenu(scope) => {
+                let alive = self.host_menu_scope_alive(scope);
+                let permit = if alive {
+                    scope.lease.try_enter(&scope.stamp).ok()
+                } else {
+                    None
+                };
+                let pair = permit
+                    .as_ref()
+                    .and_then(|_| self.host_browser_main_frame(id.browser));
+                let current = !self.is_draining() && alive;
+                (permit, pair, current)
+            }
+            SourceScope::HostDirect { browser, .. } => {
+                let alive = self.host_direct_source_alive(*browser);
+                let pair = if alive {
+                    self.host_browser_main_frame(*browser)
+                } else {
+                    None
+                };
+                let current = !self.is_draining() && alive;
+                (None, pair, current)
+            }
         };
-        let pair = permit
-            .as_ref()
-            .and_then(|_| self.menu_original_frame(&data.scope));
-        if pair.is_none() || self.is_draining() || !data.scope.current() {
+        if pair.is_none() || !current {
             let _ = self
                 .sources
-                .cancel(Some(id.browser), Some(data.scope.serial), Some(id));
+                .cancel(Some(id.browser), data.scope.serial(), Some(id));
             return;
         }
         let Some(data) = self.sources.begin_publish(id, source.len()) else {
@@ -688,7 +831,7 @@ impl UiRegistry {
         let request = SourceViewRequest {
             operation: id,
             menu: status(&data.status).menu,
-            context: data.scope.context.clone(),
+            context: data.scope.context().clone(),
             source,
         };
         let control = self.sources.control(id, &data);
@@ -704,7 +847,7 @@ impl UiRegistry {
         if !data.scope.operation_alive() {
             let _ = self
                 .sources
-                .cancel(Some(id.browser), Some(data.scope.serial), Some(id));
+                .cancel(Some(id.browser), data.scope.serial(), Some(id));
         }
         drop(permit);
         drop(pair);

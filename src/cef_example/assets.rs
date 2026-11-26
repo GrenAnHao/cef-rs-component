@@ -28,11 +28,13 @@ pub const BINDING_TEST_URL: &str = "https://cef-rs-gpui.example/BindingTestNetCo
 pub const BINDING_TEST_ALL_URL: &str = "https://cef-rs-gpui.example/BindingTest.html";
 pub const BINDING_TEST_SINGLE_URL: &str = "https://cef-rs-gpui.example/BindingTestSingle.html";
 pub const LEGACY_BINDING_TEST_URL: &str = "https://cef-rs-gpui.example/LegacyBindingTest.html";
-pub const BINDING_TESTS_ASYNC_TASK_URL: &str = "https://cef-rs-gpui.example/BindingTestsAsyncTask.html";
+pub const BINDING_TESTS_ASYNC_TASK_URL: &str =
+    "https://cef-rs-gpui.example/BindingTestsAsyncTask.html";
 pub const POST_MESSAGE_TEST_URL: &str = "https://cef-rs-gpui.example/PostMessageTest.html";
 pub const TOOLTIP_TEST_URL: &str = "https://cef-rs-gpui.example/TooltipTest.html";
 pub const DRAG_DROP_CURSORS_TEST_URL: &str = "https://cef-rs-gpui.example/DragDropCursorsTest.html";
-pub const POPUP_PARENT_URL: &str = "http://www.w3schools.com/jsref/tryit.asp?filename=tryjsref_win_close";
+pub const POPUP_PARENT_URL: &str =
+    "http://www.w3schools.com/jsref/tryit.asp?filename=tryjsref_win_close";
 pub const POPUP_TEST_URL: &str = "https://cef-rs-gpui.example/PopupTest.html";
 pub const BASIC_SCHEME_TEST_URL: &str = "https://cef-rs-gpui.example/SchemeTest.html";
 pub const SCHEME_TEST_URL: &str = "custom://cef-rs-gpui/SchemeTest.html";
@@ -50,6 +52,8 @@ pub const CUSTOM_POST_URL: &str = "https://cef-rs-gpui.com/PostDataTest.html";
 #[allow(dead_code)]
 pub const DIAGNOSTICS_URL: &str = "custom://cef-rs-gpui/diagnostics.html";
 pub const BENCHMARK_SUITE_URL: &str = "https://cef-rs-gpui.example/BenchmarkSuite.html";
+pub const DESKTOP_UX_FIXTURES_URL: &str = "https://cef-rs-gpui.example/DesktopUxFixtures.html";
+pub const BEFORE_UNLOAD_TEST_URL: &str = "https://cef-rs-gpui.example/BeforeUnloadTest.html";
 pub const CHROME_INTERNAL_URLS: &str = "chrome://chrome-urls";
 pub const CHROME_NET_INTERNAL_URLS: &str = "chrome://net-internals";
 pub const CHROME_PROCESS_INTERNAL_URLS: &str = "chrome://process-internals";
@@ -75,16 +79,64 @@ const POPUP_TEST_HTML: &[u8] = include_bytes!("test_resources/PopupTest.html");
 const MULTI_BINDING_TEST_HTML: &[u8] = include_bytes!("test_resources/MultiBindingTest.html");
 const HELLO_WORLD_HTML: &[u8] = include_bytes!("test_resources/HelloWorld.html");
 const SCHEME_TEST_HTML: &[u8] = include_bytes!("test_resources/SchemeTest.html");
-const RESPONSE_FILTER_RAW_HTML: &[u8] =
-    include_bytes!("test_resources/ResponseFilterTest.html");
-const DRAGGABLE_REGION_TEST_HTML: &[u8] =
-    include_bytes!("test_resources/DraggableRegionTest.html");
+const RESPONSE_FILTER_RAW_HTML: &[u8] = include_bytes!("test_resources/ResponseFilterTest.html");
+const DRAGGABLE_REGION_TEST_HTML: &[u8] = include_bytes!("test_resources/DraggableRegionTest.html");
 const CDM_SUPPORT_TEST_HTML: &[u8] = include_bytes!("test_resources/CdmSupportTest.html");
 const EXCEPTION_TEST_HTML: &[u8] = include_bytes!("test_resources/ExceptionTest.html");
 const BINDING_API_CUSTOM_OBJECT_NAME_TEST_HTML: &[u8] =
     include_bytes!("test_resources/BindingApiCustomObjectNameTest.html");
 const JAVASCRIPT_CALLBACK_TEST_HTML: &[u8] =
     include_bytes!("test_resources/JavascriptCallbackTest.html");
+
+const DESKTOP_UX_FIXTURES_HTML: &[u8] = br##"<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Desktop UX Test Fixtures</title>
+</head>
+<body>
+  <h1>Desktop UX Test Fixtures</h1>
+  <section id="find-section">
+    <p>SEARCH_TOKEN_ALPHA appears first here.</p>
+    <p>SEARCH_TOKEN_ALPHA appears second here.</p>
+    <p>Search_Token_Case tests match-case sensitivity alongside FIND_ME_TARGET.</p>
+  </section>
+  <section id="source-marker">desktop-ux-source-ok</section>
+  <section id="file-section">
+    <input id="upload-input" type="file" />
+    <input id="upload-multi" type="file" multiple />
+  </section>
+  <section id="permission-section">
+    <button id="perm-media-btn" onclick="if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) { navigator.mediaDevices.getUserMedia({ audio: true }).then(() => { document.getElementById('perm-out').textContent = 'allowed'; }).catch(() => { document.getElementById('perm-out').textContent = 'denied'; }); } else { document.getElementById('perm-out').textContent = 'unavailable'; }">Request Microphone</button>
+    <span id="perm-out">idle</span>
+  </section>
+  <section id="download-section">
+    <a id="dl-link" href="https://cef-rs-gpui.example/download/sample-report.txt">Download Sample Report</a>
+  </section>
+</body>
+</html>"##;
+
+const BEFORE_UNLOAD_TEST_HTML: &[u8] = br##"<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>BeforeUnload Confirmation Fixture</title>
+</head>
+<body>
+  <h1>BeforeUnload Confirmation Fixture</h1>
+  <p id="status">Armed</p>
+  <script>
+    window.__armBeforeUnload = true;
+    window.addEventListener('beforeunload', function (e) {
+      if (window.__armBeforeUnload !== false) {
+        e.preventDefault();
+        e.returnValue = '';
+        return '';
+      }
+    });
+  </script>
+</body>
+</html>"##;
 
 static RESPONSE_FILTER_HTML: OnceLock<Vec<u8>> = OnceLock::new();
 
@@ -390,8 +442,6 @@ const BENCHMARK_SUITE_HTML: &[u8] = br##"<!DOCTYPE html>
 </html>
 "##;
 
-
-
 const DIAGNOSTICS_HTML: &[u8] = br##"<!DOCTYPE html>
 <html lang="en">
 <head><meta charset="utf-8" /><title>Runtime Diagnostics &middot; GpuiCef</title></head>
@@ -421,7 +471,8 @@ const DIAGNOSTICS_HTML: &[u8] = br##"<!DOCTYPE html>
 </html>
 "##;
 
-const SAMPLE_DOWNLOAD_BYTES: &[u8] = b"GpuiCef.Example\r\nSample download artifact delivered via ResourceInterceptor.\r\n";
+const SAMPLE_DOWNLOAD_BYTES: &[u8] =
+    b"GpuiCef.Example\r\nSample download artifact delivered via ResourceInterceptor.\r\n";
 
 const EDITORCONFIG_TEXT: &[u8] = b"# editorconfig.org\r\nroot = true\r\n\r\n[*]\r\ninsert_final_newline = true\r\nindent_style = space\r\nindent_size = 4\r\ncharset = utf-8\r\nend_of_line = crlf\r\ntrim_trailing_whitespace = true\r\n\r\n[*.ps1]\r\ncharset = utf-8-bom\r\n\r\n[*.rs]\r\nindent_size = 4\r\n\r\n[*.js]\r\nindent_size = 4\r\n";
 
@@ -446,7 +497,12 @@ fn lookup_asset(raw_path: &str) -> Option<ResolvedAsset> {
     } else if normalized.eq_ignore_ascii_case("/assets/docs.css") {
         (200, "text/css", Vec::new(), DOCS_CSS.as_bytes().to_vec())
     } else if normalized.eq_ignore_ascii_case("/assets/js/jquery.js") {
-        (200, "application/javascript", Vec::new(), JQUERY_JS.to_vec())
+        (
+            200,
+            "application/javascript",
+            Vec::new(),
+            JQUERY_JS.to_vec(),
+        )
     } else if normalized.eq_ignore_ascii_case("/BindingTest.html") {
         (200, "text/html", Vec::new(), BINDING_TEST_HTML.to_vec())
     } else if normalized.eq_ignore_ascii_case("/BindingTestNetCore.html") {
@@ -556,15 +612,24 @@ fn lookup_asset(raw_path: &str) -> Option<ResolvedAsset> {
         )
     } else if normalized.eq_ignore_ascii_case("/BenchmarkSuite.html") {
         (200, "text/html", Vec::new(), BENCHMARK_SUITE_HTML.to_vec())
+    } else if normalized.eq_ignore_ascii_case("/DesktopUxFixtures.html") {
+        (
+            200,
+            "text/html",
+            Vec::new(),
+            DESKTOP_UX_FIXTURES_HTML.to_vec(),
+        )
+    } else if normalized.eq_ignore_ascii_case("/BeforeUnloadTest.html") {
+        (
+            200,
+            "text/html",
+            Vec::new(),
+            BEFORE_UNLOAD_TEST_HTML.to_vec(),
+        )
     } else if normalized.eq_ignore_ascii_case("/diagnostics.html") {
         (200, "text/html", Vec::new(), DIAGNOSTICS_HTML.to_vec())
     } else if normalized.eq_ignore_ascii_case("/.editorconfig") {
-        (
-            200,
-            "text/plain",
-            Vec::new(),
-            EDITORCONFIG_TEXT.to_vec(),
-        )
+        (200, "text/plain", Vec::new(), EDITORCONFIG_TEXT.to_vec())
     } else if normalized.eq_ignore_ascii_case("/download/sample-report.txt") {
         (
             200,
@@ -614,6 +679,8 @@ fn memory_assets_map() -> BTreeMap<String, MemoryAsset> {
         "HelloWorld.html",
         "ResponseFilterTest.html",
         "BenchmarkSuite.html",
+        "DesktopUxFixtures.html",
+        "BeforeUnloadTest.html",
         "diagnostics.html",
         ".editorconfig",
         "download/sample-report.txt",
@@ -805,7 +872,10 @@ impl ResourceInterceptor for ExampleResourceInterceptor {
             {
                 let cors_headers = vec![
                     ("Access-Control-Allow-Origin".into(), "*".into()),
-                    ("Access-Control-Allow-Methods".into(), "GET, POST, OPTIONS".into()),
+                    (
+                        "Access-Control-Allow-Methods".into(),
+                        "GET, POST, OPTIONS".into(),
+                    ),
                     ("Access-Control-Allow-Headers".into(), "*".into()),
                 ];
                 if request.method.eq_ignore_ascii_case("OPTIONS") {
@@ -843,7 +913,10 @@ impl ResourceInterceptor for ExampleResourceInterceptor {
 
     fn response_filter(&self, info: &ResourceResponseInfo) -> Option<Box<dyn ResponseBodyFilter>> {
         let clean = info.url.split(['?', '#']).next().unwrap_or(&info.url);
-        if clean.to_ascii_lowercase().ends_with("/responsefiltertest.html") {
+        if clean
+            .to_ascii_lowercase()
+            .ends_with("/responsefiltertest.html")
+        {
             return Some(Box::new(FindReplaceResponseFilter::new(
                 RESPONSE_FILTER_NEEDLE,
                 RESPONSE_FILTER_REPLACEMENT,
@@ -962,7 +1035,10 @@ mod tests {
             } => {
                 assert_eq!(status_code, 200);
                 assert_eq!(mime_type, "text/html");
-                assert_eq!(String::from_utf8_lossy(&body), "Post Data: user=gpui&mode=custom");
+                assert_eq!(
+                    String::from_utf8_lossy(&body),
+                    "Post Data: user=gpui&mode=custom"
+                );
             }
             other => panic!("unexpected post response: {other:?}"),
         }
@@ -993,7 +1069,9 @@ mod tests {
             is_main_frame: true,
             post_body: None,
         });
-        assert!(matches!(empty_post, InterceptAction::Respond { status_code: 200, body, .. } if body == b"Post Data: null"));
+        assert!(
+            matches!(empty_post, InterceptAction::Respond { status_code: 200, body, .. } if body == b"Post Data: null")
+        );
 
         let bench_resp = interceptor.intercept(&InterceptRequest {
             url: BENCHMARK_SUITE_URL.into(),
@@ -1001,7 +1079,13 @@ mod tests {
             is_main_frame: true,
             post_body: None,
         });
-        assert!(matches!(bench_resp, InterceptAction::Respond { status_code: 200, .. }));
+        assert!(matches!(
+            bench_resp,
+            InterceptAction::Respond {
+                status_code: 200,
+                ..
+            }
+        ));
         let rf = interceptor.response_filter(&ResourceResponseInfo {
             url: RESPONSE_FILTER_TEST_URL.into(),
             method: "GET".into(),
@@ -1010,5 +1094,28 @@ mod tests {
             mime_type: "text/html".into(),
         });
         assert!(rf.is_some());
+
+        for (url, marker) in [
+            (DESKTOP_UX_FIXTURES_URL, "SEARCH_TOKEN_ALPHA"),
+            (BEFORE_UNLOAD_TEST_URL, "beforeunload"),
+        ] {
+            match interceptor.intercept(&InterceptRequest {
+                url: url.into(),
+                method: "GET".into(),
+                is_main_frame: true,
+                post_body: None,
+            }) {
+                InterceptAction::Respond {
+                    status_code: 200,
+                    mime_type,
+                    body,
+                    ..
+                } => {
+                    assert_eq!(mime_type, "text/html");
+                    assert!(String::from_utf8_lossy(&body).contains(marker));
+                }
+                other => panic!("unexpected fixture response for {url}: {other:?}"),
+            }
+        }
     }
 }

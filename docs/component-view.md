@@ -1,6 +1,6 @@
 # 公开 CefBrowser 接入与显式分发
 
-范围：Windows x64 MSVC、可信内容；`gpui-pre 0.3.12`、`gpui-component 0.9.1`、CEF `156.0.31` 与固定 `cef-rs v156.7.0+156.0.31` (`7b6bf84e76e919790bd61df077e29dc4132eb5e2`)。本文覆盖公开 VIEW/POPUP、完整左键点击前置、OSR CefSharp 对齐能力、显式 opt-in `NativeChildHwnd` 模式与显式分发；当前 `v0.1.0` 全量 CEF `156.0.31` 实证见 `r468`（历史 146 基线见 `r466`/`r467`），不是 Chrome 扩展或生产安全 sandbox 声明。
+范围：Windows x64 MSVC、可信内容；`gpui-pre 0.3.12`、`gpui-component 0.9.1`、CEF `156.0.31` 与固定 `cef-rs v156.7.0+156.0.31` (`7b6bf84e76e919790bd61df077e29dc4132eb5e2`)。本文保留深层视图接入契约、`NativeChildHwnd` 与历史阶段实证留档；简洁的外部 SDK 接入与示例上手请优先参阅 [SDK 接入指南](sdk-guide.md) 与 [桌面示例指南](desktop-example.md)。
 
 ## Win32 原生子 `HWND` 宿主模式与选型边界（Track B / `r467`）
 
@@ -21,7 +21,7 @@
 
 | 维度 | 默认 `BrowserSurfaceMode::Offscreen` (OSR) | opt-in `BrowserSurfaceMode::NativeChildHwnd` |
 | --- | --- | --- |
-| 渲染管线 | 软件位图 / D3D11 共享纹理 **GPU→CPU 回读**再绘入 GPUI `RenderImage` | Chromium 原生 `SetAsChild` **GPU SwapChain 零拷贝**直接合成到子 `HWND` |
+| 渲染管线 | `D3d11Required` 共享纹理（4 槽 SRV 直绘 GPUI `DirectXRenderer`，无逐帧 CPU 回读；支持 `SoftwareRequired` 回退与截图按需读回） | Chromium 原生 `SetAsChild` **GPU SwapChain 零拷贝**直接合成到子 `HWND` |
 | **GPUI 浮层与 UI 叠加** | **完整可控**：GPUI 弹窗、Toast、悬浮工具栏、圆角裁剪、`Overlay` 可自由盖在网页之上 | **Win32 子 `HWND` airspace 限制**：GPUI 绘制内容**无法**叠在原生子窗口上方；工具栏/标签栏/状态栏必须位于不重叠的 Dock 布局区 |
 | 输入法 / 触控 / 外拖 / 无障碍 | 由组件显式桥接（IMM32+1x1 caret、`NativeTouchServices`、`OutboundDragPolicy::AllowAsync`、`accesskit` UIA） | 由 Chromium 原生子窗口直接提供原生 IME、原生多点触控、原生拼写/OLE 拖放与原生 Windows UIA 树 |
 | 多标签切换 | GPUI `Entity` 正常按条件渲染即可 | 切走非激活标签时必须由 `NativeCefBrowser` / 宿主显式 `SetVisible(false)`（`SW_HIDE` + `0x0`），否则后台 `HWND` 会覆盖当前激活标签 |
@@ -674,3 +674,61 @@ pwsh -NoProfile -File scripts/test-component-host.ps1 -Scenario Popup `
 四次失败原件保留：外部窗口遮挡（并发现GPUI激活API隐式ALT风险）、自有两窗完全重叠时帧期限、客户区物理坐标误与viewDIP比较、普通前台请求未确认成功；用户随后选择短暂停用桌面后四格通过，不放宽像素/输入/退出门。stderr的Chrome扩展注册表/USB错误原样保留，不宣称零错误。
 
 全部实际窗口当前均96DPI/100%；每窗独立实际bounds/scale及wrong-window拒绝、精确scale metadata回归证明接线不串用，不把这些扩大为物理异DPI/跨屏试验。完整11.1输入/捕获、11.2中文IME、11.3真实缩放/resize/失焦矩阵、菜单/拖入及G3/G4/完整Goal仍待各自验收。截图与离散遮挡观测非原子，不证明所有透明覆盖隔离或截图alpha，也不补造原生callback epoch。
+
+## 公开 JS Object Repository SDK 与异步/截图 API
+
+`rust_cef_gpui` 公开导出 [`js_repository`](../crates/rust-cef-gpui/src/js_repository.rs) 与 [`async_ops`](../crates/rust-cef-gpui/src/async_ops.rs)，使业务宿主无需直接接触底层 CEF 指针或依赖外部 JSON/Base64 crate 即可完成双向对象绑定与页面求值/截图：
+
+### 1. JS Object Repository (`rust_cef_gpui::js_repository`)
+
+- **核心类型**：`JsObjectRepository`、`JsBindingSettings`、`JsBindingOptions`、`JsNameConverter`、`BoundObject`、`BoundProperty`、`JsValue`、`JsDate`、`JsCallbackHandle`、`CallbackReplyKind`、`PostMessageEvent`，以及无外部依赖的有界 RFC-8259 JSON 解析/编码器 `JsonVal` / `JsonParser` / `parse_json`。
+- **可配置全局命名与风格**：通过 `JsBindingSettings::global_object_name` 与 `JsRepositoryMethodStyle`（`AutoByGlobalName` / `CamelCase` / `PascalCase`）调用 `repo.apply_to_runtime(&runtime)`（即 `Runtime::set_js_repository_settings`）在渲染进程暴露自定义全局对象；未显式覆盖时保留默认兼容别名（`window['cef-rs-gpui']` / `window.CefRsGpui` / `window.cefRsGpui`）。
+- **完整生命周期与回调清理**：支持 `BindObjectAsync`（含 `NotifyIfAlreadyBound` / `IgnoreCache`）、`DeleteBoundObject`、`IsObjectCached`、`RemoveObjectFromCache`、`PostMessage`、延迟 `ResolveObject`、`ObjectBoundInJavascript` / `ObjectsBoundInJavascript` 通知、`__cefCbId` / `cbResult` JS 回调及 `__cefDateMs` / `__cefLocalDate` 日期往返，并在 `purge_browser` / `purge_context` 时释放未完成状态。
+
+```rust,no_run
+use rust_cef_gpui::{
+    BoundObject, JsBindingSettings, JsObjectRepository, JsValue, Runtime, ports::EngineError,
+};
+
+fn configure_js_bridge(runtime: &Runtime) -> Result<JsObjectRepository, EngineError> {
+    let mut repo = JsObjectRepository::new(JsBindingSettings {
+        global_object_name: Some("myAppBridge".into()),
+        legacy_binding_enabled: true,
+        ..Default::default()
+    });
+    repo.register(
+        BoundObject::new("appService")
+            .with_property("version", "1.0.0", true)
+            .with_method("ping", |_ctx, args| {
+                let msg = args.first().and_then(JsValue::as_str).unwrap_or("pong");
+                Ok(JsValue::from(format!("echo:{msg}")))
+            }),
+    );
+    repo.apply_to_runtime(runtime)?;
+    Ok(repo)
+}
+```
+
+### 2. 异步求值、源码/文本提取、初始加载等待与截图 (`CefBrowser` / `NativeCefBrowser`)
+
+`CefBrowser`（OSR）与 `NativeCefBrowser`（`NativeChildHwnd`）均提供一致的 `AsyncOpFuture<T>` 异步方法（均带显式 `timeout: Option<Duration>`，默认 `DEFAULT_ASYNC_OP_TIMEOUT = 30s`，队列上限 `MAX_PENDING_ASYNC_OPS = 64` / `MAX_PENDING_SCREENSHOTS = 16`，并在 View 退休或关闭时确定性取消）：
+
+| 方法 | 返回类型 | 说明与后端行为 |
+| --- | --- | --- |
+| `evaluate_script_async(script, frame_scope, timeout)` | `AsyncOpFuture<Option<String>>` | 提交至 `window.rustCef` 隔离求值通道并追踪超时与过期响应抑制 |
+| `get_source_async(frame_scope, timeout)` | `AsyncOpFuture<String>` | 经 `RuntimeBrowserBridge` 在 CEF UI 线程安全执行 `Frame::source` |
+| `get_text_async(frame_scope, timeout)` | `AsyncOpFuture<String>` | 经 `RuntimeBrowserBridge` 在 CEF UI 线程安全执行 `Frame::text` |
+| `wait_for_initial_load_async(timeout)` | `AsyncOpFuture<InitialLoadResult>` | 等待主帧 `LoadFinished`；主动忽略重定向/取消触发的 `ERR_ABORTED`（`-3`）与 `LoadCancelled` |
+| `capture_screenshot_bgra(timeout)` | `AsyncOpFuture<ScreenshotBgra>` | OSR 读取最新 `CpuBgra` 或经 `RuntimeBrowserBridge` 执行按需 D3D11 shared-texture staging 读回；`NativeCefBrowser` 经 CDP PNG 解码 |
+| `capture_screenshot_png(timeout)` | `AsyncOpFuture<Vec<u8>>` | OSR 经锁定的 `image` PNG 编码器压缩 BGRA；`NativeCefBrowser` 经瞬态 CDP `Page.captureScreenshot` 获取 PNG |
+
+- **CefSharp 帧作用域差异说明**：CefSharp `WebBrowserExtensions.cs:340,373` 中的无参 `GetSourceAsync` / `GetTextAsync` / `EvaluateScriptAsync` 默认作用于 `FocusedFrame`；本组件全部公开方法显式要求调用方传入 `JsFrameScope`（通常为 `JsFrameScope::MainFrame`），消除多 iframe 焦点漂移导致的误执行与策略歧义。
+- **`NativeCefBrowser` 截图 opt-in 前置条件**：`NativeCefBrowser::capture_screenshot_{bgra,png}` 复用受管无头 CDP（`Page.captureScreenshot`），要求创建 Browser 时在 `BrowserOptions` 中显式开启 `headless_cdp_enabled: true`。默认未开启时，两种方法均立即返回 `Err(AsyncOpError::CapabilityDisabled)`，并在完成、超时或关闭时自动在 CEF UI 线程注销瞬态 CDP observer，不污染宿主已注册的 `CdpObserver`。
+
+### 3. 宿主发起的 Find 与 View Source（`Runtime::find` / `stop_finding` / `view_source`）
+
+[`crates/rust-cef-runtime/src/host_find_source.rs`](../crates/rust-cef-runtime/src/host_find_source.rs) 为外部宿主和 `--context-menu false` / `NativeChildHwnd` 场景暴露直接的页面查找与查看源码入口：
+
+- **API 与接收器**：`Runtime::set_find_sink` / `Runtime::set_source_viewer` 注册直接接收器（若已挂载 OSR `ContextMenuRegistration` 则同步复用现有 `FindServices` / `SourceViewServices` 收件箱），由 `Runtime::find(browser, search_text, forward, match_case, find_next)`、`Runtime::stop_finding(browser, clear_selection)` 与 `Runtime::view_source(browser)` 驱动。
+- **有界严格串行不变量**：空字符串返回 `EngineError::InvalidRequest`；单 Browser 仅允许 1 个在途 `FindOperationId`，在途或隔离期间（`quarantined`）返回 `EngineError::Backpressure`；旧序号回调被丢弃，未知高 ID 触发浏览器级隔离，绝不把迟到回调误归属于新请求。
+- **CEF `156.0.31` 实证差异**：CEF `156.0.31` 的 `FindTabHelper::StartFinding` 在 `findNext = 0`（`false`）时固定回报 `active_ordinal == 0`（对应 CefSharp `CefBrowserHostWrapper.cpp:300-312` 原样透传差异）。`host_find_source.rs` 对宿主新查找先调用 `host.stop_finding(0)` 清空旧查找会话再以 `1` 触发首次 `find`，确保立即激活第 `1` 处匹配（`1 / N`）；右键菜单路径 `FindScope::Menu` 维持 `0`。同时 `TaskPayload::HostStopFinding` 携带 `cutoff_sequence`，避免 CEF UI 异步退场时误取消宿主侧紧接着新入队的 `host_find`。

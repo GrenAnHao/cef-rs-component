@@ -1,4 +1,4 @@
-# cef-rs-component
+# cef-rs-gpui
 
 面向 **Windows x64 MSVC** 的嵌入式 Chromium（**CEF `156.0.31`**）分层组件套件与 **GPUI**（`gpui-pre 0.3.12`）集成框架，对标 **CefSharp** 双后端形态，提供 **D3D11 共享纹理零拷贝离屏渲染（OSR）** 与可选的 **Win32 原生子窗口（`NativeChildHwnd` / Alloy `SetAsChild`）** 两种渲染后端。
 
@@ -47,12 +47,12 @@
 - **完整 Per-View 事件回调体系**（`crates/rust-cef-gpui/src/events.rs`）：`CefBrowser` 与 `NativeCefBrowser` 共享统一的加载生命周期（`LoadingStateChange`、`LoadStartInfo`、`LoadEndInfo`、`LoadErrorInfo`）、导航请求（`NavigationRequestEvent`）、标题/地址/状态/控制台（`ConsoleMessageInfo`）、Tooltip、光标变更、`-webkit-app-region` 拖拽区、Frame 与 V8 Context 生命周期（`FrameAttachedInfo`、`FrameDetachedInfo`、`MainFrameChangedInfo`、`V8ContextLifecycleInfo`）、未捕获 JS 异常、焦点 DOM 节点、`BeforeUnloadInfo`、`RendererTerminatedInfo`、`AutoResizeInfo`、`MediaAccessInfo` 与资源响应观测等逐视图回调。
 - **受管原生子弹窗（`PopupLedger` / `PopupClient`）**（`crates/rust-cef-runtime/src/popup_window.rs`）：支持策略受限的原生产生子窗口，受 `TrustedContentPolicy` 约束并在父 Browser 关闭或 Runtime 退出前自动回收。
 - **扩展 CEF Handler 与流式响应重写**：通过 `crates/rust-cef-runtime/src/client_handlers.rs` 提供 `DragHandler`、`FrameHandler` 与可选 `AudioHandler`；支持 `ResourceInterceptor`、`ResponseBodyFilter` 流式响应体替换、跨站 Site Isolation 安全的 `LoadUrlWithPostData` 以及 `ExecuteJavascript` / `EvaluateScript` 异步脚本求值。
-- **桌面交互与导航**：导航历史与加载进度、音频静音、快捷键拦截（`on_pre_key_event`）、Page Find 有界串行查找、View Source、系统标准光标（21 种）及 ≤256px 自定义位图光标（`OnCursorChange`）、多点触控（`BrowserTouchEvent` / `WM_POINTER*`）与触控板捏合缩放、`accesskit` UIA 无障碍树投影；并提供交互式 GPUI 文本输入组件（`src/cef_example/text_input.rs`，支持光标闪烁、聚焦动效、鼠标拖选与双三击选词、撤销/剪贴板及 Win32 IME `EntityInputHandler`），同时复用于 `gpui-cef-example` 与 `component-demo` 多标签壳。
+- **桌面交互与导航**：导航历史与加载进度、音频静音、快捷键拦截（`on_pre_key_event` + 跨 OSR / `NativeHwnd` 统一快捷键 `Ctrl+T` / `Ctrl+W` / `Ctrl+F` / `F3` / `Shift+F3` / `Ctrl+U` / `Esc`）、有界严格串行 Page Find（`Runtime::find` / `stop_finding` / `set_find_sink`）、View Source（`Runtime::view_source` / `set_source_viewer`）、系统标准光标（21 种）及 ≤256px 自定义位图光标（`OnCursorChange`）、多点触控（`BrowserTouchEvent` / `WM_POINTER*`）与触控板捏合缩放、`accesskit` UIA 无障碍树投影；并提供可复用交互式 GPUI 文本输入组件（`src/cef_example/text_input.rs`，支持光标、选区、双三击、撤销/剪贴板、Win32 IME `EntityInputHandler` 及掩码密码框）。
 - **原生拖放**：默认 `OutboundDragPolicy::Deny`；Opt-in `AllowAsync` 支持基于零新增依赖 COM 虚表的异步 OLE `DoDragDrop`（含虚拟图像拖出）；通过 `IDropTarget` + `IDropTargetHelper` 支持外部文件、URL、纯文本及 HTML 入站与页内拖放。
 - **安全边界与扩展能力**：
   - `TrustedContentPolicy`、`ResourceInterceptor`、受限 `app://` / `custom://` Scheme、opt-in `chrome://` 内部页导航（`set_allow_chrome_internal_urls`）、同进程子帧 V8 桥接（`set_js_bridge_allow_subframes`）、冻结只读 `window.rustCef` JS 桥接（256 KiB / 32 层深度边界）与 `window['cef-rs-gpui']` JS Object Repository（`BindObjectAsync`、`PostMessage`、`Date` / JS 回调往返与 Legacy/Sync/Async 绑定）；
-  - 可插拔宿主能力（下载管控、JS/文件对话框、权限请求、托管弹窗、禁用内置登录框的 HTTP 401 Basic Auth、TLS 证书确认）；
-  - `CookieManager`、`PrintConfirmation` / `PrintToPdf`、独立 `CefURLRequest`、默认关闭且受管释放的无头 CDP。
+  - 可插拔宿主能力（`DownloadService` 下载管控与禁区校验、原生 OS `FileDialogService` 文件上传/保存选择、内联 `JsDialogService`、`PermissionService` 权限弹窗、带 `RedactedSecret` 脱敏的 `AuthService` 401 基本认证弹窗、`CertificateService` 服务端/客户端证书确认、受管弹窗与两阶段 `BeforeUnload` 安全关闭）；
+  - `CookieManager`、`PrintConfirmation` / `PrintToPdf`、独立 `CefURLRequest`、默认关闭且受管释放的无头 CDP（以及按 `has_dev_tools()` 观测的离线 DevTools）。
 
 ---
 
@@ -82,11 +82,28 @@
 | [`crates/rust-cef-ui`](crates/rust-cef-ui) | UI 无关表面管线、原生窗口槽位与输入投影层 |
 | [`crates/rust-cef-gpui`](crates/rust-cef-gpui) | GPUI 视图集成层（`CefBrowser`、`NativeCefBrowser`、统一逐视图事件回调 `events.rs`、`UiComposition`、`DefaultMenuPresenter`） |
 | [`patches/gpui-pre`](patches/gpui-pre) / [`patches/gpui-pre-windows`](patches/gpui-pre-windows) | 本地 GPUI 补丁：外部 D3D11 SRV 表面直绘、`Angle` / `Opacity` / 采样模式、`FLIP_DISCARD`、帧延迟 `MaximumFrameLatency=1` 等 |
-| [`src/cef_example`](src/cef_example) / [`src/bin/cef-example.rs`](src/bin/cef-example.rs) | 全功能桌面浏览器示例（`gpui-cef-example`）：多标签、GPU 旋转/透明度/采样面板、JS 执行/求值与 JS Object Repository RPC（`window['cef-rs-gpui']`）、26 项 `Tests` 菜单（20 项功能/QUnit 对齐测试 + 6 项本地/外站基准）、3 项 `Chrome Urls`、原生保存对话框 PDF 导出与结果弹窗、`custom://cef-rs-gpui/` 与 `https://cef-rs-gpui.example/` 测试资源及 `--verify-tests true` 自动化套件 |
+| [`src/cef_example`](src/cef_example) / [`src/bin/cef-example.rs`](src/bin/cef-example.rs) | 全功能桌面浏览器示例（`gpui-cef-example`）：多标签与两阶段 `BeforeUnload` 关闭、页内 Find 工具栏（单飞合并 + 延后停止）、独立 View Source 窗、原生文件上传/保存对话框、交互式 Permission/Auth(掩码)/Cert 模态框、下载增强（Ask Save As / Cancel / Open Containing Folder）、GPU 旋转/透明度/采样面板、JS Object Repository RPC、**28** 项 `Tests` 菜单、**3** 项 `Chrome Urls` 及 `--verify-tests true` **16** 阶段自动化套件 |
 | [`examples/bing_cn.rs`](examples/bing_cn.rs) | 轻量在线浏览示例（默认 D3D11 零拷贝 OSR，可选 `-NativeHwnd`、`-SelfTestOsr` 与 `-SelfTestOsrDnd`） |
 | [`src/component_demo`](src/component_demo) | 公开组件演示宿主与多标签桌面壳（`gpui-cef-component-demo`，支持 `--cef-example true`） |
-| [`scripts/`](scripts) | Windows 构建、示例启动（`run-example.ps1` / `run-bing.ps1`）、独立发行打包与自动化验证脚本 |
-| [`docs/`](docs) | [架构设计](docs/architecture.md)、[组件视图接入](docs/component-view.md)、[发行契约](docs/component-deployment.md)、[目录说明](docs/project-structure.md)、[验证记录](docs/validation.md) |
+| [`scripts/`](scripts) | Windows 构建、示例启动（`run-example.ps1` / `run-bing.ps1` / `run.ps1`）、独立发行打包（`package-component.ps1`）与自动化验证脚本 |
+| [`.github/workflows/`](.github/workflows) | CI 跨平台格式/纯核与 Windows 检查（[`ci.yml`](.github/workflows/ci.yml)）、Release 自动编译打包与 SHA-256 发布（[`release.yml`](.github/workflows/release.yml)） |
+| [`docs/`](docs) | 项目文档目录，完整索引见下方 **文档导航** |
+
+### 文档导航
+
+| 文档 | 内容定位 |
+| --- | --- |
+| [API 参考索引](docs/api/README.md) | 面向外部宿主与组件维护者的完整 Rust API 参考总索引（含 CefSharp `156.0.15` / CEF `156.0.31` 对照与 8 篇分章，覆盖 Runtime、Views、Events、JS 桥接/异步、Handlers、桌面服务与[类型/错误/常量目录](docs/api/types-and-errors.md)） |
+| [SDK 接入指南](docs/sdk-guide.md) | 外部 GPUI 宿主集成：双后端/双线程选型、最小启动/关闭骨架、Per-View 回调、`JsObjectRepository`、`AsyncOps` 截图、宿主 Find/ViewSource 与 CEF `156.0.31` 实证差异 |
+| [桌面示例与排查指南](docs/desktop-example.md) | `gpui-cef-example`、`bing_cn` 与 `component-demo` 的完整参数、快捷键（`Ctrl+F`/`F3`/`Ctrl+U`/`Esc`）、28 项菜单 / 16 阶段验证与 Windows 构建 FAQ |
+| [架构设计](docs/architecture.md) | 五包无环分层、D3D11 4 槽共享纹理零拷贝 SRV 管线、`NativeChildHwnd`、状态机与安全策略边界 |
+| [组件视图接入](docs/component-view.md) | `CefBrowser` / `NativeCefBrowser` 深层接入契约、宿主 Find/ViewSource 接线与历史实证留档 |
+| [发行契约](docs/component-deployment.md) | 独立 `rust-cef-helper`、CEF `156.0.31`（234 项运行时）、`component-runtime.json` 打包与冷启动校验 |
+| [项目结构说明](docs/project-structure.md) | 仓库目录、五包职责、`src/cef_example/` 模块拆解与 `legacy-demo` 弃用状态 |
+| [验证记录](docs/validation.md) | 各阶段单元测试、原生矩阵、Release 回归与 2026-11-26 Find/CEF `156.0.31` 实跑证据 |
+| [版本与变更记录](docs/changes.md) | `v0.2.0` / `v0.1.0` 演进摘要与早期 PoC 初始修复保留记录 |
+
+> **API 参考分章速达**：[总索引](docs/api/README.md) · [Runtime 与生命周期](docs/api/runtime-and-lifecycle.md) · [浏览器视图与渲染表面](docs/api/browser-views.md) · [事件与回调系统](docs/api/events-and-callbacks.md) · [JS 桥接、对象仓储与异步操作](docs/api/js-bridge-and-async.md) · [Handler 与可插拔宿主能力](docs/api/handlers-and-capabilities.md) · [桌面交互服务](docs/api/desktop-services.md) · [类型、错误与常量](docs/api/types-and-errors.md)
 
 ---
 
@@ -101,7 +118,7 @@
 
 ### 1. 运行全功能桌面浏览器示例（`gpui-cef-example`）
 
-在仓库根目录的 PowerShell（5.1 或 7+）中执行 [`scripts/run-example.ps1`](scripts/run-example.ps1)（自动编译 `gpui-cef-example` 与 `rust-cef-helper`、打包至独立 bundle 目录并启动；支持多标签、GPU 旋转/透明度/采样模式面板、JS 执行/异步求值、`window['cef-rs-gpui']` 对象绑定、`custom://cef-rs-gpui/` 自定义 Scheme、`ResponseBodyFilter` 流式过滤、跨站 POST、原生保存对话框 PDF 导出与结果弹窗、26 项 `Tests` 菜单及 `Chrome Urls`）：
+在仓库根目录的 PowerShell（5.1 或 7+）中执行 [`scripts/run-example.ps1`](scripts/run-example.ps1)（自动编译 `gpui-cef-example` 与 `rust-cef-helper`、打包至独立 bundle 目录并启动；完整功能、快捷键与测试套件说明见 [桌面示例指南](docs/desktop-example.md)）：
 
 ```powershell
 # 默认以 D3D11 零拷贝 OSR + Threaded + CEF 原生右键菜单启动（可仅加 -BuildOnly 构建打包）
@@ -128,9 +145,9 @@
 .\scripts\run-example.ps1 -Release -StagingRoot .\dist -BuildOnly
 .\dist\cef-example-release\gpui-cef-example.exe
 
-# 或使用相对缓存目录运行 14 阶段自动化对齐验证套件（6 套 QUnit 共 2280 断言 + 8 项功能检查）
+# 或使用相对缓存目录运行 16 阶段自动化对齐验证套件（6 套 QUnit >= 2280 断言 + 10 项原生/桌面 UX 检查）
 .\dist\cef-example-release\gpui-cef-example.exe --verify-tests true --cache-root .\dist\verify-cache
-# 可选 CLI 参数: [--host-mode osr|native-hwnd] [--backend D3d11|Software] [--mode Threaded|Integrated] [--context-menu true|false] [--url <url>] [--smoke-ms 100..30000] [--verify-tests true|false]
+# 可选 CLI 参数: [--bundle <dir>] [--helper <exe>] [--cache-root <dir>] [--mode Threaded|Integrated] [--backend D3d11|Software] [--host-mode osr|native-hwnd] [--context-menu true|false] [--url <url>] [--smoke-ms 100..30000] [--verify-tests true|false]
 ```
 
 ### 2. 运行在线浏览示例（`examples/bing_cn.rs`）
@@ -178,9 +195,9 @@ $bundle = .\scripts\build.ps1 -StagingRoot .\dist
 ```
 
 ### Windows 构建注意事项
-1. **短构建目录**：由于 `cef-dll-sys` 使用 `CMAKE_OBJECT_PATH_MAX=500`，过深的工程路径易触及 Windows `MAX_PATH` 限制。仓内 [`.cargo/config.toml`](.cargo/config.toml) 与构建脚本默认将中间产物输出至所在磁盘根目录下的短路径 `cargo-target`，亦可通过相对或自定义路径参数 `-TargetDir`、`-StagingRoot` 以及环境变量 `CARGO_TARGET_DIR`、`POC_TARGET_DIR`、`POC_OUTPUT_ROOT` 覆盖。
-2. **UTF-8 编码页**：中文 Windows（CP936）下直接编译 CEF 头文件可能触发 `C4819`，仓库已通过 `scripts/windows-toolchain.cmake` 与构建脚本自动注入 `/utf-8`。
-3. **锁定依赖**：所有 `cargo` 命令建议携带 `--locked`，保持 `Cargo.lock` 与本地 `patches/gpui-pre*` 身份一致。
+1. **短构建目录**：由于 `cef-dll-sys` 使用 `CMAKE_OBJECT_PATH_MAX=500`，过深的工程路径易触及 Windows `MAX_PATH` 限制。仓内 [`.cargo/config.toml`](.cargo/config.toml) 配置默认相对 `.cef/` 缓存与 UTF-8 工具链；[`scripts/common.ps1`](scripts/common.ps1) 及各构建脚本默认将中间产物与 bundle 输出至短路径 **`E:\cargo-target\gpui-cef-poc\`**（若无 `E:\cargo-target` 则回退至 `<RepoDrive>:\cargo-target\cef-rs-component`），避免在仓库根产生 `target\` 目录。亦可通过 `-TargetDir`、`-StagingRoot` 以及环境变量 `CARGO_TARGET_DIR`、`POC_TARGET_DIR`、`POC_OUTPUT_ROOT` 覆盖。
+2. **UTF-8 编码页与 Ninja**：中文 Windows（CP936）下直接编译 CEF 头文件可能触发 `C4819`，仓库通过 [`scripts/windows-toolchain.cmake`](scripts/windows-toolchain.cmake) 与构建脚本自动注入 `/utf-8`；`ninja` 需为原生可执行文件而非 `depot_tools` 包装脚本。若本机 PowerShell 5.1 触发 `AmsiScanBuffer` `0xc0000005` 报错，可改用 PowerShell 7（`pwsh`）。更多排查见 [桌面示例与排查指南](docs/desktop-example.md#4-windows-%E6%9E%84%E5%BB%BA%E6%B3%A8%E6%84%8F%E4%BA%8B%E9%A1%B9%E4%B8%8E%E5%B8%B8%E8%A7%81%E9%97%AE%E9%A2%98%E6%8E%92%E6%9F%A5)。
+3. **锁定依赖**：所有 `cargo` 命令建议携带 `--locked`，保持 4 份 `Cargo.lock` 与本地 `patches/gpui-pre*` 身份一致。
 
 ---
 
@@ -208,7 +225,7 @@ cargo test --locked --bin gpui-cef-example --bin gpui-cef-component-demo --featu
 ### 集成与发行级验证（PowerShell 7）
 
 ```powershell
-# 全功能桌面示例 Release 自动化冒烟与 14 阶段对齐套件验证（均使用相对路径 .\dist）
+# 全功能桌面示例 Release 自动化冒烟与 16 阶段对齐套件验证（均使用相对路径 .\dist）
 pwsh -NoProfile -File scripts/run-example.ps1 -Release -SmokeSeconds 8
 .\scripts\run-example.ps1 -Release -StagingRoot .\dist -BuildOnly
 .\dist\cef-example-release\gpui-cef-example.exe --mode Threaded --backend D3d11 --host-mode osr --context-menu true --verify-tests true --cache-root .\dist\verify-osr-cache
@@ -226,6 +243,53 @@ pwsh -NoProfile -File scripts/test-component-workspace.ps1 `
 ```
 
 > 注：历史与当前阶段验证结论、豁免项及局限说明详见 [docs/validation.md](docs/validation.md)。
+
+---
+
+## 公开 SDK 用法：`JsObjectRepository`、异步 / 截图 API 与 Find / ViewSource
+
+在外部 GPUI 应用中直接集成 [`rust-cef-gpui`](crates/rust-cef-gpui) 时，可通过公开模块 `rust_cef_gpui::js_repository`、`CefBrowser`（OSR）与 `NativeCefBrowser`（Win32 子 `HWND`）完成双向 JS 绑定、异步求值、源码/文本获取、按需截图与宿主级查找/查看源码（完整接入说明见 [SDK 接入指南](docs/sdk-guide.md) 与 [组件视图接入](docs/component-view.md)）：
+
+```rust,no_run
+use std::time::Duration;
+use rust_cef_gpui::{
+    BoundObject, CefBrowser, JsBindingSettings, JsObjectRepository, JsValue, Runtime,
+    js_bridge::JsFrameScope, ports::EngineError,
+};
+
+fn setup_repo(runtime: &Runtime) -> Result<JsObjectRepository, EngineError> {
+    let mut repo = JsObjectRepository::new(JsBindingSettings {
+        global_object_name: Some("myAppBridge".into()),
+        ..Default::default()
+    });
+    repo.register(
+        BoundObject::new("appApi").with_method("greet", |_ctx, args| {
+            let who = args.first().and_then(JsValue::as_str).unwrap_or("world");
+            Ok(JsValue::from(format!("Hello {who}")))
+        }),
+    );
+    repo.apply_to_runtime(runtime)?;
+    Ok(repo)
+}
+
+async fn inspect_page(view: &CefBrowser) -> Result<(), rust_cef_gpui::AsyncOpError> {
+    let timeout = Some(Duration::from_secs(10));
+    view.wait_for_initial_load_async(timeout).await?;
+    let _title = view.evaluate_script_async("document.title", JsFrameScope::MainFrame, timeout).await?;
+    let _html = view.get_source_async(JsFrameScope::MainFrame, timeout).await?;
+    let _text = view.get_text_async(JsFrameScope::MainFrame, timeout).await?;
+    let _png = view.capture_screenshot_png(timeout).await?;
+    Ok(())
+}
+```
+
+- **显式帧作用域**：区别于 CefSharp `WebBrowserExtensions.cs:340,373` 默认投向 `FocusedFrame`，`cef-rs-gpui` 要求显式传入 `JsFrameScope`（通常为 `JsFrameScope::MainFrame`）。
+- **原生子 HWND 截图条件**：`NativeCefBrowser::capture_screenshot_{bgra,png}` 需在创建浏览器时的 `BrowserOptions` 中显式设置 `headless_cdp_enabled: true`，否则返回 `AsyncOpError::CapabilityDisabled`。
+- **宿主查找 / View Source 与 CEF `156.0.31` 实证差异**：`Runtime::find` / `stop_finding` / `view_source`（配合 `set_find_sink` / `set_source_viewer`）提供跨 OSR 与 `NativeChildHwnd` 的有界严格串行查找与源码获取；针对 CEF `156.0.31` `FindTabHelper::StartFinding` 在 `findNext=0` 回报 `active_ordinal == 0` 的实测差异，宿主新查找会先 `host.stop_finding(0)` 再传 `1` 立即激活 Match #1，并在 `TaskPayload::HostStopFinding` 携带 `cutoff_sequence` 防止 CEF UI 延迟取消新查找。
+
+## `legacy-demo` 维护状态声明
+
+根目录保留 `--features legacy-demo`（对应 `src/main.rs`、`src/windows.rs`、`src/ui.rs`、`src/browser/`）及兼容脚本 `scripts/build.ps1 -Legacy`、`scripts/test-cargo-run.ps1`、`scripts/check.ps1`、`scripts/test-component-workspace.ps1`。`legacy-demo` 已正式标记为**已弃用、仅维护 / 归档候选（deprecated maintenance-only / archive-candidate）**，新宿主请统一基于 `crates/rust-cef-gpui` 与 `src/cef_example` / `src/component_demo` 开发。
 
 ---
 

@@ -82,7 +82,10 @@ fn native_frame_input_failures_keep_source_good_pixels_and_budget() {
         PublishResult::Published
     );
     let good = source.latest(SurfaceKind::View).unwrap();
-    assert_eq!(good.cpu_pixels().unwrap().as_slice(), texture.expected_bgra());
+    assert_eq!(
+        good.cpu_pixels().unwrap().as_slice(),
+        texture.expected_bgra()
+    );
     let mut bad = texture.info.clone();
     bad.format = cef::ColorType::NUM_VALUES;
     let result = publish(&endpoint, &source, &bad);
@@ -252,7 +255,10 @@ fn native_capture_faults_unmap_and_never_publish_partial_or_removed_device_frame
             Arc::ptr_eq(&good, &source.latest(SurfaceKind::View).unwrap()),
             "{point:?}"
         );
-        assert_eq!(good.cpu_pixels().unwrap().as_slice(), texture.expected_bgra());
+        assert_eq!(
+            good.cpu_pixels().unwrap().as_slice(),
+            texture.expected_bgra()
+        );
         assert_eq!(source.budget().stats().used, 16, "{point:?}");
     }
     endpoint.retire().unwrap();

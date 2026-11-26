@@ -219,6 +219,20 @@ pub(crate) enum TaskPayload {
         native_id: i32,
     },
     FindCancel(rust_cef_core::find::FindOperationId),
+    HostFind {
+        id: rust_cef_core::find::FindOperationId,
+        forward: bool,
+        match_case: bool,
+        find_next: bool,
+    },
+    HostStopFinding {
+        browser: BrowserId,
+        clear_selection: bool,
+        cutoff_sequence: u64,
+    },
+    HostViewSource {
+        id: rust_cef_core::source_view::SourceOperationId,
+    },
     RetireMenuBinding {
         browser: BrowserId,
         serial: u64,
@@ -425,6 +439,28 @@ pub(crate) enum TaskPayload {
     NavigateMainFrame {
         browser: BrowserId,
         url: String,
+    },
+    ReadFrameText {
+        browser: BrowserId,
+        kind: crate::frame_text::FrameTextKind,
+        scope: rust_cef_core::js_bridge::JsFrameScope,
+        max_bytes: usize,
+        reply: crate::attachment::ReplyOnce<Result<String, crate::frame_text::FrameTextError>>,
+    },
+    ReadbackSharedTexture {
+        browser: BrowserId,
+        frame: crate::attachment::SharedTextureReadbackInput,
+        reply: crate::attachment::ReplyOnce<Result<Vec<u8>, EngineError>>,
+    },
+    CaptureCdpScreenshot {
+        browser: BrowserId,
+        token: u64,
+        method_id: rust_cef_core::host_capabilities::CdpMethodId,
+        params_json: Option<String>,
+    },
+    DetachCdpScreenshot {
+        browser: BrowserId,
+        token: u64,
     },
 }
 

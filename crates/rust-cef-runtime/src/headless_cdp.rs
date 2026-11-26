@@ -26,6 +26,10 @@ use rust_cef_core::{
 
 use crate::executor::NativeAudit;
 
+/// Dedicated bounded ceiling (32 MiB) for transient `Page.captureScreenshot`
+/// responses in `NativeChildHwnd`, kept separate from the 512 KiB general CDP cap.
+pub(crate) const MAX_CDP_SCREENSHOT_JSON_BYTES: usize = 32 * 1024 * 1024;
+
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -57,8 +61,11 @@ impl Drop for RegistrationSlot {
 
 pub(crate) struct HeadlessCdpManager {
     next_message_id: AtomicI32,
+    next_transient_token: AtomicU64,
     registrations: Mutex<BTreeMap<BrowserId, RegistrationSlot>>,
     pending_observers: Mutex<BTreeMap<BrowserId, Arc<dyn CdpObserver>>>,
+    transient_registrations: Mutex<BTreeMap<(BrowserId, u64), RegistrationSlot>>,
+    pending_transient_observers: Mutex<BTreeMap<(BrowserId, u64), Arc<dyn CdpObserver>>>,
     attached: AtomicU64,
     detached: AtomicU64,
     dropped_on_ui: AtomicU64,
@@ -70,14 +77,38 @@ impl HeadlessCdpManager {
     pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self {
             next_message_id: AtomicI32::new(1),
+            next_transient_token: AtomicU64::new(1),
             registrations: Mutex::new(BTreeMap::new()),
             pending_observers: Mutex::new(BTreeMap::new()),
+            transient_registrations: Mutex::new(BTreeMap::new()),
+            pending_transient_observers: Mutex::new(BTreeMap::new()),
             attached: AtomicU64::new(0),
             detached: AtomicU64::new(0),
             dropped_on_ui: AtomicU64::new(0),
             rejected_off_ui: AtomicU64::new(0),
             oversized_dropped: Arc::new(AtomicU64::new(0)),
         })
+    }
+
+    pub(crate) fn alloc_transient_token(&self) -> u64 {
+        self.next_transient_token.fetch_add(1, Ordering::Relaxed)
+    }
+
+    pub(crate) fn set_pending_transient_observer(
+        &self,
+        browser: BrowserId,
+        token: u64,
+        observer: Arc<dyn CdpObserver>,
+    ) {
+        lock(&self.pending_transient_observers).insert((browser, token), observer);
+    }
+
+    pub(crate) fn take_pending_transient_observer(
+        &self,
+        browser: BrowserId,
+        token: u64,
+    ) -> Option<Arc<dyn CdpObserver>> {
+        lock(&self.pending_transient_observers).remove(&(browser, token))
     }
 
     pub(crate) fn set_pending_observer(&self, browser: BrowserId, observer: Arc<dyn CdpObserver>) {
@@ -101,7 +132,7 @@ impl HeadlessCdpManager {
     }
 
     pub(crate) fn active_registrations(&self) -> u64 {
-        lock(&self.registrations).len() as u64
+        lock(&self.registrations).len() as u64 + lock(&self.transient_registrations).len() as u64
     }
 
     pub(crate) fn diagnostics(&self) -> CdpDiagnostics {
@@ -127,8 +158,12 @@ impl HeadlessCdpManager {
             self.rejected_off_ui.fetch_add(1, Ordering::AcqRel);
             return Err(HostCapabilityError::Cancelled);
         }
-        let mut native_obs =
-            RuntimeDevToolsObserver::new(browser, observer, self.oversized_dropped.clone());
+        let mut native_obs = RuntimeDevToolsObserver::new(
+            browser,
+            observer,
+            self.oversized_dropped.clone(),
+            MAX_CDP_JSON_BYTES,
+        );
         audit.record();
         let registration = host.add_dev_tools_message_observer(Some(&mut native_obs));
         drop(native_obs);
@@ -146,18 +181,90 @@ impl HeadlessCdpManager {
         Ok(())
     }
 
+    pub(crate) fn attach_transient_screenshot_observer(
+        &self,
+        on_ui: bool,
+        browser: BrowserId,
+        token: u64,
+        host: &BrowserHost,
+        observer: Arc<dyn CdpObserver>,
+        audit: &NativeAudit,
+    ) -> Result<(), HostCapabilityError> {
+        if !on_ui {
+            self.rejected_off_ui.fetch_add(1, Ordering::AcqRel);
+            return Err(HostCapabilityError::Cancelled);
+        }
+        let mut native_obs = RuntimeDevToolsObserver::new(
+            browser,
+            observer,
+            self.oversized_dropped.clone(),
+            MAX_CDP_SCREENSHOT_JSON_BYTES,
+        );
+        audit.record();
+        let registration = host.add_dev_tools_message_observer(Some(&mut native_obs));
+        drop(native_obs);
+        let Some(registration) = registration else {
+            return Err(HostCapabilityError::OperationFailed);
+        };
+        let previous = lock(&self.transient_registrations)
+            .insert((browser, token), RegistrationSlot::Native(registration));
+        self.attached.fetch_add(1, Ordering::AcqRel);
+        if previous.is_some() {
+            self.detached.fetch_add(1, Ordering::AcqRel);
+            self.dropped_on_ui.fetch_add(1, Ordering::AcqRel);
+        }
+        drop(previous);
+        Ok(())
+    }
+
+    pub(crate) fn detach_transient_observer(&self, on_ui: bool, browser: BrowserId, token: u64) {
+        if !on_ui {
+            self.rejected_off_ui.fetch_add(1, Ordering::AcqRel);
+            return;
+        }
+        lock(&self.pending_transient_observers).remove(&(browser, token));
+        let removed = lock(&self.transient_registrations).remove(&(browser, token));
+        if removed.is_some() {
+            self.detached.fetch_add(1, Ordering::AcqRel);
+            self.dropped_on_ui.fetch_add(1, Ordering::AcqRel);
+        }
+        drop(removed);
+    }
+
     pub(crate) fn detach_browser(&self, on_ui: bool, browser: BrowserId) {
         if !on_ui {
             self.rejected_off_ui.fetch_add(1, Ordering::AcqRel);
             return;
         }
         lock(&self.pending_observers).remove(&browser);
+        lock(&self.pending_transient_observers).retain(|(b, _), _| *b != browser);
         let removed = lock(&self.registrations).remove(&browser);
         if removed.is_some() {
             self.detached.fetch_add(1, Ordering::AcqRel);
             self.dropped_on_ui.fetch_add(1, Ordering::AcqRel);
         }
         drop(removed);
+        let mut transient_removed = Vec::new();
+        {
+            let mut guard = lock(&self.transient_registrations);
+            let keys: Vec<(BrowserId, u64)> = guard
+                .keys()
+                .copied()
+                .filter(|(b, _)| *b == browser)
+                .collect();
+            for key in keys {
+                if let Some(slot) = guard.remove(&key) {
+                    transient_removed.push(slot);
+                }
+            }
+        }
+        let transient_count = transient_removed.len() as u64;
+        if transient_count > 0 {
+            self.detached.fetch_add(transient_count, Ordering::AcqRel);
+            self.dropped_on_ui
+                .fetch_add(transient_count, Ordering::AcqRel);
+        }
+        drop(transient_removed);
     }
 
     pub(crate) fn detach_all(&self, on_ui: bool) {
@@ -166,9 +273,11 @@ impl HeadlessCdpManager {
             return;
         }
         lock(&self.pending_observers).clear();
-        let removed: Vec<RegistrationSlot> = std::mem::take(&mut *lock(&self.registrations))
+        lock(&self.pending_transient_observers).clear();
+        let mut removed: Vec<RegistrationSlot> = std::mem::take(&mut *lock(&self.registrations))
             .into_values()
             .collect();
+        removed.extend(std::mem::take(&mut *lock(&self.transient_registrations)).into_values());
         let count = removed.len() as u64;
         if count > 0 {
             self.detached.fetch_add(count, Ordering::AcqRel);
@@ -243,6 +352,7 @@ wrap_dev_tools_message_observer! {
         browser: BrowserId,
         observer: Arc<dyn CdpObserver>,
         oversized_dropped: Arc<AtomicU64>,
+        max_bytes: usize,
     }
 
     impl DevToolsMessageObserver {
@@ -264,7 +374,7 @@ wrap_dev_tools_message_observer! {
             result: Option<&[u8]>,
         ) {
             let bytes = result.unwrap_or(&[]);
-            if bytes.len() > MAX_CDP_JSON_BYTES {
+            if bytes.len() > self.max_bytes {
                 self.oversized_dropped.fetch_add(1, Ordering::AcqRel);
                 self.observer.on_method_result(CdpMethodResult {
                     id: CdpMethodId {
@@ -294,7 +404,7 @@ wrap_dev_tools_message_observer! {
             params: Option<&[u8]>,
         ) {
             let bytes = params.unwrap_or(&[]);
-            if bytes.len() > MAX_CDP_JSON_BYTES {
+            if bytes.len() > self.max_bytes {
                 self.oversized_dropped.fetch_add(1, Ordering::AcqRel);
                 return;
             }
@@ -343,6 +453,34 @@ mod tests {
     }
 
     #[test]
+    fn transient_registrations_detach_on_ui_and_browser_close() {
+        let mgr = HeadlessCdpManager::new();
+        let browser = BrowserId::new(RuntimeGeneration::new(1), 10);
+        let tok1 = mgr.alloc_transient_token();
+        let tok2 = mgr.alloc_transient_token();
+        let dropped1 = Arc::new(AtomicBool::new(false));
+        let dropped2 = Arc::new(AtomicBool::new(false));
+        lock(&mgr.transient_registrations)
+            .insert((browser, tok1), RegistrationSlot::Test(dropped1.clone()));
+        lock(&mgr.transient_registrations)
+            .insert((browser, tok2), RegistrationSlot::Test(dropped2.clone()));
+        mgr.attached.fetch_add(2, Ordering::AcqRel);
+        assert_eq!(mgr.active_registrations(), 2);
+
+        mgr.detach_transient_observer(false, browser, tok1);
+        assert!(!dropped1.load(Ordering::Acquire));
+        assert_eq!(mgr.active_registrations(), 2);
+
+        mgr.detach_transient_observer(true, browser, tok1);
+        assert!(dropped1.load(Ordering::Acquire));
+        assert_eq!(mgr.active_registrations(), 1);
+
+        mgr.detach_browser(true, browser);
+        assert!(dropped2.load(Ordering::Acquire));
+        assert_eq!(mgr.active_registrations(), 0);
+    }
+
+    #[test]
     fn oversize_cdp_observer_payload_is_bounded_and_counted() {
         struct Capture(Mutex<Vec<CdpMethodResult>>, Mutex<Vec<CdpEvent>>);
         impl CdpObserver for Capture {
@@ -356,7 +494,8 @@ mod tests {
         let cap = Arc::new(Capture(Mutex::new(Vec::new()), Mutex::new(Vec::new())));
         let counter = Arc::new(AtomicU64::new(0));
         let browser = BrowserId::new(RuntimeGeneration::new(1), 9);
-        let obs = RuntimeDevToolsObserver::new(browser, cap.clone(), counter.clone());
+        let obs =
+            RuntimeDevToolsObserver::new(browser, cap.clone(), counter.clone(), MAX_CDP_JSON_BYTES);
 
         let huge = vec![b'a'; MAX_CDP_JSON_BYTES + 1];
         obs.on_dev_tools_method_result(None, 3, 1, Some(&huge));

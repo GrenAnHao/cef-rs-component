@@ -1,6 +1,19 @@
 # 验证记录
 
-## 终态收口汇总（2026-11-21 / `r459`–`r461` 及 `r468` v0.1.0 CEF 156 升级）
+## 终态收口汇总（2026-11-26 `v0.2.0` 与 2026-11-21 `r459`–`r468`）
+
+- **`2026-11-26 / v0.2.0` 桌面 UX（Find / ViewSource / Dialogs / Downloads）、公开 SDK 与 CEF `156.0.31` Find 实证**：
+  - 变更范围：落地 `complete-example-desktop-ux`（`host_find_source.rs`、`dialogs.rs`、`find_bar.rs` 等桌面交互能力）与 `prepare-public-sdk-and-release`（`rust_cef_gpui::js_repository`、`async_ops`、`frame_text.rs`、`.github/workflows/{ci,release}.yml`），并诊断修复 `gpui-cef-example` 在 `chrome://process-internals/#general` 等页面渐进查找触发 `Busy (strict serial)` 与 TOCTOU 的问题。
+  - **CEF `156.0.31` 实证差异与首次失败保留**：
+    1. 首次在 `chrome://process-internals` 测试 `"P"->"Pr"->"Pro"` 后确认 CEF `156.0.31`（Chromium `FindTabHelper::StartFinding`）在 `findNext = 0` 时返回 `matches=20, ordinal=0`，导致 `WaitChromeUrls substep=2` 超时失败；据此将宿主新搜索（`!continue_session`）修正为先执行 `host.stop_finding(0)` 清空活跃匹配状态再传 `1`（激活 Match #1），`FindScope::Menu` 保留 `0` 以维持历史 G0–G4 语义。
+    2. 首次运行 `WaitDesktopUxFind substep=4`（关闭查找条并立刻重开）出现间歇性 `matches=0, ordinal=0` 失败：因 `host_stop_finding` 后新入队的 `host_find` 在 CEF UI 线程尚未执行 `HostStopFinding` 前即到达，旧取消任务清除了新搜索会话；据此为 `TaskPayload::HostStopFinding` 增加 `cutoff_sequence: u64` 门控并同步更新 `clear_session_active`，且保留宿主 PowerShell 5.1 曾出现一次 `AmsiScanBuffer` `AccessViolationException`（`-1073741819`）的原始失败观察后重跑恢复记录。
+  - **修复后本轮直接执行的验证结果（全部退出码 `0`）**：
+    - 格式检查：`cargo fmt -p gpui-cef-poc -p rust-cef-runtime -- --check` 通过。
+    - Runtime 定向单测：`cargo test --locked --target x86_64-pc-windows-msvc -p rust-cef-runtime find` — `14 passed; 0 failed`（`315 filtered out`，含新增 `host_find_next_reuses_same_session_id_and_clears_after_stop_or_zero_matches` 与 `host_stop_finding_does_not_cancel_subsequent_host_find`）。
+    - Example 定向单测：`cargo test --locked --target x86_64-pc-windows-msvc --bin gpui-cef-example find_bar` — `4 passed; 0 failed`（`21 filtered out`）。
+    - 打包：`.\scripts\run-example.ps1 -BuildOnly` 产出 `E:\cargo-target\gpui-cef-poc\component-bundles\cef-example-debug`。
+    - 真实 CEF `156.0.31` 端到端连续 **3 次**验证（`gpui-cef-example.exe --verify-tests true`，两次 `--context-menu false` + 一次 `--context-menu true`）：3/3 全部退出 `0`，均打印 `CEF_EXAMPLE_VERIFY item=ChromeUrls ok=true`、`CEF_EXAMPLE_VERIFY item=DesktopUxFind matches=2 ok=true`、`CEF_EXAMPLE_VERIFY item=BeforeUnloadFixture ok=true` 与 `CEF_EXAMPLE_VERIFY_SUITE ok=true`（每轮 `tabs=16 created=16 closed=16`）。
+    - 不变量核对：4 份 `Cargo.lock` 零改动，仓库根不存在 `target\` 目录。
 
 - **`r468` CEF `156.0.31` / `cef-rs 156.7.0+156.0.31` 全量升级实证（2026-11-22 / `v0.1.0` 首发基线）**：
   - 锁定升级与运行时适配：将 `cef` / `cef-dll-sys` 升至 `v156.7.0+156.0.31`（`7b6bf84e76e919790bd61df077e29dc4132eb5e2`），导出 CEF `156.0.31+ge603d97+chromium-156.0.8078.100` Windows x64 运行时（14 项根文件 + 220 项 `locales/*.pak` 共 `234` 项，CEF 156 已不再分发独立 `libEGL.dll`/`libGLESv2.dll`/`dxil.dll`，同步更新 `REQUIRED_RUNTIME_FILES`、`package-component.ps1`、`component-product-ui-receipt.ps1`、`build_stamp.rs`、`subprocess.rs` `[156, 0, 31]` 与 `cargo-run.ps1` stale DLL 刷新逻辑）；`.cargo/config.toml`、`scripts/common.ps1`、`scripts/poc_paths.py` 移除硬编码 `E:` 路径以支持公开仓克隆运行；并先归档 `add-osr-cefsharp-parity` 与 `add-native-child-hwnd-host`（`openspec validate --all --strict` 14/14 通过）。

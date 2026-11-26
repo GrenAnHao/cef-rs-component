@@ -282,22 +282,12 @@ mod win {
             _qi: usize,
             _add_ref: usize,
             _release: usize,
-            drag_enter: unsafe extern "system" fn(
-                *mut c_void,
-                *mut c_void,
-                u32,
-                ComPoint,
-                *mut u32,
-            ) -> i32,
+            drag_enter:
+                unsafe extern "system" fn(*mut c_void, *mut c_void, u32, ComPoint, *mut u32) -> i32,
             drag_over: unsafe extern "system" fn(*mut c_void, u32, ComPoint, *mut u32) -> i32,
             drag_leave: unsafe extern "system" fn(*mut c_void) -> i32,
-            drop: unsafe extern "system" fn(
-                *mut c_void,
-                *mut c_void,
-                u32,
-                ComPoint,
-                *mut u32,
-            ) -> i32,
+            drop:
+                unsafe extern "system" fn(*mut c_void, *mut c_void, u32, ComPoint, *mut u32) -> i32,
         }
         #[link(name = "ole32")]
         unsafe extern "system" {
@@ -369,7 +359,11 @@ mod win {
                 let cf_url_w = unsafe { RegisterClipboardFormatW(CFSTR_URL_W.as_ptr()) } as u16;
                 let cf_drag_bits =
                     unsafe { RegisterClipboardFormatW(CFSTR_DRAG_IMAGE_BITS.as_ptr()) } as u16;
-                for (name, cf) in [("CF_UNICODETEXT", 13u16), ("URLW", cf_url_w), ("DragImageBits", cf_drag_bits)] {
+                for (name, cf) in [
+                    ("CF_UNICODETEXT", 13u16),
+                    ("URLW", cf_url_w),
+                    ("DragImageBits", cf_drag_bits),
+                ] {
                     let fmt = FormatEtc {
                         cf_format: cf,
                         ptd: std::ptr::null_mut(),
@@ -379,7 +373,10 @@ mod win {
                     };
                     let hr = unsafe { ((*data_vtbl).query_get_data)(data_obj, &fmt) };
                     if hr != 0 {
-                        return Err(format!("IDataObject::QueryGetData({name}) hr=0x{:08x}", hr as u32));
+                        return Err(format!(
+                            "IDataObject::QueryGetData({name}) hr=0x{:08x}",
+                            hr as u32
+                        ));
                     }
                 }
                 let fmt_bits = FormatEtc {
@@ -396,7 +393,10 @@ mod win {
                 };
                 let hr = unsafe { ((*data_vtbl).get_data)(data_obj, &fmt_bits, &mut med) };
                 if hr != 0 || med.union_ptr.is_null() {
-                    return Err(format!("IDataObject::GetData(DragImageBits) hr=0x{:08x}", hr as u32));
+                    return Err(format!(
+                        "IDataObject::GetData(DragImageBits) hr=0x{:08x}",
+                        hr as u32
+                    ));
                 }
                 let ok_dims = unsafe {
                     let sz = GlobalSize(med.union_ptr);
@@ -460,7 +460,8 @@ mod win {
 
                 // 3. Plain text over `<input id='sb_form_q'>` negotiates DROPEFFECT_COPY (`1`), then leaves.
                 let mut eff_plain = 1u32 | 2 | 4;
-                let _ = unsafe { ((*dt_vtbl).drag_enter)(dt, plain_obj, 1, pt_input, &mut eff_plain) };
+                let _ =
+                    unsafe { ((*dt_vtbl).drag_enter)(dt, plain_obj, 1, pt_input, &mut eff_plain) };
                 for _ in 0..40 {
                     if eff_plain != 0 {
                         break;
@@ -471,7 +472,9 @@ mod win {
                 }
                 let _ = unsafe { ((*dt_vtbl).drag_leave)(dt) };
                 if eff_plain != 1 {
-                    return Err(format!("expected DROPEFFECT_COPY (1) for plain text over #sb_form_q, got {eff_plain}"));
+                    return Err(format!(
+                        "expected DROPEFFECT_COPY (1) for plain text over #sb_form_q, got {eff_plain}"
+                    ));
                 }
                 std::thread::sleep(Duration::from_millis(20));
 
@@ -488,12 +491,16 @@ mod win {
                 }
                 if eff_in != 1 && eff_in != 4 {
                     let _ = unsafe { ((*dt_vtbl).drag_leave)(dt) };
-                    return Err(format!("expected Copy(1) or Link(4) over #sb_form_q, got {eff_in}"));
+                    return Err(format!(
+                        "expected Copy(1) or Link(4) over #sb_form_q, got {eff_in}"
+                    ));
                 }
                 let mut eff_drop = 1u32 | 2 | 4;
                 let _ = unsafe { ((*dt_vtbl).drop)(dt, data_obj, 0, pt_input, &mut eff_drop) };
                 if eff_drop != 1 && eff_drop != 4 {
-                    return Err(format!("expected non-zero drop effect on #sb_form_q, got {eff_drop}"));
+                    return Err(format!(
+                        "expected non-zero drop effect on #sb_form_q, got {eff_drop}"
+                    ));
                 }
                 Ok(())
             })();
@@ -1807,9 +1814,7 @@ mod win {
         let mut menu_pair: Option<(ContextMenuServices, Arc<ContextMenuRegistration>)> = None;
         let mut sources: Option<SourceViewServices> = None;
         let mut finds: Option<FindServices> = None;
-        let presenter = if use_custom_menu
-            && let BrowserView::Osr(entity) = &attached_view
-        {
+        let presenter = if use_custom_menu && let BrowserView::Osr(entity) = &attached_view {
             let mut menus = ContextMenuServices::new(nz(1), nz(1), limits, context_limits);
             if let Ok(target) = win
                 .update(cx, |_, window, cx| menus.register(entity, window, cx))
@@ -3110,23 +3115,24 @@ mod win {
                 let mut ole_test_params: Option<(isize, f32)> = None;
                 let any_win: gpui::AnyWindowHandle = win.into();
                 let kb_active = keyboard.as_ref().is_some_and(|k| !k.diagnostics().retired);
-                let parse_dnd_probe = |title: &str, expected_seq: u64| -> Option<(String, String, u64)> {
-                    let prefix = format!("DND:{expected_seq}|");
-                    let rest = title.strip_prefix(&prefix)?;
-                    let mut sel = String::new();
-                    let mut q = String::new();
-                    let mut nav = 0u64;
-                    for part in rest.split('|') {
-                        if let Some(v) = part.strip_prefix("sel=") {
-                            sel = v.to_owned();
-                        } else if let Some(v) = part.strip_prefix("q=") {
-                            q = v.to_owned();
-                        } else if let Some(v) = part.strip_prefix("nav=") {
-                            nav = v.parse::<u64>().unwrap_or(99);
+                let parse_dnd_probe =
+                    |title: &str, expected_seq: u64| -> Option<(String, String, u64)> {
+                        let prefix = format!("DND:{expected_seq}|");
+                        let rest = title.strip_prefix(&prefix)?;
+                        let mut sel = String::new();
+                        let mut q = String::new();
+                        let mut nav = 0u64;
+                        for part in rest.split('|') {
+                            if let Some(v) = part.strip_prefix("sel=") {
+                                sel = v.to_owned();
+                            } else if let Some(v) = part.strip_prefix("q=") {
+                                q = v.to_owned();
+                            } else if let Some(v) = part.strip_prefix("nav=") {
+                                nav = v.parse::<u64>().unwrap_or(99);
+                            }
                         }
-                    }
-                    Some((sel, q, nav))
-                };
+                        Some((sel, q, nav))
+                    };
                 let issue_dnd_probe = |seq: &mut u64| -> u64 {
                     *seq += 1;
                     let id = *seq;

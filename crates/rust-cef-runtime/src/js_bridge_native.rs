@@ -23,11 +23,99 @@ use crate::executor::NativeAudit;
 use crate::helper_app::{
     EXTRA_BROWSER_LOCAL, EXTRA_JS_BRIDGE_ENABLED, EXTRA_JS_BRIDGE_LEGACY,
     EXTRA_JS_BRIDGE_MAX_BYTES, EXTRA_JS_BRIDGE_ORIGINS, EXTRA_JS_BRIDGE_SUBFRAMES,
-    EXTRA_RUNTIME_GEN, MSG_CONTEXT_CREATED, MSG_CONTEXT_RELEASED, MSG_EVAL_REQUEST,
-    MSG_EVAL_RESPONSE, MSG_FOCUSED_NODE_CHANGED, MSG_HOST_MESSAGE, MSG_POST_MESSAGE,
-    MSG_UNCAUGHT_EXCEPTION,
+    EXTRA_JS_REPO_CONFIG, EXTRA_RUNTIME_GEN, MSG_CONTEXT_CREATED, MSG_CONTEXT_RELEASED,
+    MSG_EVAL_REQUEST, MSG_EVAL_RESPONSE, MSG_FOCUSED_NODE_CHANGED, MSG_HOST_MESSAGE,
+    MSG_POST_MESSAGE, MSG_UNCAUGHT_EXCEPTION,
 };
 use crate::policy::CompiledPolicy;
+use crate::policy_native::{JsRepositoryObjectDescriptor, JsRepositorySettings};
+use serde::Serialize;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct HelperRepoBootstrapConfig {
+    pub(crate) enabled: bool,
+    pub(crate) compat_default: bool,
+    pub(crate) global_object_name: Option<String>,
+    pub(crate) camel_case_methods: bool,
+    pub(crate) legacy_binding: bool,
+    pub(crate) objects: Vec<HelperRepoObjectDescriptor>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct HelperRepoPropertyDescriptor {
+    pub(crate) name: String,
+    pub(crate) value_json: String,
+    pub(crate) readonly: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct HelperRepoObjectDescriptor {
+    pub(crate) name: String,
+    pub(crate) is_async: bool,
+    pub(crate) methods: Vec<String>,
+    pub(crate) properties: Vec<HelperRepoPropertyDescriptor>,
+    pub(crate) sub_objects: Vec<HelperRepoObjectDescriptor>,
+}
+
+impl From<&JsRepositoryObjectDescriptor> for HelperRepoObjectDescriptor {
+    fn from(desc: &JsRepositoryObjectDescriptor) -> Self {
+        Self {
+            name: desc.name.clone(),
+            is_async: desc.is_async,
+            methods: desc.methods.clone(),
+            properties: desc
+                .properties
+                .iter()
+                .map(|p| HelperRepoPropertyDescriptor {
+                    name: p.name.clone(),
+                    value_json: p.value_json.clone(),
+                    readonly: p.readonly,
+                })
+                .collect(),
+            sub_objects: desc.sub_objects.iter().map(Self::from).collect(),
+        }
+    }
+}
+
+pub(crate) fn encode_repo_bootstrap_config(
+    repo_settings: Option<&JsRepositorySettings>,
+    legacy_binding: bool,
+) -> (bool, String) {
+    let cfg = match repo_settings {
+        None => HelperRepoBootstrapConfig {
+            enabled: true,
+            compat_default: true,
+            global_object_name: None,
+            camel_case_methods: false,
+            legacy_binding,
+            objects: Vec::new(),
+        },
+        Some(settings) => HelperRepoBootstrapConfig {
+            enabled: settings.enabled,
+            compat_default: false,
+            global_object_name: settings.global_object_name.clone(),
+            camel_case_methods: settings.uses_camel_case_methods(),
+            legacy_binding: settings.enabled && (legacy_binding || settings.legacy_binding_enabled),
+            objects: settings
+                .objects
+                .iter()
+                .map(HelperRepoObjectDescriptor::from)
+                .collect(),
+        },
+    };
+    let effective_legacy = cfg.legacy_binding;
+    let json = serde_json::to_string(&cfg).unwrap_or_else(|_| {
+        if legacy_binding {
+            r#"{"enabled":true,"compatDefault":true,"globalObjectName":null,"camelCaseMethods":false,"legacyBinding":true,"objects":[]}"#.to_owned()
+        } else {
+            r#"{"enabled":true,"compatDefault":true,"globalObjectName":null,"camelCaseMethods":false,"legacyBinding":false,"objects":[]}"#.to_owned()
+        }
+    });
+    (effective_legacy, json)
+}
 
 pub(crate) enum RendererIpcAction {
     PostMessage {
@@ -86,6 +174,7 @@ pub(crate) fn build_browser_extra_info(
     policy: &CompiledPolicy,
     allow_subframes: bool,
     legacy_binding: bool,
+    repo_settings: Option<&JsRepositorySettings>,
 ) -> Option<DictionaryValue> {
     let dict = dictionary_value_create()?;
     dict.set_string(
@@ -100,6 +189,7 @@ pub(crate) fn build_browser_extra_info(
     );
     let permitted = allowed_bridge_origins(options, policy);
     let enabled = options.js_bridge.enabled && !permitted.is_empty();
+    let (effective_legacy, repo_json) = encode_repo_bootstrap_config(repo_settings, legacy_binding);
     dict.set_bool(
         Some(&CefString::from(EXTRA_JS_BRIDGE_ENABLED)),
         i32::from(enabled),
@@ -110,7 +200,11 @@ pub(crate) fn build_browser_extra_info(
     );
     dict.set_bool(
         Some(&CefString::from(EXTRA_JS_BRIDGE_LEGACY)),
-        i32::from(enabled && legacy_binding),
+        i32::from(enabled && effective_legacy),
+    );
+    dict.set_string(
+        Some(&CefString::from(EXTRA_JS_REPO_CONFIG)),
+        Some(&CefString::from(repo_json.as_str())),
     );
     let max_bytes = i32::try_from(
         options
@@ -132,7 +226,7 @@ pub(crate) fn build_browser_extra_info(
     Some(dict)
 }
 
-fn resolve_verified_frame(
+pub(crate) fn resolve_verified_frame(
     native: &Browser,
     audit: &NativeAudit,
     scope: &JsFrameScope,
@@ -166,7 +260,7 @@ fn resolve_verified_frame(
     }
 }
 
-fn frame_origin_allowed(state: &BrowserClientState, frame: &Frame) -> Option<String> {
+pub(crate) fn frame_origin_allowed(state: &BrowserClientState, frame: &Frame) -> Option<String> {
     let url = CefString::from(&frame.url()).to_string();
     let is_main = frame.is_main() != 0;
     let allowed = state.allows_navigation_for_script(&url, is_main);
@@ -533,5 +627,92 @@ pub(crate) fn parse_renderer_process_message(
             })
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::policy_native::{
+        JsRepositoryMethodStyle, JsRepositoryPropertyDescriptor, validate_js_repository_name,
+    };
+
+    #[test]
+    fn repository_settings_validate_names_and_descriptors() {
+        assert!(validate_js_repository_name("cef-rs-gpui", true).is_ok());
+        assert!(validate_js_repository_name("my_App2", true).is_ok());
+        assert!(validate_js_repository_name("boundAsync", false).is_ok());
+
+        assert!(validate_js_repository_name("", true).is_err());
+        assert!(validate_js_repository_name("123bad", true).is_err());
+        assert!(validate_js_repository_name("bad.name", true).is_err());
+        assert!(validate_js_repository_name("bad name", true).is_err());
+        assert!(validate_js_repository_name("bad-obj", false).is_err());
+        assert!(validate_js_repository_name("__proto__", true).is_err());
+        assert!(validate_js_repository_name("constructor", true).is_err());
+        assert!(validate_js_repository_name("prototype", true).is_err());
+
+        let settings = JsRepositorySettings {
+            enabled: true,
+            global_object_name: Some("myApp".into()),
+            method_style: JsRepositoryMethodStyle::AutoByGlobalName,
+            legacy_binding_enabled: true,
+            objects: vec![JsRepositoryObjectDescriptor {
+                name: "hostApi".into(),
+                is_async: true,
+                methods: vec!["greet".into()],
+                properties: vec![JsRepositoryPropertyDescriptor {
+                    name: "version".into(),
+                    value_json: "\"1.0\"".into(),
+                    readonly: true,
+                }],
+                sub_objects: Vec::new(),
+            }],
+        };
+        assert!(settings.validate().is_ok());
+        assert!(settings.uses_camel_case_methods());
+
+        let pascal = JsRepositorySettings {
+            global_object_name: Some("MyApp".into()),
+            ..settings.clone()
+        };
+        assert!(!pascal.uses_camel_case_methods());
+
+        let bad_json = JsRepositorySettings {
+            objects: vec![JsRepositoryObjectDescriptor {
+                name: "hostApi".into(),
+                is_async: true,
+                methods: Vec::new(),
+                properties: vec![JsRepositoryPropertyDescriptor {
+                    name: "broken".into(),
+                    value_json: "{not-json".into(),
+                    readonly: true,
+                }],
+                sub_objects: Vec::new(),
+            }],
+            ..settings
+        };
+        assert!(bad_json.validate().is_err());
+    }
+
+    #[test]
+    fn encode_repo_bootstrap_config_preserves_compat_and_opt_in_modes() {
+        let (legacy, compat_json) = encode_repo_bootstrap_config(None, false);
+        assert!(!legacy);
+        assert!(compat_json.contains("\"compatDefault\":true"));
+        assert!(compat_json.contains("\"enabled\":true"));
+
+        let custom = JsRepositorySettings {
+            enabled: true,
+            global_object_name: Some("customApi".into()),
+            method_style: JsRepositoryMethodStyle::AutoByGlobalName,
+            legacy_binding_enabled: true,
+            objects: Vec::new(),
+        };
+        let (eff_legacy, custom_json) = encode_repo_bootstrap_config(Some(&custom), false);
+        assert!(eff_legacy);
+        assert!(custom_json.contains("\"compatDefault\":false"));
+        assert!(custom_json.contains("\"globalObjectName\":\"customApi\""));
+        assert!(custom_json.contains("\"camelCaseMethods\":true"));
     }
 }

@@ -3,7 +3,7 @@ name = "gpui-cef-poc"
 version = "0.2.0"
 edition = "2024"
 license = "MIT"
-description = "Minimal Windows x64 GPUI + CEF software OSR proof of concept"
+description = "cef-rs-gpui: Windows x64 GPUI + Chromium Embedded Framework (CEF) browser component, runtime SDK, and desktop examples"
 default-run = "gpui-cef-component-demo"
 
 [features]
@@ -42,7 +42,7 @@ gpui = { version = "=0.3.12", package = "gpui-pre", default-features = false, fe
 gpui_platform = { version = "=0.3.12", package = "gpui-pre-platform" }
 # Styled component set (buttons, menus, inputs) from the GPUI Kit project. It
 # pins the same gpui-pre version, so the two must move together.
-gpui-component = { version = "=0.9.1", default-features = false, optional = true }
+gpui-component = { workspace = true, optional = true }
 image = { version = "0.25", default-features = false, optional = true }
 # gpui's `Window` implements `HasWindowHandle` from this crate; the raw HWND is
 # needed for the two Win32 calls gpui does not wrap (IME candidate placement).

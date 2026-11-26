@@ -16,19 +16,23 @@ use rust_cef_gpui::{
     js_bridge::{EvalOutcome, EvalRequestId},
 };
 
+use rust_cef_gpui::host_capabilities::{DownloadId, DownloadRequest};
+
 use super::{
-    ExampleAccounting, TabRuntime,
+    ExampleAccounting, TabRuntime, UxServices,
     assets::{
-        BINDING_TEST_ALL_URL, BINDING_TEST_SINGLE_URL, BINDING_TEST_URL,
+        BEFORE_UNLOAD_TEST_URL, BINDING_TEST_ALL_URL, BINDING_TEST_SINGLE_URL, BINDING_TEST_URL,
         BINDING_TESTS_ASYNC_TASK_URL, CDM_SUPPORT_TEST_URL, CHROME_INTERNAL_URLS,
-        CUSTOM_POST_URL, DEFAULT_HOME_URL, DRAGGABLE_REGION_TEST_URL, LEGACY_BINDING_TEST_URL,
-        MULTI_BINDING_TEST_URL, POST_MESSAGE_TEST_URL, RESPONSE_FILTER_TEST_URL,
-        SCHEME_TEST_URL,
+        CHROME_PROCESS_INTERNAL_URLS, CUSTOM_POST_URL, DEFAULT_HOME_URL, DESKTOP_UX_FIXTURES_URL,
+        DRAGGABLE_REGION_TEST_URL, LEGACY_BINDING_TEST_URL, MULTI_BINDING_TEST_URL,
+        POST_MESSAGE_TEST_URL, RESPONSE_FILTER_TEST_URL, SCHEME_TEST_URL,
     },
+    close_find_bar_for_tab,
+    dialogs::FileDialogTracker,
+    finalize_close_example_tab,
     jsb_rpc::{CefRsGpuiRpcHost, JsonVal, QUnitSummary, parse_json},
-    close_example_tab,
-    model::ExampleConfig,
-    spawn_example_tab,
+    model::{ExampleConfig, TextBuffer},
+    open_find_bar_for_tab, spawn_example_tab, trigger_find_for_tab,
     ui::CefExampleRoot,
 };
 
@@ -64,6 +68,11 @@ enum VerifyStage {
     WaitChromeUrls,
     StartMultiBinding,
     WaitMultiBinding,
+    StartDesktopUxFixtures,
+    WaitDesktopUxFixtures,
+    WaitDesktopUxFind,
+    StartBeforeUnloadFixture,
+    WaitBeforeUnloadFixture,
     Done,
 }
 
@@ -77,6 +86,8 @@ pub(super) struct VerifyDriver {
     pdf_ticket: Option<(PathBuf, PdfExportTicket)>,
     scheme_ajax_triggered: bool,
     custom_post_submitted: bool,
+    find_substep: u8,
+    chrome_ready_at: Option<Instant>,
 }
 
 impl VerifyDriver {
@@ -92,6 +103,8 @@ impl VerifyDriver {
             pdf_ticket: None,
             scheme_ajax_triggered: false,
             custom_post_submitted: false,
+            find_substep: 0,
+            chrome_ready_at: None,
         }
     }
 
@@ -109,6 +122,9 @@ impl VerifyDriver {
         cx: &mut AsyncApp,
         rt_cell: &std::rc::Rc<std::cell::RefCell<Option<Runtime>>>,
         menus: Option<&std::rc::Rc<std::cell::RefCell<rust_cef_gpui::ContextMenuServices>>>,
+        ux: &mut UxServices,
+        file_dialogs: &mut FileDialogTracker,
+        pending_save_as: &mut BTreeMap<DownloadId, (u64, u64, String, DownloadRequest)>,
         cap_adapter: &std::sync::Arc<super::ExampleCapAdapter>,
         root: WindowHandle<CefExampleRoot>,
         config: &ExampleConfig,
@@ -118,10 +134,49 @@ impl VerifyDriver {
         tabs: &mut BTreeMap<u64, TabRuntime>,
         rpc: &mut CefRsGpuiRpcHost,
     ) -> Result<(), String> {
-        if Instant::now() >= self.deadline {
+        let timed_out = Instant::now() >= self.deadline
+            || (matches!(
+                self.stage,
+                VerifyStage::WaitChromeUrls | VerifyStage::WaitDesktopUxFind
+            ) && self.stage_started.elapsed() >= Duration::from_secs(20));
+        if timed_out {
+            let nav_diag = self.active_test_tab.and_then(|id| tabs.get(&id)).map(|t| {
+                let s = t.handle.snapshot();
+                format!(
+                    "url={:?} loading={} title={:?} err={:?}",
+                    s.navigation.address,
+                    s.navigation.is_loading,
+                    s.navigation.title,
+                    s.navigation.last_main_frame_error
+                )
+            });
+            let find_diag = self
+                .active_test_tab
+                .and_then(|id| {
+                    root.update(cx, |r, _, _| {
+                        r.model.tab(id).map(|t| {
+                            format!(
+                                "open={} in_prog={} matches={} ordinal={} err={:?} pending={:?} query={:?}",
+                                t.find.open,
+                                t.find.search_in_progress,
+                                t.find.matches,
+                                t.find.active_ordinal,
+                                t.find.last_error,
+                                t.find.pending_after_finish,
+                                t.find.query.text
+                            )
+                        })
+                    })
+                    .ok()
+                    .flatten()
+                });
+            let rt_diag = rt_cell
+                .borrow()
+                .as_ref()
+                .map(|rt| format!("{:?}", rt.find_diagnostics()));
             return Err(format!(
-                "cef-rs-gpui verify suite timed out at stage {:?} (qunit_failures={:?})",
-                self.stage, rpc.qunit_failures
+                "cef-rs-gpui verify suite timed out at stage {:?} substep={} (nav={:?}, find={:?}, rt_find={:?}, qunit_failures={:?})",
+                self.stage, self.find_substep, nav_diag, find_diag, rt_diag, rpc.qunit_failures
             ));
         }
 
@@ -142,6 +197,7 @@ impl VerifyDriver {
                     cx,
                     rt_cell,
                     menus,
+                    ux,
                     cap_adapter,
                     root,
                     config,
@@ -158,7 +214,7 @@ impl VerifyDriver {
             VerifyStage::WaitBindingNetCore => {
                 if let Some(res) = self.check_qunit_done_msg(rpc) {
                     Self::assert_qunit("BindingTestNetCore", &res, 50, rpc)?;
-                    self.close_active_test_tab(cx, rt_cell, menus, root, accounting, tabs)?;
+                    self.close_active_test_tab(cx, rt_cell, menus, ux, file_dialogs, pending_save_as, root, accounting, tabs)?;
                     self.stage = VerifyStage::StartBindingSingle;
                 }
             }
@@ -167,6 +223,7 @@ impl VerifyDriver {
                     cx,
                     rt_cell,
                     menus,
+                    ux,
                     cap_adapter,
                     root,
                     config,
@@ -184,7 +241,7 @@ impl VerifyDriver {
             VerifyStage::WaitBindingSingle => {
                 if let Some(res) = self.poll_qunit_via_eval(cx, root, tabs, "BindingTestSingle")? {
                     Self::assert_qunit("BindingTestSingle", &res, 2, rpc)?;
-                    self.close_active_test_tab(cx, rt_cell, menus, root, accounting, tabs)?;
+                    self.close_active_test_tab(cx, rt_cell, menus, ux, file_dialogs, pending_save_as, root, accounting, tabs)?;
                     self.stage = VerifyStage::StartLegacyBinding;
                 }
             }
@@ -193,6 +250,7 @@ impl VerifyDriver {
                     cx,
                     rt_cell,
                     menus,
+                    ux,
                     cap_adapter,
                     root,
                     config,
@@ -209,7 +267,7 @@ impl VerifyDriver {
             VerifyStage::WaitLegacyBinding => {
                 if let Some(res) = self.check_qunit_done_msg(rpc) {
                     Self::assert_qunit("LegacyBindingTest", &res, 1020, rpc)?;
-                    self.close_active_test_tab(cx, rt_cell, menus, root, accounting, tabs)?;
+                    self.close_active_test_tab(cx, rt_cell, menus, ux, file_dialogs, pending_save_as, root, accounting, tabs)?;
                     self.stage = VerifyStage::StartBindingAll;
                 }
             }
@@ -218,6 +276,7 @@ impl VerifyDriver {
                     cx,
                     rt_cell,
                     menus,
+                    ux,
                     cap_adapter,
                     root,
                     config,
@@ -234,7 +293,7 @@ impl VerifyDriver {
             VerifyStage::WaitBindingAll => {
                 if let Some(res) = self.check_qunit_done_msg(rpc) {
                     Self::assert_qunit("BindingTest(Sync+Async)", &res, 1070, rpc)?;
-                    self.close_active_test_tab(cx, rt_cell, menus, root, accounting, tabs)?;
+                    self.close_active_test_tab(cx, rt_cell, menus, ux, file_dialogs, pending_save_as, root, accounting, tabs)?;
                     self.stage = VerifyStage::StartPostMessage;
                 }
             }
@@ -243,6 +302,7 @@ impl VerifyDriver {
                     cx,
                     rt_cell,
                     menus,
+                    ux,
                     cap_adapter,
                     root,
                     config,
@@ -260,7 +320,7 @@ impl VerifyDriver {
             VerifyStage::WaitPostMessage => {
                 if let Some(res) = self.poll_qunit_via_eval(cx, root, tabs, "PostMessageTest")? {
                     Self::assert_qunit("PostMessageTest", &res, 2, rpc)?;
-                    self.close_active_test_tab(cx, rt_cell, menus, root, accounting, tabs)?;
+                    self.close_active_test_tab(cx, rt_cell, menus, ux, file_dialogs, pending_save_as, root, accounting, tabs)?;
                     self.stage = VerifyStage::StartAsyncTask;
                 }
             }
@@ -269,6 +329,7 @@ impl VerifyDriver {
                     cx,
                     rt_cell,
                     menus,
+                    ux,
                     cap_adapter,
                     root,
                     config,
@@ -285,7 +346,7 @@ impl VerifyDriver {
             VerifyStage::WaitAsyncTask => {
                 if let Some(res) = self.check_qunit_done_msg(rpc) {
                     Self::assert_qunit("BindingTestsAsyncTask", &res, 13, rpc)?;
-                    self.close_active_test_tab(cx, rt_cell, menus, root, accounting, tabs)?;
+                    self.close_active_test_tab(cx, rt_cell, menus, ux, file_dialogs, pending_save_as, root, accounting, tabs)?;
                     self.stage = VerifyStage::StartResponseFilter;
                 }
             }
@@ -294,6 +355,7 @@ impl VerifyDriver {
                     cx,
                     rt_cell,
                     menus,
+                    ux,
                     cap_adapter,
                     root,
                     config,
@@ -317,7 +379,7 @@ impl VerifyDriver {
                 )? {
                     if val == "\"OK\"" {
                         println!("CEF_EXAMPLE_VERIFY item=ResponseFilter ok=true");
-                        self.close_active_test_tab(cx, rt_cell, menus, root, accounting, tabs)?;
+                        self.close_active_test_tab(cx, rt_cell, menus, ux, file_dialogs, pending_save_as, root, accounting, tabs)?;
                         self.stage = VerifyStage::StartSchemeAjax;
                     }
                 }
@@ -327,6 +389,7 @@ impl VerifyDriver {
                     cx,
                     rt_cell,
                     menus,
+                    ux,
                     cap_adapter,
                     root,
                     config,
@@ -362,7 +425,7 @@ impl VerifyDriver {
                 )? {
                     if val.contains("Post Data: user=lion&pass=123") {
                         println!("CEF_EXAMPLE_VERIFY item=SchemeAndAjaxPost ok=true");
-                        self.close_active_test_tab(cx, rt_cell, menus, root, accounting, tabs)?;
+                        self.close_active_test_tab(cx, rt_cell, menus, ux, file_dialogs, pending_save_as, root, accounting, tabs)?;
                         self.stage = VerifyStage::StartCustomPost;
                     }
                 }
@@ -372,6 +435,7 @@ impl VerifyDriver {
                     cx,
                     rt_cell,
                     menus,
+                    ux,
                     cap_adapter,
                     root,
                     config,
@@ -420,7 +484,7 @@ impl VerifyDriver {
                 {
                     if val.contains("Post Data: test=123&data=456") {
                         println!("CEF_EXAMPLE_VERIFY item=LoadCustomRequest ok=true");
-                        self.close_active_test_tab(cx, rt_cell, menus, root, accounting, tabs)?;
+                        self.close_active_test_tab(cx, rt_cell, menus, ux, file_dialogs, pending_save_as, root, accounting, tabs)?;
                         self.stage = VerifyStage::StartPdfExport;
                     } else {
                         return Err(format!("Custom POST unexpected body: {val}"));
@@ -475,6 +539,7 @@ impl VerifyDriver {
                     cx,
                     rt_cell,
                     menus,
+                    ux,
                     cap_adapter,
                     root,
                     config,
@@ -502,7 +567,7 @@ impl VerifyDriver {
                         && parsed.obj_get("playbackSupport").is_some()
                     {
                         println!("CEF_EXAMPLE_VERIFY item=CdmSupportTest ok=true");
-                        self.close_active_test_tab(cx, rt_cell, menus, root, accounting, tabs)?;
+                        self.close_active_test_tab(cx, rt_cell, menus, ux, file_dialogs, pending_save_as, root, accounting, tabs)?;
                         self.stage = VerifyStage::StartDraggableRegion;
                     }
                 }
@@ -512,6 +577,7 @@ impl VerifyDriver {
                     cx,
                     rt_cell,
                     menus,
+                    ux,
                     cap_adapter,
                     root,
                     config,
@@ -538,13 +604,13 @@ impl VerifyDriver {
                         .unwrap_or(0);
                     if count >= 4 {
                         println!("CEF_EXAMPLE_VERIFY item=DraggableRegion count={count} ok=true");
-                        self.close_active_test_tab(cx, rt_cell, menus, root, accounting, tabs)?;
+                        self.close_active_test_tab(cx, rt_cell, menus, ux, file_dialogs, pending_save_as, root, accounting, tabs)?;
                         self.stage = VerifyStage::StartChromeUrls;
                     } else if Instant::now().duration_since(self.stage_started)
                         > Duration::from_secs(5)
                     {
                         println!("CEF_EXAMPLE_VERIFY item=DraggableRegion count={count} ok=true");
-                        self.close_active_test_tab(cx, rt_cell, menus, root, accounting, tabs)?;
+                        self.close_active_test_tab(cx, rt_cell, menus, ux, file_dialogs, pending_save_as, root, accounting, tabs)?;
                         self.stage = VerifyStage::StartChromeUrls;
                     }
                 }
@@ -554,6 +620,7 @@ impl VerifyDriver {
                     cx,
                     rt_cell,
                     menus,
+                    ux,
                     cap_adapter,
                     root,
                     config,
@@ -565,23 +632,84 @@ impl VerifyDriver {
                 )?;
                 self.active_test_tab = Some(id);
                 self.eval_pending = None;
+                self.find_substep = 0;
+                self.chrome_ready_at = None;
                 self.stage_started = Instant::now();
                 self.stage = VerifyStage::WaitChromeUrls;
             }
             VerifyStage::WaitChromeUrls => {
-                if let Some(id) = self.active_test_tab
-                    && tabs.get(&id).is_some_and(|t| {
-                        let s = t.handle.snapshot();
-                        t.first_paint
-                            && !s.navigation.is_loading
-                            && s.navigation.address.starts_with("chrome://")
-                            && s.navigation.last_main_frame_error.is_none()
-                            && !s.navigation.title.is_empty()
-                    })
-                {
-                    println!("CEF_EXAMPLE_VERIFY item=ChromeUrls ok=true");
-                    self.close_active_test_tab(cx, rt_cell, menus, root, accounting, tabs)?;
-                    self.stage = VerifyStage::StartMultiBinding;
+                if let Some(id) = self.active_test_tab {
+                    if self.find_substep == 0
+                        && tabs.get(&id).is_some_and(|t| {
+                            let s = t.handle.snapshot();
+                            t.first_paint
+                                && !s.navigation.is_loading
+                                && s.navigation.address.starts_with("chrome://")
+                                && s.navigation.last_main_frame_error.is_none()
+                                && !s.navigation.title.is_empty()
+                        })
+                    {
+                        let _ = root.update(cx, |r, _, cx| {
+                            if let Some(v) = r.views.get(&id).cloned() {
+                                v.load_url(CHROME_PROCESS_INTERNAL_URLS.into(), cx);
+                            }
+                        });
+                        self.chrome_ready_at = None;
+                        self.find_substep = 1;
+                    } else if self.find_substep == 1
+                        && tabs.get(&id).is_some_and(|t| {
+                            let s = t.handle.snapshot();
+                            !s.navigation.is_loading
+                                && s.navigation.address.starts_with("chrome://process-internals")
+                                && !s.navigation.title.is_empty()
+                        })
+                    {
+                        let ready_at = *self.chrome_ready_at.get_or_insert_with(Instant::now);
+                        if ready_at.elapsed() >= Duration::from_millis(200) {
+                            let _ = open_find_bar_for_tab(cx, root, id);
+                            for typed in ["P", "Pr", "Pro"] {
+                                let _ = root.update(cx, |r, _, cx| {
+                                    if let Some(t) = r.model.tab_mut(id) {
+                                        t.find.query = TextBuffer::new(typed);
+                                    }
+                                    cx.notify();
+                                });
+                                trigger_find_for_tab(cx, root, tabs, rt_cell, id, true, false);
+                            }
+                            self.find_substep = 2;
+                        }
+                    } else if self.find_substep == 2
+                        && root
+                            .update(cx, |r, _, _| {
+                                r.model.tab(id).is_some_and(|t| {
+                                    !t.find.search_in_progress
+                                        && t.find.matches >= 2
+                                        && t.find.active_ordinal == 1
+                                        && t.find.last_error.is_none()
+                                })
+                            })
+                            .unwrap_or(false)
+                    {
+                        trigger_find_for_tab(cx, root, tabs, rt_cell, id, true, true);
+                        self.find_substep = 3;
+                    } else if self.find_substep == 3
+                        && root
+                            .update(cx, |r, _, _| {
+                                r.model.tab(id).is_some_and(|t| {
+                                    !t.find.search_in_progress
+                                        && t.find.active_ordinal == 2
+                                        && t.find.last_error.is_none()
+                                })
+                            })
+                            .unwrap_or(false)
+                    {
+                        close_find_bar_for_tab(cx, root, tabs, rt_cell, id);
+                        println!("CEF_EXAMPLE_VERIFY item=ChromeUrls ok=true");
+                        self.close_active_test_tab(cx, rt_cell, menus, ux, file_dialogs, pending_save_as, root, accounting, tabs)?;
+                        self.find_substep = 0;
+                        self.chrome_ready_at = None;
+                        self.stage = VerifyStage::StartMultiBinding;
+                    }
                 }
             }
             VerifyStage::StartMultiBinding => {
@@ -589,6 +717,7 @@ impl VerifyDriver {
                     cx,
                     rt_cell,
                     menus,
+                    ux,
                     cap_adapter,
                     root,
                     config,
@@ -615,10 +744,186 @@ impl VerifyDriver {
                 {
                     if val.trim() == "6" {
                         println!("CEF_EXAMPLE_VERIFY item=MultiBindingTest iframes=6 ok=true");
-                        self.close_active_test_tab(cx, rt_cell, menus, root, accounting, tabs)?;
-                        self.stage = VerifyStage::Done;
-                        println!("CEF_EXAMPLE_VERIFY_SUITE ok=true");
+                        self.close_active_test_tab(cx, rt_cell, menus, ux, file_dialogs, pending_save_as, root, accounting, tabs)?;
+                        self.stage = VerifyStage::StartDesktopUxFixtures;
                     }
+                }
+            }
+            VerifyStage::StartDesktopUxFixtures => {
+                let id = Self::open_tab(
+                    cx,
+                    rt_cell,
+                    menus,
+                    ux,
+                    cap_adapter,
+                    root,
+                    config,
+                    next_tab_id,
+                    DESKTOP_UX_FIXTURES_URL,
+                    false,
+                    accounting,
+                    tabs,
+                )?;
+                self.active_test_tab = Some(id);
+                self.eval_pending = None;
+                self.stage_started = Instant::now();
+                self.stage = VerifyStage::WaitDesktopUxFixtures;
+            }
+            VerifyStage::WaitDesktopUxFixtures => {
+                if let Some(id) = self.active_test_tab
+                    && let Some(val) = self.poll_eval_expr(
+                        cx,
+                        root,
+                        tabs,
+                        "(document.body && document.body.innerText.includes('SEARCH_TOKEN_ALPHA')) ? 'READY' : ''",
+                    )?
+                    && val == "\"READY\""
+                {
+                    let _ = open_find_bar_for_tab(cx, root, id);
+                    for typed in ["S", "SE", "SEARCH_TOKEN_ALPHA"] {
+                        let _ = root.update(cx, |r, _, cx| {
+                            if let Some(t) = r.model.tab_mut(id) {
+                                t.find.query = TextBuffer::new(typed);
+                            }
+                            cx.notify();
+                        });
+                        trigger_find_for_tab(cx, root, tabs, rt_cell, id, true, false);
+                    }
+                    self.find_substep = 0;
+                    self.stage_started = Instant::now();
+                    self.stage = VerifyStage::WaitDesktopUxFind;
+                }
+            }
+            VerifyStage::WaitDesktopUxFind => {
+                if let Some(id) = self.active_test_tab {
+                    if self.find_substep == 0
+                        && root
+                            .update(cx, |r, _, _| {
+                                r.model.tab(id).is_some_and(|t| {
+                                    t.find.open
+                                        && !t.find.search_in_progress
+                                        && t.find.matches >= 2
+                                        && t.find.active_ordinal == 1
+                                        && t.find.last_error.is_none()
+                                })
+                            })
+                            .unwrap_or(false)
+                    {
+                        trigger_find_for_tab(cx, root, tabs, rt_cell, id, true, false);
+                        trigger_find_for_tab(cx, root, tabs, rt_cell, id, true, true);
+                        self.find_substep = 1;
+                    } else if self.find_substep == 1
+                        && root
+                            .update(cx, |r, _, _| {
+                                r.model.tab(id).is_some_and(|t| {
+                                    t.find.open
+                                        && !t.find.search_in_progress
+                                        && t.find.active_ordinal == 2
+                                        && t.find.last_error.is_none()
+                                })
+                            })
+                            .unwrap_or(false)
+                    {
+                        trigger_find_for_tab(cx, root, tabs, rt_cell, id, false, true);
+                        self.find_substep = 2;
+                    } else if self.find_substep == 2
+                        && root
+                            .update(cx, |r, _, _| {
+                                r.model.tab(id).is_some_and(|t| {
+                                    t.find.open
+                                        && !t.find.search_in_progress
+                                        && t.find.active_ordinal == 1
+                                        && t.find.last_error.is_none()
+                                })
+                            })
+                            .unwrap_or(false)
+                    {
+                        let _ = root.update(cx, |r, _, cx| {
+                            if let Some(t) = r.model.tab_mut(id) {
+                                t.find.query = TextBuffer::new("SEARCH");
+                            }
+                            cx.notify();
+                        });
+                        trigger_find_for_tab(cx, root, tabs, rt_cell, id, true, false);
+                        close_find_bar_for_tab(cx, root, tabs, rt_cell, id);
+                        self.find_substep = 3;
+                    } else if self.find_substep == 3
+                        && root
+                            .update(cx, |r, _, _| {
+                                r.model.tab(id).is_some_and(|t| {
+                                    !t.find.open
+                                        && !t.find.search_in_progress
+                                        && t.find.pending_after_finish.is_none()
+                                })
+                            })
+                            .unwrap_or(false)
+                    {
+                        let _ = open_find_bar_for_tab(cx, root, id);
+                        let _ = root.update(cx, |r, _, cx| {
+                            if let Some(t) = r.model.tab_mut(id) {
+                                t.find.query = TextBuffer::new("SEARCH_TOKEN_ALPHA");
+                            }
+                            cx.notify();
+                        });
+                        trigger_find_for_tab(cx, root, tabs, rt_cell, id, true, false);
+                        self.find_substep = 4;
+                    } else if self.find_substep == 4
+                        && let Some(matches) = root
+                            .update(cx, |r, _, _| {
+                                r.model
+                                    .tab(id)
+                                    .filter(|t| {
+                                        t.find.open
+                                            && !t.find.search_in_progress
+                                            && t.find.matches >= 2
+                                            && t.find.active_ordinal == 1
+                                            && t.find.last_error.is_none()
+                                    })
+                                    .map(|t| t.find.matches)
+                            })
+                            .ok()
+                            .flatten()
+                    {
+                        close_find_bar_for_tab(cx, root, tabs, rt_cell, id);
+                        println!("CEF_EXAMPLE_VERIFY item=DesktopUxFind matches={matches} ok=true");
+                        self.close_active_test_tab(cx, rt_cell, menus, ux, file_dialogs, pending_save_as, root, accounting, tabs)?;
+                        self.find_substep = 0;
+                        self.stage = VerifyStage::StartBeforeUnloadFixture;
+                    }
+                }
+            }
+            VerifyStage::StartBeforeUnloadFixture => {
+                let id = Self::open_tab(
+                    cx,
+                    rt_cell,
+                    menus,
+                    ux,
+                    cap_adapter,
+                    root,
+                    config,
+                    next_tab_id,
+                    BEFORE_UNLOAD_TEST_URL,
+                    false,
+                    accounting,
+                    tabs,
+                )?;
+                self.active_test_tab = Some(id);
+                self.eval_pending = None;
+                self.stage_started = Instant::now();
+                self.stage = VerifyStage::WaitBeforeUnloadFixture;
+            }
+            VerifyStage::WaitBeforeUnloadFixture => {
+                if let Some(val) = self.poll_eval_expr(
+                    cx,
+                    root,
+                    tabs,
+                    "window.__armBeforeUnload === true ? 'ARMED' : ''",
+                )? && val == "\"ARMED\""
+                {
+                    println!("CEF_EXAMPLE_VERIFY item=BeforeUnloadFixture ok=true");
+                    self.close_active_test_tab(cx, rt_cell, menus, ux, file_dialogs, pending_save_as, root, accounting, tabs)?;
+                    self.stage = VerifyStage::Done;
+                    println!("CEF_EXAMPLE_VERIFY_SUITE ok=true");
                 }
             }
             VerifyStage::Done => {}
@@ -631,6 +936,7 @@ impl VerifyDriver {
         cx: &mut AsyncApp,
         rt_cell: &std::rc::Rc<std::cell::RefCell<Option<Runtime>>>,
         menus: Option<&std::rc::Rc<std::cell::RefCell<rust_cef_gpui::ContextMenuServices>>>,
+        ux: &mut UxServices,
         cap_adapter: &std::sync::Arc<super::ExampleCapAdapter>,
         root: WindowHandle<CefExampleRoot>,
         config: &ExampleConfig,
@@ -646,6 +952,7 @@ impl VerifyDriver {
             cx,
             rt_cell,
             menus,
+            ux,
             cap_adapter,
             root,
             config,
@@ -659,18 +966,34 @@ impl VerifyDriver {
         Ok(id)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn close_active_test_tab(
         &mut self,
         cx: &mut AsyncApp,
         rt_cell: &std::rc::Rc<std::cell::RefCell<Option<Runtime>>>,
         menus: Option<&std::rc::Rc<std::cell::RefCell<rust_cef_gpui::ContextMenuServices>>>,
+        ux: &mut UxServices,
+        file_dialogs: &mut FileDialogTracker,
+        pending_save_as: &mut BTreeMap<DownloadId, (u64, u64, String, DownloadRequest)>,
         root: WindowHandle<CefExampleRoot>,
         accounting: &mut ExampleAccounting,
         tabs: &mut BTreeMap<u64, TabRuntime>,
     ) -> Result<(), String> {
         self.eval_pending = None;
         if let Some(id) = self.active_test_tab.take() {
-            close_example_tab(cx, rt_cell, menus, root, id, accounting, tabs)?;
+            finalize_close_example_tab(
+                cx,
+                rt_cell,
+                menus,
+                ux,
+                file_dialogs,
+                pending_save_as,
+                root,
+                id,
+                accounting,
+                tabs,
+                false,
+            )?;
         }
         Ok(())
     }
@@ -818,8 +1141,14 @@ impl VerifyDriver {
             .unwrap_or(0)
             .max(0) as u64;
         if failed != 0 || total == 0 {
-            let banner = parsed.obj_get("banner").and_then(JsonVal::as_str).unwrap_or("");
-            let tests_text = parsed.obj_get("testsText").and_then(JsonVal::as_str).unwrap_or("");
+            let banner = parsed
+                .obj_get("banner")
+                .and_then(JsonVal::as_str)
+                .unwrap_or("");
+            let tests_text = parsed
+                .obj_get("testsText")
+                .and_then(JsonVal::as_str)
+                .unwrap_or("");
             eprintln!("QUNIT_DEBUG {name}: raw={raw} banner={banner:?} testsText={tests_text:?}");
         }
         Ok(Some(QUnitSummary {

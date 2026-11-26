@@ -200,11 +200,7 @@ impl FastMouseMoveQueue {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut out = Vec::new();
-        while st
-            .queue
-            .front()
-            .is_some_and(|item| item.order <= max_order)
-        {
+        while st.queue.front().is_some_and(|item| item.order <= max_order) {
             if let Some(item) = st.queue.pop_front() {
                 out.push(item);
             }
@@ -700,6 +696,7 @@ pub(crate) struct UiRegistry {
     pub(crate) menu_bridge: crate::menu_bridge::MenuBridge,
     pub(crate) sources: Arc<crate::source_view::SourceViews>,
     pub(crate) finds: Arc<crate::find::Finds>,
+    pub(crate) host_find_source: crate::host_find_source::HostFindSourceBook,
     pub(crate) prints: crate::print_operations::PrintOperations,
     /// Accounting only; no DevTools capability is enabled until a real managed
     /// auxiliary client/window service supplies the native retirement evidence.
@@ -711,6 +708,7 @@ pub(crate) struct UiRegistry {
     pub(crate) pdf_exports: Arc<crate::pdf_export::PdfExportRegistry>,
     pub(crate) headless_cdp: Arc<crate::headless_cdp::HeadlessCdpManager>,
     pub(crate) outbound_drags: Arc<crate::outbound_drag::OutboundDragManager>,
+    pub(crate) frame_texts: Arc<crate::frame_text::FrameTextLedger>,
     url_requests: OnceLock<Weak<crate::url_request::UrlRequestManager>>,
     #[cfg(feature = "test-support")]
     probe_dialogs: Mutex<BTreeMap<BrowserId, crate::dialog_probe::DialogProbe>>,
@@ -839,6 +837,7 @@ impl UiRegistry {
             menu_bridge: crate::menu_bridge::MenuBridge::new(),
             sources: crate::source_view::SourceViews::new(),
             finds: crate::find::Finds::new(),
+            host_find_source: crate::host_find_source::HostFindSourceBook::new(),
             prints: crate::print_operations::PrintOperations::default(),
             auxiliary_native: crate::devtools::resources::NativeAuxiliaries::new(devtools.clone()),
             auxiliary_windows: crate::devtools::windows::NativeWindows::new(devtools.clone()),
@@ -847,6 +846,7 @@ impl UiRegistry {
             pdf_exports: crate::pdf_export::PdfExportRegistry::new(),
             headless_cdp: crate::headless_cdp::HeadlessCdpManager::new(),
             outbound_drags: crate::outbound_drag::OutboundDragManager::new(),
+            frame_texts: crate::frame_text::FrameTextLedger::new(),
             url_requests: OnceLock::new(),
             devtools,
             #[cfg(feature = "test-support")]
@@ -1226,7 +1226,7 @@ impl UiRegistry {
         self.profiles.get().and_then(Weak::upgrade)
     }
 
-    fn executor(&self) -> Option<Arc<Executor>> {
+    pub(crate) fn executor(&self) -> Option<Arc<Executor>> {
         self.executor.get().and_then(Weak::upgrade)
     }
 
@@ -2012,6 +2012,7 @@ impl UiRegistry {
         let caps = self.host_capabilities();
         self.host_requests.cancel_all(&self.audit, &caps);
         self.headless_cdp.detach_all(on_ui);
+        self.frame_texts.cancel_all();
         self.pdf_exports.close_all();
         if let Some(urls) = self.url_requests() {
             urls.drain_on_ui(on_ui);
@@ -2284,6 +2285,21 @@ impl UiRegistry {
             .get(&browser)
             .and_then(|e| e.client_state.as_ref())
             .is_some_and(|c| !c.find_unmanaged.load(Ordering::Acquire))
+    }
+    pub(crate) fn host_find_unmanaged(&self, browser: BrowserId) -> bool {
+        self.lock()
+            .browsers
+            .get(&browser)
+            .and_then(|e| e.client_state.as_ref())
+            .is_some_and(|c| c.find_unmanaged.load(Ordering::Acquire))
+    }
+    #[cfg(test)]
+    pub(crate) fn mark_alive_for_test(&self, browser: BrowserId) {
+        let mut s = self.lock();
+        if let Some(entry) = s.browsers.get_mut(&browser) {
+            entry.session.after_created();
+            entry.created_reported = true;
+        }
     }
     pub(crate) fn find_browser(&self, browser: BrowserId) -> Option<Browser> {
         let owner = {
@@ -3519,6 +3535,7 @@ impl UiRegistry {
         self.menus.native_closed(browser);
         let _ = self.sources.cancel(Some(browser), None, None);
         self.finds.browser_closed(browser);
+        self.host_find_source.browser_closed(browser);
         // Original Browser terminal is not proof of print job/UI retirement.
         self.prints.browser_closed(browser);
         // Parent OnBeforeClose does not prove its DevTools has been destroyed.
@@ -3590,6 +3607,7 @@ impl UiRegistry {
         self.host_requests
             .cancel_browser_all(browser, true, &self.audit, &caps);
         self.headless_cdp.detach_browser(true, browser);
+        self.frame_texts.cancel_browser(browser);
         self.cancel_browser_evals(browser, EvalError::Closed);
         // Only now is the instance really out of native state; publish the
         // terminal transition.
@@ -5949,6 +5967,37 @@ impl UiRegistry {
                     self.finds.fault();
                 }
             }
+            TaskPayload::HostFind {
+                id,
+                forward,
+                match_case,
+                find_next,
+            } => {
+                if on_ui {
+                    self.execute_host_find(id, forward, match_case, find_next);
+                } else {
+                    self.finds.fault();
+                }
+            }
+            TaskPayload::HostStopFinding {
+                browser,
+                clear_selection,
+                cutoff_sequence,
+            } => {
+                if on_ui {
+                    self.execute_host_stop_finding(browser, clear_selection, cutoff_sequence);
+                } else {
+                    self.finds.fault();
+                }
+            }
+            TaskPayload::HostViewSource { id } => {
+                if on_ui {
+                    self.execute_host_view_source(id);
+                } else {
+                    self.sources
+                        .fault(id, rust_cef_core::source_view::SourceFailure::WrongThread);
+                }
+            }
             TaskPayload::AuxiliaryClose(ticket) => {
                 if !on_ui {
                     self.devtools.fault();
@@ -6392,6 +6441,94 @@ impl UiRegistry {
                     }
                 }
             }
+            TaskPayload::ReadFrameText {
+                browser,
+                kind,
+                scope,
+                max_bytes,
+                reply,
+            } => {
+                crate::frame_text::run_frame_text_task(
+                    self, on_ui, browser, kind, scope, max_bytes, reply,
+                );
+            }
+            TaskPayload::ReadbackSharedTexture {
+                browser: _,
+                frame,
+                reply,
+            } => {
+                if !on_ui || self.is_draining() {
+                    reply.complete(Err(EngineError::Closed));
+                    return;
+                }
+                reply.complete(crate::capture::readback_shared_texture_frame(frame.frame()));
+            }
+            TaskPayload::CaptureCdpScreenshot {
+                browser,
+                token,
+                method_id,
+                params_json,
+            } => {
+                let Some(observer) = self
+                    .headless_cdp
+                    .take_pending_transient_observer(browser, token)
+                else {
+                    return;
+                };
+                let fail = |obs: &Arc<dyn rust_cef_core::host_capabilities::CdpObserver>,
+                            msg: &str| {
+                    obs.on_method_result(rust_cef_core::host_capabilities::CdpMethodResult {
+                        id: method_id,
+                        success: false,
+                        result_json: msg.to_string(),
+                    });
+                };
+                let Some(host) = on_ui.then(|| self.ready_cdp_host(browser)).flatten() else {
+                    fail(&observer, r#"{"error":"cdp host unavailable or disabled"}"#);
+                    return;
+                };
+                if self
+                    .headless_cdp
+                    .attach_transient_screenshot_observer(
+                        true,
+                        browser,
+                        token,
+                        &host,
+                        observer.clone(),
+                        &self.audit,
+                    )
+                    .is_err()
+                {
+                    fail(
+                        &observer,
+                        r#"{"error":"failed to attach transient screenshot observer"}"#,
+                    );
+                    return;
+                }
+                if self
+                    .headless_cdp
+                    .execute_method(
+                        true,
+                        &host,
+                        "Page.captureScreenshot",
+                        params_json.as_deref(),
+                        method_id.message_id,
+                        &self.audit,
+                    )
+                    .is_err()
+                {
+                    self.headless_cdp
+                        .detach_transient_observer(true, browser, token);
+                    fail(
+                        &observer,
+                        r#"{"error":"failed to execute Page.captureScreenshot"}"#,
+                    );
+                }
+            }
+            TaskPayload::DetachCdpScreenshot { browser, token } => {
+                self.headless_cdp
+                    .detach_transient_observer(on_ui, browser, token);
+            }
         }
     }
 
@@ -6562,12 +6699,14 @@ impl UiRegistry {
             ),
         };
         let settings = build_browser_settings(&config.options, background_color);
+        let repo_settings = client_state.policy.js_repository_settings();
         let mut extra_info = crate::js_bridge_native::build_browser_extra_info(
             browser,
             &config.options,
             &client_state.policy.rules,
             client_state.policy.js_bridge_allow_subframes(),
             client_state.policy.take_next_browser_legacy_binding(),
+            repo_settings.as_ref(),
         );
         let url = CefString::from(config.initial_url.as_str());
         if client_state.capture.is_abandoned() {
@@ -7016,8 +7155,10 @@ impl UiRegistry {
                     if let Some(error) = &failed {
                         ledger.last_native_error = Some(error.clone());
                     }
-                    entry.input_shadow.admitted =
-                        entry.input_shadow.admitted.saturating_add(pre_mouse_dispatched);
+                    entry.input_shadow.admitted = entry
+                        .input_shadow
+                        .admitted
+                        .saturating_add(pre_mouse_dispatched);
                     entry.restore_input(ledger);
                 }
                 entry.input_outstanding.remove(&id.sequence);
@@ -7042,9 +7183,8 @@ impl UiRegistry {
                             .position(|item| item.id.sequence == sequence)
                     })
                     .map(|position| entry.input_deferred.remove(position));
-                let drain_trailing = next.is_none()
-                    && entry.input_outstanding.is_empty()
-                    && entry.input.is_some();
+                let drain_trailing =
+                    next.is_none() && entry.input_outstanding.is_empty() && entry.input.is_some();
                 (next, entry.ime.revision() != ime_revision, drain_trailing)
             };
             if ime_changed {
@@ -7494,7 +7634,8 @@ impl UiRegistry {
                 let _ = self.sources.cancel(Some(browser), None, None);
                 self.cancel_finds(Some(browser), None);
                 self.clear_osr_drag_active(browser);
-                if let Some((done, native_drag)) = self.outbound_drags.take_active_for_browser(browser)
+                if let Some((done, native_drag)) =
+                    self.outbound_drags.take_active_for_browser(browser)
                     && let Some(host) = native.host()
                 {
                     let target_left = self.take_inbound_drag_active(browser)
@@ -8321,11 +8462,9 @@ impl BrowserControl for RuntimeBrowserControl {
         };
         let should_post = queue.enqueue(x, y, leaving, modifiers)?;
         if should_post
-            && let Err(err) = self
-                .executor
-                .post(TaskPayload::DrainMouseMoves {
-                    browser: self.browser,
-                })
+            && let Err(err) = self.executor.post(TaskPayload::DrainMouseMoves {
+                browser: self.browser,
+            })
         {
             queue.clear_scheduled();
             return Err(err);
@@ -8349,11 +8488,9 @@ impl BrowserControl for RuntimeBrowserControl {
         };
         let should_post = queue.enqueue_wheel(x, y, delta_x, delta_y, modifiers)?;
         if should_post
-            && let Err(err) = self
-                .executor
-                .post(TaskPayload::DrainMouseMoves {
-                    browser: self.browser,
-                })
+            && let Err(err) = self.executor.post(TaskPayload::DrainMouseMoves {
+                browser: self.browser,
+            })
         {
             queue.clear_scheduled();
             return Err(err);
@@ -11707,12 +11844,26 @@ mod tests {
 
         let pre = queue.take_up_to(cut);
         assert_eq!(pre.len(), 2);
-        assert!(matches!(pre[0].kind, FastPointerKind::Move { x: 10, y: 20, .. }));
-        assert!(matches!(pre[1].kind, FastPointerKind::Wheel { delta_y: -100, .. }));
+        assert!(matches!(
+            pre[0].kind,
+            FastPointerKind::Move { x: 10, y: 20, .. }
+        ));
+        assert!(matches!(
+            pre[1].kind,
+            FastPointerKind::Wheel { delta_y: -100, .. }
+        ));
 
         let post = queue.take_remaining_inline();
         assert_eq!(post.len(), 1);
-        assert!(matches!(post[0].kind, FastPointerKind::Wheel { x: 15, y: 25, delta_y: -33, .. }));
+        assert!(matches!(
+            post[0].kind,
+            FastPointerKind::Wheel {
+                x: 15,
+                y: 25,
+                delta_y: -33,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -11733,7 +11884,9 @@ mod tests {
         let posted_guard = posted.lock().unwrap();
         let zoom_posts = posted_guard
             .iter()
-            .filter(|payload| matches!(payload, TaskPayload::ApplyZoom { browser } if *browser == id))
+            .filter(
+                |payload| matches!(payload, TaskPayload::ApplyZoom { browser } if *browser == id),
+            )
             .count();
         assert_eq!(posted_guard.len(), 1);
         assert_eq!(zoom_posts, 1);
@@ -11755,7 +11908,10 @@ mod tests {
         registry.begin_create(id, config()).unwrap();
         let control = RuntimeBrowserControl::new(id, executor, registry.clone());
 
-        assert_eq!(control.submit_zoom_level_fast(0.5), Err(EngineError::NotReady));
+        assert_eq!(
+            control.submit_zoom_level_fast(0.5),
+            Err(EngineError::NotReady)
+        );
         assert_eq!(
             control.submit_zoom_level_fast(f64::NAN),
             Err(EngineError::InvalidRequest)
@@ -11769,7 +11925,10 @@ mod tests {
         }
         assert_eq!(control.submit_zoom_level_fast(0.5), Ok(()));
         registry.before_close(id);
-        assert_eq!(control.submit_zoom_level_fast(1.0), Err(EngineError::NotReady));
+        assert_eq!(
+            control.submit_zoom_level_fast(1.0),
+            Err(EngineError::NotReady)
+        );
     }
 
     #[test]

@@ -5,6 +5,7 @@ use std::{
     cell::{Cell, RefCell},
     collections::BTreeMap,
     ops::Range,
+    path::PathBuf,
     rc::Rc,
     sync::Arc,
 };
@@ -17,32 +18,37 @@ use gpui::{
     prelude::FluentBuilder as _, px, rgb, size,
 };
 use rust_cef_gpui::{
-    DefaultMenuPresenter,
-    contracts::zoom_level_to_percent,
-    dispatcher::UiWakeSender,
-    host_capabilities::JsDialogKind,
-    ports::UiDispatcher as _,
+    DefaultMenuPresenter, contracts::zoom_level_to_percent, dispatcher::UiWakeSender,
+    host_capabilities::JsDialogKind, ports::UiDispatcher as _,
 };
 
+use super::{ExampleAction, ExampleView};
 use super::{
     assets::{
-        BASIC_SCHEME_TEST_URL, BENCHMARK_SUITE_URL, BINDING_TEST_SINGLE_URL, BINDING_TEST_URL,
-        BINDING_TESTS_ASYNC_TASK_URL, CDM_SUPPORT_TEST_URL, CHROME_INTERNAL_URLS,
-        CHROME_NET_INTERNAL_URLS, CHROME_PROCESS_INTERNAL_URLS, DRAG_DROP_CURSORS_TEST_URL,
-        DRAGGABLE_REGION_TEST_URL, DEFAULT_HOME_URL, LEGACY_BINDING_TEST_URL, POPUP_PARENT_URL,
-        POPUP_TEST_URL, POST_MESSAGE_TEST_URL, RESPONSE_FILTER_TEST_URL, TOOLTIP_TEST_URL,
+        BASIC_SCHEME_TEST_URL, BEFORE_UNLOAD_TEST_URL, BENCHMARK_SUITE_URL,
+        BINDING_TEST_SINGLE_URL, BINDING_TEST_URL, BINDING_TESTS_ASYNC_TASK_URL,
+        CDM_SUPPORT_TEST_URL, CHROME_INTERNAL_URLS, CHROME_NET_INTERNAL_URLS,
+        CHROME_PROCESS_INTERNAL_URLS, DEFAULT_HOME_URL, DESKTOP_UX_FIXTURES_URL,
+        DRAG_DROP_CURSORS_TEST_URL, DRAGGABLE_REGION_TEST_URL, LEGACY_BINDING_TEST_URL,
+        POPUP_PARENT_URL, POPUP_TEST_URL, POST_MESSAGE_TEST_URL, RESPONSE_FILTER_TEST_URL,
+        TOOLTIP_TEST_URL,
     },
+    dialogs::{
+        render_auth_modal, render_before_unload_modal, render_certificate_modal,
+        render_permission_modal,
+    },
+    find_bar::render_find_bar,
     model::{
-        ActiveInput, MenuCategory, TextBuffer, ExampleAppModel, ExampleHostMode,
-        ExampleTabModel, is_point_draggable,
+        ActiveInput, ExampleAppModel, ExampleHostMode, ExampleTabModel, MenuCategory, TextBuffer,
+        is_point_draggable,
     },
     text_input::{
         KeyEditOutcome, TextFieldLayoutCache, TextFieldRenderSpec, TextFieldTheme,
-        apply_editor_key_down, child_hwnd_owns_win32_focus, ensure_parent_window_win32_focus,
-        render_text_field_box,
+        apply_editor_key_down_masked, child_hwnd_owns_win32_focus,
+        ensure_parent_window_win32_focus, mask_display_text, masked_to_plain_offset,
+        plain_to_masked_offset, render_text_field_box,
     },
 };
-use super::{ExampleAction, ExampleView};
 
 const WATERMARK_SVG: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 540 88" width="540" height="88"><text x="12" y="60" font-family="Segoe UI, Arial, sans-serif" font-size="52" font-weight="700" fill="#000000">cef-rs-gpui Rocks!</text></svg>"##;
 
@@ -87,7 +93,7 @@ pub(super) struct CefExampleRoot {
     pub(super) wake: Arc<UiWakeSender>,
     pub(super) focus: FocusHandle,
     pub(super) input_focus: FocusHandle,
-    pub(super) input_caches: [Rc<RefCell<TextFieldLayoutCache>>; 4],
+    pub(super) input_caches: [Rc<RefCell<TextFieldLayoutCache>>; 7],
     pub(super) dragging_input: Option<(ActiveInput, Point<Pixels>, bool)>,
     #[allow(dead_code)]
     pub(super) focus_out_sub: Option<Subscription>,
@@ -98,6 +104,7 @@ pub(super) struct CefExampleRoot {
     pub(super) active_slider: Option<SliderKind>,
     pub(super) angle_track_bounds: Rc<Cell<Bounds<Pixels>>>,
     pub(super) opacity_track_bounds: Rc<Cell<Bounds<Pixels>>>,
+    pub(super) selected_cert_index: Option<usize>,
 }
 
 impl CefExampleRoot {
@@ -111,9 +118,7 @@ impl CefExampleRoot {
             return;
         }
         let active = self.model.active_tab;
-        let overlay_blocks_hwnd = self.model.open_menu.is_some()
-            || self.model.pending_js_dialog.is_some()
-            || self.model.notice_dialog.is_some();
+        let overlay_blocks_hwnd = self.model.has_blocking_modal();
         for (id, view) in &self.views {
             view.set_visible(!overlay_blocks_hwnd && active == Some(*id), cx);
         }
@@ -125,6 +130,9 @@ impl CefExampleRoot {
             ActiveInput::ExecuteJs => Some(1),
             ActiveInput::EvaluateJs => Some(2),
             ActiveInput::JsPrompt => Some(3),
+            ActiveInput::FindQuery => Some(4),
+            ActiveInput::AuthUser => Some(5),
+            ActiveInput::AuthPass => Some(6),
             ActiveInput::None => None,
         }
     }
@@ -144,6 +152,9 @@ impl CefExampleRoot {
                 .pending_js_dialog
                 .as_ref()
                 .map(|d| &d.prompt_input),
+            ActiveInput::FindQuery => self.model.active_tab().map(|t| &t.find.query),
+            ActiveInput::AuthUser => self.model.pending_auth.front().map(|d| &d.username_input),
+            ActiveInput::AuthPass => self.model.pending_auth.front().map(|d| &d.password_input),
         }
     }
 
@@ -152,12 +163,26 @@ impl CefExampleRoot {
             ActiveInput::None => None,
             ActiveInput::Address => self.model.active_tab_mut().map(|t| &mut t.address_input),
             ActiveInput::ExecuteJs => self.model.active_tab_mut().map(|t| &mut t.execute_js_input),
-            ActiveInput::EvaluateJs => self.model.active_tab_mut().map(|t| &mut t.evaluate_js_input),
+            ActiveInput::EvaluateJs => self
+                .model
+                .active_tab_mut()
+                .map(|t| &mut t.evaluate_js_input),
             ActiveInput::JsPrompt => self
                 .model
                 .pending_js_dialog
                 .as_mut()
                 .map(|d| &mut d.prompt_input),
+            ActiveInput::FindQuery => self.model.active_tab_mut().map(|t| &mut t.find.query),
+            ActiveInput::AuthUser => self
+                .model
+                .pending_auth
+                .front_mut()
+                .map(|d| &mut d.username_input),
+            ActiveInput::AuthPass => self
+                .model
+                .pending_auth
+                .front_mut()
+                .map(|d| &mut d.password_input),
         }
     }
 
@@ -201,6 +226,45 @@ impl CefExampleRoot {
         }
     }
 
+    fn hit_test_buffer_index(
+        kind: ActiveInput,
+        cache: &TextFieldLayoutCache,
+        plain_text: &str,
+        position: Point<Pixels>,
+        multiline: bool,
+    ) -> usize {
+        if kind == ActiveInput::AuthPass {
+            let masked = mask_display_text(plain_text);
+            let raw = cache.index_for_point(&masked, position, multiline);
+            masked_to_plain_offset(plain_text, raw)
+        } else {
+            cache.index_for_point(plain_text, position, multiline)
+        }
+    }
+
+    fn focus_modal_input(
+        &mut self,
+        kind: ActiveInput,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.dragging_input = None;
+        if self.model.active_input != kind
+            && let Some(prev) = self.active_buffer_mut()
+        {
+            prev.unmark();
+        }
+        self.model.active_input = kind;
+        let handle = self.input_focus.clone();
+        window.focus(&handle, cx);
+        window.request_virtual_keyboard();
+        if let Some(buf) = self.buffer_for_mut(kind) {
+            buf.focus_select_all();
+        }
+        window.notify_text_selection_changed(&handle);
+        cx.notify();
+    }
+
     fn focus_input_on_mouse_down(
         &mut self,
         kind: ActiveInput,
@@ -215,8 +279,7 @@ impl CefExampleRoot {
             self.model.open_menu = None;
             self.sync_native_tab_visibility(cx);
         }
-        let was_active =
-            self.model.active_input == kind && self.input_focus.is_focused(window);
+        let was_active = self.model.active_input == kind && self.input_focus.is_focused(window);
         if self.model.active_input != kind
             && let Some(prev_buf) = self.active_buffer_mut()
         {
@@ -228,7 +291,8 @@ impl CefExampleRoot {
         window.request_virtual_keyboard();
 
         let multiline = Self::is_multiline_input(kind);
-        let Some(cache) = Self::input_cache_index(kind).map(|i| self.input_caches[i].clone()) else {
+        let Some(cache) = Self::input_cache_index(kind).map(|i| self.input_caches[i].clone())
+        else {
             cx.notify();
             return;
         };
@@ -236,7 +300,8 @@ impl CefExampleRoot {
             let cache_ref = cache.borrow();
             buf.scroll_x = cache_ref.scroll_x;
             buf.scroll_y = cache_ref.scroll_y;
-            let idx = cache_ref.index_for_point(&buf.text, event.position, multiline);
+            let idx =
+                Self::hit_test_buffer_index(kind, &cache_ref, &buf.text, event.position, multiline);
             drop(cache_ref);
 
             if event.click_count >= 3 {
@@ -269,7 +334,8 @@ impl CefExampleRoot {
         let Some((kind, down_pos, pending_select_all)) = self.dragging_input else {
             return;
         };
-        let Some(cache) = Self::input_cache_index(kind).map(|i| self.input_caches[i].clone()) else {
+        let Some(cache) = Self::input_cache_index(kind).map(|i| self.input_caches[i].clone())
+        else {
             return;
         };
         let multiline = Self::is_multiline_input(kind);
@@ -280,13 +346,20 @@ impl CefExampleRoot {
                 return;
             }
             if let Some(buf) = self.buffer_for_mut(kind) {
-                let start_idx = cache.borrow().index_for_point(&buf.text, down_pos, multiline);
+                let start_idx = Self::hit_test_buffer_index(
+                    kind,
+                    &cache.borrow(),
+                    &buf.text,
+                    down_pos,
+                    multiline,
+                );
                 buf.move_to(start_idx);
             }
             self.dragging_input = Some((kind, down_pos, false));
         }
         if let Some(buf) = self.buffer_for_mut(kind) {
-            let idx = cache.borrow().index_for_point(&buf.text, position, multiline);
+            let idx =
+                Self::hit_test_buffer_index(kind, &cache.borrow(), &buf.text, position, multiline);
             buf.select_to(idx);
             buf.scroll_x = cache.borrow().scroll_x;
             buf.scroll_y = cache.borrow().scroll_y;
@@ -303,8 +376,9 @@ impl CefExampleRoot {
     ) {
         let mods = &event.keystroke.modifiers;
         let key = event.keystroke.key.as_str();
+        let has_blocking_modal = self.model.has_blocking_modal();
 
-        if mods.control && !mods.alt && !mods.platform {
+        if mods.control && !mods.alt && !mods.platform && !has_blocking_modal {
             if key.eq_ignore_ascii_case("t") {
                 self.emit(ExampleAction::NewTab(None));
                 cx.stop_propagation();
@@ -317,6 +391,29 @@ impl CefExampleRoot {
                 cx.stop_propagation();
                 return;
             }
+            if key.eq_ignore_ascii_case("f") {
+                self.emit(ExampleAction::OpenFindBar);
+                cx.stop_propagation();
+                return;
+            }
+            if key.eq_ignore_ascii_case("u") {
+                self.emit(ExampleAction::ViewSource);
+                cx.stop_propagation();
+                return;
+            }
+        }
+        if !mods.control
+            && !mods.alt
+            && !mods.platform
+            && !has_blocking_modal
+            && key.eq_ignore_ascii_case("f3")
+        {
+            self.emit(ExampleAction::FindDispatch {
+                forward: !mods.shift,
+                force_find_next: true,
+            });
+            cx.stop_propagation();
+            return;
         }
 
         if self.model.active_input != ActiveInput::None && !self.input_focus.is_focused(window) {
@@ -329,11 +426,38 @@ impl CefExampleRoot {
                 cx.stop_propagation();
                 return;
             }
-            if key == "escape" && self.model.open_menu.is_some() {
-                self.model.open_menu = None;
-                self.sync_native_tab_visibility(cx);
-                cx.notify();
-                cx.stop_propagation();
+            if key == "escape" {
+                if self.model.pending_before_unload.front().is_some() {
+                    self.emit(ExampleAction::ResolveBeforeUnload(false));
+                    cx.stop_propagation();
+                    return;
+                }
+                if self.model.pending_permission.front().is_some() {
+                    self.emit(ExampleAction::ResolvePermission { allow: false });
+                    cx.stop_propagation();
+                    return;
+                }
+                if self.model.pending_auth.front().is_some() {
+                    self.emit(ExampleAction::ResolveAuth { submit: false });
+                    cx.stop_propagation();
+                    return;
+                }
+                if self.model.pending_cert.front().is_some() {
+                    self.emit(ExampleAction::ResolveCertificate { accept: false });
+                    cx.stop_propagation();
+                    return;
+                }
+                if self.model.open_menu.is_some() {
+                    self.model.open_menu = None;
+                    self.sync_native_tab_visibility(cx);
+                    cx.notify();
+                    cx.stop_propagation();
+                    return;
+                }
+                if !has_blocking_modal && self.model.active_tab().is_some_and(|t| t.find.open) {
+                    self.emit(ExampleAction::CloseFindBar);
+                    cx.stop_propagation();
+                }
             }
             return;
         }
@@ -349,11 +473,32 @@ impl CefExampleRoot {
                         let addr = tab.address.clone();
                         tab.address_input.set_from_external(&addr);
                     }
-                } else if let Some(buf) = self.buffer_for_mut(input_kind) {
-                    buf.unmark();
+                    self.focus_browser_or_root(window, cx);
+                } else if input_kind == ActiveInput::FindQuery {
+                    if let Some(idx) = Self::input_cache_index(ActiveInput::FindQuery) {
+                        self.input_caches[idx].borrow_mut().reset_scroll();
+                    }
+                    self.focus_browser_or_root(window, cx);
+                    self.emit(ExampleAction::CloseFindBar);
+                } else if matches!(input_kind, ActiveInput::AuthUser | ActiveInput::AuthPass) {
+                    self.focus_browser_or_root(window, cx);
+                    self.emit(ExampleAction::ResolveAuth { submit: false });
+                } else {
+                    if let Some(buf) = self.buffer_for_mut(input_kind) {
+                        buf.unmark();
+                    }
+                    self.focus_browser_or_root(window, cx);
                 }
-                self.focus_browser_or_root(window, cx);
                 cx.notify();
+                cx.stop_propagation();
+            }
+            "tab" if matches!(input_kind, ActiveInput::AuthUser | ActiveInput::AuthPass) => {
+                let next_kind = if input_kind == ActiveInput::AuthUser {
+                    ActiveInput::AuthPass
+                } else {
+                    ActiveInput::AuthUser
+                };
+                self.focus_modal_input(next_kind, window, cx);
                 cx.stop_propagation();
             }
             "enter" => {
@@ -405,29 +550,54 @@ impl CefExampleRoot {
                         self.emit(ExampleAction::ResolveJsDialog { accept: true });
                         cx.notify();
                     }
+                    ActiveInput::FindQuery => {
+                        self.emit(ExampleAction::FindDispatch {
+                            forward: !mods.shift,
+                            force_find_next: true,
+                        });
+                    }
+                    ActiveInput::AuthUser => {
+                        self.focus_modal_input(ActiveInput::AuthPass, window, cx);
+                    }
+                    ActiveInput::AuthPass => {
+                        self.dragging_input = None;
+                        self.model.active_input = ActiveInput::None;
+                        self.focus_browser_or_root(window, cx);
+                        self.emit(ExampleAction::ResolveAuth { submit: true });
+                        cx.notify();
+                    }
                     ActiveInput::None => {}
                 }
                 cx.stop_propagation();
             }
             _ => {
-                let Some(cache) = Self::input_cache_index(input_kind)
-                    .map(|i| self.input_caches[i].clone())
+                let Some(cache) =
+                    Self::input_cache_index(input_kind).map(|i| self.input_caches[i].clone())
                 else {
                     return;
                 };
                 let multiline = Self::is_multiline_input(input_kind);
+                let masked = matches!(input_kind, ActiveInput::AuthPass);
                 let cache_ref = cache.borrow();
-                let outcome = self
-                    .buffer_for_mut(input_kind)
-                    .map_or(KeyEditOutcome::NotHandled, |buf| {
-                        buf.scroll_x = cache_ref.scroll_x;
-                        buf.scroll_y = cache_ref.scroll_y;
-                        apply_editor_key_down(buf, &cache_ref, event, multiline, cx)
-                    });
+                let outcome =
+                    self.buffer_for_mut(input_kind)
+                        .map_or(KeyEditOutcome::NotHandled, |buf| {
+                            buf.scroll_x = cache_ref.scroll_x;
+                            buf.scroll_y = cache_ref.scroll_y;
+                            apply_editor_key_down_masked(
+                                buf, &cache_ref, event, multiline, masked, cx,
+                            )
+                        });
                 drop(cache_ref);
                 match outcome {
                     KeyEditOutcome::HandledChanged => {
                         window.notify_text_input_changed(&self.input_focus);
+                        if input_kind == ActiveInput::FindQuery {
+                            self.emit(ExampleAction::FindDispatch {
+                                forward: true,
+                                force_find_next: false,
+                            });
+                        }
                         cx.notify();
                         cx.stop_propagation();
                     }
@@ -653,6 +823,11 @@ impl CefExampleRoot {
                     ));
             }
             MenuCategory::View => {
+                let save_as_label: &'static str = if self.model.ask_save_as {
+                    "[x] Ask Save As (Downloads)"
+                } else {
+                    "[ ] Ask Save As (Downloads)"
+                };
                 card = card
                     .child(Self::menu_row(
                         "m-toggle-sidebar",
@@ -665,6 +840,25 @@ impl CefExampleRoot {
                         "Toggle Download Info",
                         |this, _, _| this.emit(ExampleAction::ToggleDownloadInfo),
                         cx,
+                    ))
+                    .child(div().h(px(1.0)).mx(px(8.0)).my(px(2.0)).bg(rgb(0xe0e0e0)))
+                    .child(Self::menu_row(
+                        "m-find-bar",
+                        "Find in Page  (Ctrl+F)",
+                        |this, _, _| this.emit(ExampleAction::OpenFindBar),
+                        cx,
+                    ))
+                    .child(Self::menu_row(
+                        "m-view-source",
+                        "View Source  (Ctrl+U)",
+                        |this, _, _| this.emit(ExampleAction::ViewSource),
+                        cx,
+                    ))
+                    .child(Self::menu_row(
+                        "m-ask-save-as",
+                        save_as_label,
+                        |this, _, _| this.emit(ExampleAction::ToggleAskSaveAs),
+                        cx,
                     ));
             }
             MenuCategory::Tests => {
@@ -672,7 +866,9 @@ impl CefExampleRoot {
                     .child(Self::menu_row(
                         "m-t-binding",
                         "Binding Test",
-                        |this, _, _| this.emit(ExampleAction::NewTab(Some(BINDING_TEST_URL.into()))),
+                        |this, _, _| {
+                            this.emit(ExampleAction::NewTab(Some(BINDING_TEST_URL.into())))
+                        },
                         cx,
                     ))
                     .child(Self::menu_row(
@@ -702,21 +898,27 @@ impl CefExampleRoot {
                     .child(Self::menu_row(
                         "m-t-tooltip",
                         "Tooltip Test",
-                        |this, _, _| this.emit(ExampleAction::NewTab(Some(TOOLTIP_TEST_URL.into()))),
+                        |this, _, _| {
+                            this.emit(ExampleAction::NewTab(Some(TOOLTIP_TEST_URL.into())))
+                        },
                         cx,
                     ))
                     .child(Self::menu_row(
                         "m-t-dnd",
                         "Drag&Drop Cursors Test",
                         |this, _, _| {
-                            this.emit(ExampleAction::NewTab(Some(DRAG_DROP_CURSORS_TEST_URL.into())))
+                            this.emit(ExampleAction::NewTab(Some(
+                                DRAG_DROP_CURSORS_TEST_URL.into(),
+                            )))
                         },
                         cx,
                     ))
                     .child(Self::menu_row(
                         "m-t-popup",
                         "Popup Test",
-                        |this, _, _| this.emit(ExampleAction::NewTab(Some(POPUP_PARENT_URL.into()))),
+                        |this, _, _| {
+                            this.emit(ExampleAction::NewTab(Some(POPUP_PARENT_URL.into())))
+                        },
                         cx,
                     ))
                     .child(Self::menu_row(
@@ -745,7 +947,9 @@ impl CefExampleRoot {
                         "m-t-drag-region",
                         "Draggable Region Test",
                         |this, _, _| {
-                            this.emit(ExampleAction::NewTab(Some(DRAGGABLE_REGION_TEST_URL.into())))
+                            this.emit(ExampleAction::NewTab(Some(
+                                DRAGGABLE_REGION_TEST_URL.into(),
+                            )))
                         },
                         cx,
                     ))
@@ -880,6 +1084,23 @@ impl CefExampleRoot {
                             )))
                         },
                         cx,
+                    ))
+                    .child(div().h(px(1.0)).mx(px(8.0)).my(px(2.0)).bg(rgb(0xe0e0e0)))
+                    .child(Self::menu_row(
+                        "m-t-ux-fixtures",
+                        "Desktop UX Fixtures",
+                        |this, _, _| {
+                            this.emit(ExampleAction::NewTab(Some(DESKTOP_UX_FIXTURES_URL.into())))
+                        },
+                        cx,
+                    ))
+                    .child(Self::menu_row(
+                        "m-t-before-unload",
+                        "BeforeUnload Test",
+                        |this, _, _| {
+                            this.emit(ExampleAction::NewTab(Some(BEFORE_UNLOAD_TEST_URL.into())))
+                        },
+                        cx,
                     ));
             }
             MenuCategory::ChromeUrls => {
@@ -949,14 +1170,15 @@ impl CefExampleRoot {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let zoom_pct = zoom_level_to_percent(f64::from(tab.zoom_level_milli) / 1000.0).round() as i32;
+        let zoom_pct =
+            zoom_level_to_percent(f64::from(tab.zoom_level_milli) / 1000.0).round() as i32;
         let angle_ratio = ((tab.render_angle_deg + 180.0) / 360.0).clamp(0.0, 1.0);
         let opacity_ratio = tab.watermark_opacity.clamp(0.0, 1.0);
         let scaling_next = tab.bitmap_scaling.toggled();
-        let exec_focused =
-            self.model.active_input == ActiveInput::ExecuteJs && self.input_focus.is_focused(window);
-        let eval_focused =
-            self.model.active_input == ActiveInput::EvaluateJs && self.input_focus.is_focused(window);
+        let exec_focused = self.model.active_input == ActiveInput::ExecuteJs
+            && self.input_focus.is_focused(window);
+        let eval_focused = self.model.active_input == ActiveInput::EvaluateJs
+            && self.input_focus.is_focused(window);
 
         let angle_bounds_cell = self.angle_track_bounds.clone();
         let opacity_bounds_cell = self.opacity_track_bounds.clone();
@@ -1087,10 +1309,7 @@ impl CefExampleRoot {
                     .items_center()
                     .justify_between()
                     .gap(px(6.0))
-                    .child(format!(
-                        "Watermark Opacity: {:.0}%",
-                        opacity_ratio * 100.0
-                    ))
+                    .child(format!("Watermark Opacity: {:.0}%", opacity_ratio * 100.0))
                     .child(render_slider(
                         "sb-opacity-slider",
                         opacity_ratio,
@@ -1183,8 +1402,16 @@ impl CefExampleRoot {
                             .id("sb-devtools")
                             .px(px(7.0))
                             .py(px(2.0))
-                            .bg(rgb(if tab.devtools_open { 0x4527a0 } else { 0xede7f6 }))
-                            .text_color(rgb(if tab.devtools_open { 0xffffff } else { 0x4527a0 }))
+                            .bg(rgb(if tab.devtools_open {
+                                0x4527a0
+                            } else {
+                                0xede7f6
+                            }))
+                            .text_color(rgb(if tab.devtools_open {
+                                0xffffff
+                            } else {
+                                0x4527a0
+                            }))
                             .rounded(px(2.0))
                             .cursor_pointer()
                             .on_mouse_down(
@@ -1194,7 +1421,11 @@ impl CefExampleRoot {
                                     this.emit(ExampleAction::ToggleDevTools);
                                 }),
                             )
-                            .child(if tab.devtools_open { "DevTools*" } else { "DevTools" }),
+                            .child(if tab.devtools_open {
+                                "DevTools*"
+                            } else {
+                                "DevTools"
+                            }),
                     ),
             )
             .into_any_element();
@@ -1232,21 +1463,16 @@ impl CefExampleRoot {
                 },
                 cx,
             ))
-            .child(
-                div()
-                    .flex()
-                    .justify_center()
-                    .child(Self::purple_btn(
-                        "sb-exec-btn",
-                        "Execute",
-                        |this, _, _| {
-                            if let Some(t) = this.model.active_tab() {
-                                this.emit(ExampleAction::ExecuteJs(t.execute_js_input.text.clone()));
-                            }
-                        },
-                        cx,
-                    )),
-            )
+            .child(div().flex().justify_center().child(Self::purple_btn(
+                "sb-exec-btn",
+                "Execute",
+                |this, _, _| {
+                    if let Some(t) = this.model.active_tab() {
+                        this.emit(ExampleAction::ExecuteJs(t.execute_js_input.text.clone()));
+                    }
+                },
+                cx,
+            )))
             .into_any_element();
 
         let eval_card_body = div()
@@ -1282,21 +1508,16 @@ impl CefExampleRoot {
                 },
                 cx,
             ))
-            .child(
-                div()
-                    .flex()
-                    .justify_center()
-                    .child(Self::purple_btn(
-                        "sb-eval-btn",
-                        "Evaluate",
-                        |this, _, _| {
-                            if let Some(t) = this.model.active_tab() {
-                                this.emit(ExampleAction::EvaluateJs(t.evaluate_js_input.text.clone()));
-                            }
-                        },
-                        cx,
-                    )),
-            )
+            .child(div().flex().justify_center().child(Self::purple_btn(
+                "sb-eval-btn",
+                "Evaluate",
+                |this, _, _| {
+                    if let Some(t) = this.model.active_tab() {
+                        this.emit(ExampleAction::EvaluateJs(t.evaluate_js_input.text.clone()));
+                    }
+                },
+                cx,
+            )))
             .child(
                 div()
                     .text_size(px(12.0))
@@ -1346,8 +1567,11 @@ impl CefExampleRoot {
             .into_any_element()
     }
 
-    fn render_download_panel(&self, tab: &ExampleTabModel) -> AnyElement {
+    fn render_download_panel(&self, tab: &ExampleTabModel, cx: &mut Context<Self>) -> AnyElement {
         let dl = &tab.download;
+        let tab_id = tab.id;
+        let can_cancel = dl.download_id.is_some() && !dl.is_complete && !dl.is_cancelled;
+        let folder_path = (!dl.full_path.is_empty()).then(|| PathBuf::from(&dl.full_path));
         let row = |label: &'static str, val: String| {
             div()
                 .flex()
@@ -1356,12 +1580,7 @@ impl CefExampleRoot {
                 .gap(px(6.0))
                 .text_size(px(11.0))
                 .child(div().text_color(rgb(0x616161)).child(label))
-                .child(
-                    div()
-                        .text_color(rgb(0x212121))
-                        .overflow_hidden()
-                        .child(val),
-                )
+                .child(div().text_color(rgb(0x212121)).overflow_hidden().child(val))
         };
         div()
             .w(px(260.0))
@@ -1398,6 +1617,9 @@ impl CefExampleRoot {
                             .child(row("IsInProgress:", dl.is_in_progress.to_string()))
                             .child(row("IsComplete:", dl.is_complete.to_string()))
                             .child(row("IsCancelled:", dl.is_cancelled.to_string()))
+                            .when_some(dl.cancelled_reason.clone(), |col, reason| {
+                                col.child(row("CancelReason:", reason))
+                            })
                             .child(row(
                                 "PercentComplete:",
                                 dl.percent_complete.map_or("-".into(), |p| format!("{p}%")),
@@ -1409,7 +1631,34 @@ impl CefExampleRoot {
                             ))
                             .child(row("SuggestedName:", dl.suggested_file_name.clone()))
                             .child(row("FullPath:", dl.full_path.clone()))
-                            .child(row("Url:", dl.url.clone())),
+                            .child(row("Url:", dl.url.clone()))
+                            .when(can_cancel || folder_path.is_some(), |col| {
+                                let mut actions_col =
+                                    div().pt(px(4.0)).flex().flex_col().gap(px(4.0));
+                                if can_cancel {
+                                    actions_col = actions_col.child(Self::purple_btn(
+                                        "dl-cancel-btn",
+                                        "Cancel Download",
+                                        move |this, _, _| {
+                                            this.emit(ExampleAction::CancelDownload(tab_id));
+                                        },
+                                        cx,
+                                    ));
+                                }
+                                if let Some(p) = folder_path.clone() {
+                                    actions_col = actions_col.child(Self::purple_btn(
+                                        "dl-open-folder-btn",
+                                        "Open Containing Folder",
+                                        move |this, _, _| {
+                                            this.emit(ExampleAction::OpenContainingFolder(
+                                                p.clone(),
+                                            ));
+                                        },
+                                        cx,
+                                    ));
+                                }
+                                col.child(actions_col)
+                            }),
                     ),
             )
             .into_any_element()
@@ -1424,10 +1673,16 @@ impl EntityInputHandler for CefExampleRoot {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<String> {
+        let masked = matches!(self.model.active_input, ActiveInput::AuthPass);
         let buf = self.active_buffer_mut()?;
         let range = buf.range_from_utf16(&range_utf16);
         adjusted_range.replace(buf.range_to_utf16(&range));
-        Some(buf.text[range].to_owned())
+        let slice = &buf.text[range];
+        if masked {
+            Some(super::text_input::mask_display_text(slice))
+        } else {
+            Some(slice.to_owned())
+        }
     }
 
     fn selected_text_range(
@@ -1468,12 +1723,19 @@ impl EntityInputHandler for CefExampleRoot {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let multiline = Self::is_multiline_input(self.model.active_input);
+        let kind = self.model.active_input;
+        let multiline = Self::is_multiline_input(kind);
         let focus = self.input_focus.clone();
         if let Some(buf) = self.active_buffer_mut() {
             buf.replace_in_utf16_range(range, text, multiline);
         }
         window.notify_text_input_changed(&focus);
+        if kind == ActiveInput::FindQuery {
+            self.emit(ExampleAction::FindDispatch {
+                forward: true,
+                force_find_next: false,
+            });
+        }
         cx.notify();
     }
 
@@ -1485,12 +1747,21 @@ impl EntityInputHandler for CefExampleRoot {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let multiline = Self::is_multiline_input(self.model.active_input);
+        let kind = self.model.active_input;
+        let multiline = Self::is_multiline_input(kind);
         let focus = self.input_focus.clone();
+        let mut has_marked = false;
         if let Some(buf) = self.active_buffer_mut() {
             buf.replace_and_mark_in_utf16_range(range, new_text, new_selected_range, multiline);
+            has_marked = buf.marked_range.is_some();
         }
         window.notify_text_input_changed(&focus);
+        if kind == ActiveInput::FindQuery && !has_marked {
+            self.emit(ExampleAction::FindDispatch {
+                forward: true,
+                force_find_next: false,
+            });
+        }
         cx.notify();
     }
 
@@ -1501,11 +1772,18 @@ impl EntityInputHandler for CefExampleRoot {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
-        let idx = Self::input_cache_index(self.model.active_input)?;
+        let kind = self.model.active_input;
+        let idx = Self::input_cache_index(kind)?;
         let cache = self.input_caches[idx].clone();
         let buf = self.active_buffer_mut()?;
         let utf8 = buf.range_from_utf16(&range_utf16);
-        cache.borrow().bounds_for_utf8_range(utf8)
+        let cache_range = if kind == ActiveInput::AuthPass {
+            plain_to_masked_offset(&buf.text, utf8.start)
+                ..plain_to_masked_offset(&buf.text, utf8.end)
+        } else {
+            utf8
+        };
+        cache.borrow().bounds_for_utf8_range(cache_range)
     }
 
     fn selection_bounds_for_range(
@@ -1531,7 +1809,7 @@ impl EntityInputHandler for CefExampleRoot {
         let multiline = Self::is_multiline_input(kind);
         let cache = self.input_caches[idx].clone();
         let buf = self.active_buffer_mut()?;
-        let utf8 = cache.borrow().index_for_point(&buf.text, point, multiline);
+        let utf8 = Self::hit_test_buffer_index(kind, &cache.borrow(), &buf.text, point, multiline);
         Some(buf.offset_to_utf16(utf8))
     }
 
@@ -1552,7 +1830,11 @@ impl EntityInputHandler for CefExampleRoot {
         cx.notify();
     }
 
-    fn text_length_utf16(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> Option<usize> {
+    fn text_length_utf16(
+        &mut self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<usize> {
         self.active_buffer_mut().map(|b| b.text_len_utf16())
     }
 }
@@ -1792,8 +2074,12 @@ impl Render for CefExampleRoot {
                         let tile_h = 84.0_f32;
                         let start_x = f32::from(bounds.origin.x) - tile_w * 0.5;
                         let start_y = f32::from(bounds.origin.y) - tile_h * 0.5;
-                        let end_x = f32::from(bounds.origin.x) + f32::from(bounds.size.width) + tile_w * 0.5;
-                        let end_y = f32::from(bounds.origin.y) + f32::from(bounds.size.height) + tile_h * 0.5;
+                        let end_x = f32::from(bounds.origin.x)
+                            + f32::from(bounds.size.width)
+                            + tile_w * 0.5;
+                        let end_y = f32::from(bounds.origin.y)
+                            + f32::from(bounds.size.height)
+                            + tile_h * 0.5;
                         let angle_rad = Radians(-22.5_f32.to_radians());
                         let color = hsla(0.0, 0.0, 0.0, 0.08);
                         let mut row = 0_i32;
@@ -1893,39 +2179,40 @@ impl Render for CefExampleRoot {
                 .border_color(rgb(0x5e35b1))
                 .text_color(rgb(0x212121))
                 .text_size(px(12.0))
-                .child(format!("[{:?}] {}: {}", dlg.kind, dlg.origin_url, dlg.message))
+                .child(format!(
+                    "[{:?}] {}: {}",
+                    dlg.kind, dlg.origin_url, dlg.message
+                ))
                 .when(is_prompt, |bar| {
-                    bar.child(
-                        div().w(px(180.0)).child(render_text_field_box(
-                            TextFieldRenderSpec {
-                                id: "dlg-prompt-input",
-                                host: cx.entity(),
-                                focus_handle: self.input_focus.clone(),
-                                buffer: &dlg.prompt_input,
-                                cache: self.input_caches[3].clone(),
-                                placeholder: "",
-                                focused: prompt_focused,
-                                multiline: false,
-                                font_size_px: 12.0,
-                                pad_x_px: 6.0,
-                                pad_y_px: 3.0,
-                                height_px: Some(26.0),
-                                rounded_px: 3.0,
-                                flex_1: false,
-                                theme: TextFieldTheme::example_light(),
-                            },
-                            |this, event, window, cx| {
-                                this.focus_input_on_mouse_down(
-                                    ActiveInput::JsPrompt,
-                                    true,
-                                    event,
-                                    window,
-                                    cx,
-                                );
-                            },
-                            cx,
-                        )),
-                    )
+                    bar.child(div().w(px(180.0)).child(render_text_field_box(
+                        TextFieldRenderSpec {
+                            id: "dlg-prompt-input",
+                            host: cx.entity(),
+                            focus_handle: self.input_focus.clone(),
+                            buffer: &dlg.prompt_input,
+                            cache: self.input_caches[3].clone(),
+                            placeholder: "",
+                            focused: prompt_focused,
+                            multiline: false,
+                            font_size_px: 12.0,
+                            pad_x_px: 6.0,
+                            pad_y_px: 3.0,
+                            height_px: Some(26.0),
+                            rounded_px: 3.0,
+                            flex_1: false,
+                            theme: TextFieldTheme::example_light(),
+                        },
+                        |this, event, window, cx| {
+                            this.focus_input_on_mouse_down(
+                                ActiveInput::JsPrompt,
+                                true,
+                                event,
+                                window,
+                                cx,
+                            );
+                        },
+                        cx,
+                    )))
                 })
                 .child(Self::purple_btn(
                     "dlg-ok",
@@ -1944,6 +2231,53 @@ impl Render for CefExampleRoot {
         });
 
         let mut center_col = div().flex_1().h_full().flex().flex_col().overflow_hidden();
+        if let Some(tab) = active_tab.as_ref()
+            && tab.find.open
+        {
+            let find_focused = self.model.active_input == ActiveInput::FindQuery
+                && self.input_focus.is_focused(window);
+            let query_cache = self.input_caches
+                [Self::input_cache_index(ActiveInput::FindQuery).expect("find query cache")]
+            .clone();
+            center_col = center_col.child(render_find_bar(
+                tab,
+                find_focused,
+                cx.entity(),
+                self.input_focus.clone(),
+                query_cache,
+                |this, event, window, cx| {
+                    this.focus_input_on_mouse_down(
+                        ActiveInput::FindQuery,
+                        false,
+                        event,
+                        window,
+                        cx,
+                    );
+                },
+                |this, _, _| this.emit(ExampleAction::FindToggleCase),
+                |this, _, _| {
+                    this.emit(ExampleAction::FindDispatch {
+                        forward: false,
+                        force_find_next: true,
+                    })
+                },
+                |this, _, _| {
+                    this.emit(ExampleAction::FindDispatch {
+                        forward: true,
+                        force_find_next: true,
+                    })
+                },
+                |this, window, cx| {
+                    if this.model.active_input == ActiveInput::FindQuery {
+                        this.dragging_input = None;
+                        this.model.active_input = ActiveInput::None;
+                        this.focus_browser_or_root(window, cx);
+                    }
+                    this.emit(ExampleAction::CloseFindBar);
+                },
+                cx,
+            ));
+        }
         if let Some(dlg_bar) = js_dialog_bar {
             center_col = center_col.child(dlg_bar);
         }
@@ -1958,7 +2292,7 @@ impl Render for CefExampleRoot {
             .child(center_col);
         if let Some(tab) = active_tab.as_ref() {
             if tab.show_download_info {
-                middle_row = middle_row.child(self.render_download_panel(tab));
+                middle_row = middle_row.child(self.render_download_panel(tab, cx));
             }
             if tab.show_sidebar {
                 middle_row = middle_row.child(self.render_sidebar(tab, window, cx));
@@ -2082,6 +2416,63 @@ impl Render for CefExampleRoot {
             root = root.child(self.render_menu_dropdown(cat, cx));
         }
 
+        if let Some(ref perm) = self.model.pending_permission.front().cloned() {
+            root = root.child(render_permission_modal(
+                perm,
+                |this, _, _| this.emit(ExampleAction::ResolvePermission { allow: true }),
+                |this, _, _| this.emit(ExampleAction::ResolvePermission { allow: false }),
+                cx,
+            ));
+        } else if let Some(ref auth) = self.model.pending_auth.front().cloned() {
+            let user_focused = self.model.active_input == ActiveInput::AuthUser
+                && self.input_focus.is_focused(window);
+            let pass_focused = self.model.active_input == ActiveInput::AuthPass
+                && self.input_focus.is_focused(window);
+            let user_cache = self.input_caches
+                [Self::input_cache_index(ActiveInput::AuthUser).expect("auth user cache")]
+            .clone();
+            let pass_cache = self.input_caches
+                [Self::input_cache_index(ActiveInput::AuthPass).expect("auth pass cache")]
+            .clone();
+            root = root.child(render_auth_modal(
+                auth,
+                user_focused,
+                pass_focused,
+                cx.entity(),
+                self.input_focus.clone(),
+                user_cache,
+                pass_cache,
+                |this, event, window, cx| {
+                    this.focus_input_on_mouse_down(ActiveInput::AuthUser, false, event, window, cx);
+                },
+                |this, event, window, cx| {
+                    this.focus_input_on_mouse_down(ActiveInput::AuthPass, false, event, window, cx);
+                },
+                |this, _, _| this.emit(ExampleAction::ResolveAuth { submit: true }),
+                |this, _, _| this.emit(ExampleAction::ResolveAuth { submit: false }),
+                cx,
+            ));
+        } else if let Some(ref cert) = self.model.pending_cert.front().cloned() {
+            root = root.child(render_certificate_modal(
+                cert,
+                self.selected_cert_index,
+                |this, idx, _, cx| {
+                    this.selected_cert_index = Some(idx);
+                    cx.notify();
+                },
+                |this, _, _| this.emit(ExampleAction::ResolveCertificate { accept: true }),
+                |this, _, _| this.emit(ExampleAction::ResolveCertificate { accept: false }),
+                cx,
+            ));
+        } else if let Some(ref bu) = self.model.pending_before_unload.front().cloned() {
+            root = root.child(render_before_unload_modal(
+                bu,
+                |this, _, _| this.emit(ExampleAction::ResolveBeforeUnload(false)),
+                |this, _, _| this.emit(ExampleAction::ResolveBeforeUnload(true)),
+                cx,
+            ));
+        }
+
         if let Some(ref notice) = self.model.notice_dialog {
             root = root.child(
                 div()
@@ -2095,7 +2486,10 @@ impl Render for CefExampleRoot {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .on_mouse_down(MouseButton::Left, cx.listener(|_, _, _, cx| cx.stop_propagation()))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|_, _, _, cx| cx.stop_propagation()),
+                    )
                     .child(
                         div()
                             .w(px(460.0))
@@ -2124,19 +2518,14 @@ impl Render for CefExampleRoot {
                                     .text_color(rgb(0x212121))
                                     .child(notice.message.clone()),
                             )
-                            .child(
-                                div()
-                                    .px(px(14.0))
-                                    .pb(px(12.0))
-                                    .flex()
-                                    .justify_end()
-                                    .child(Self::purple_btn(
-                                        "notice-modal-ok",
-                                        "OK",
-                                        |this, _, _| this.emit(ExampleAction::DismissNoticeDialog),
-                                        cx,
-                                    )),
-                            ),
+                            .child(div().px(px(14.0)).pb(px(12.0)).flex().justify_end().child(
+                                Self::purple_btn(
+                                    "notice-modal-ok",
+                                    "OK",
+                                    |this, _, _| this.emit(ExampleAction::DismissNoticeDialog),
+                                    cx,
+                                ),
+                            )),
                     ),
             );
         }

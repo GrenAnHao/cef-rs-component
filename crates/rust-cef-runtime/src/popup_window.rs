@@ -145,16 +145,13 @@ impl PopupLedger {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let matching_slot = s
-            .rows
-            .iter()
-            .find_map(|(&slot, row)| {
-                (row.owner == owner
-                    && row.popup_id == popup_id
-                    && row.created_native_id.is_none()
-                    && !row.aborted)
-                    .then_some(slot)
-            });
+        let matching_slot = s.rows.iter().find_map(|(&slot, row)| {
+            (row.owner == owner
+                && row.popup_id == popup_id
+                && row.created_native_id.is_none()
+                && !row.aborted)
+                .then_some(slot)
+        });
         if let Some(slot) = matching_slot
             && let Some(row) = s.rows.get_mut(&slot)
         {
@@ -231,7 +228,11 @@ impl PopupLedger {
         }
     }
 
-    pub(crate) fn collect_closes(&self, owner: Option<BrowserId>, stop_admission: bool) -> Vec<PopupSlotId> {
+    pub(crate) fn collect_closes(
+        &self,
+        owner: Option<BrowserId>,
+        stop_admission: bool,
+    ) -> Vec<PopupSlotId> {
         let mut s = self
             .state
             .lock()
@@ -309,11 +310,7 @@ pub(crate) fn build_popup_window_info(
     popup_features: Option<&PopupFeatures>,
     title: &str,
 ) -> WindowInfo {
-    let clean_title: String = title
-        .chars()
-        .filter(|&c| c != '\0')
-        .take(128)
-        .collect();
+    let clean_title: String = title.chars().filter(|&c| c != '\0').take(128).collect();
     let title = if clean_title.is_empty() {
         "GPUI CEF Popup"
     } else {
@@ -903,10 +900,7 @@ mod tests {
         for i in 0..MAX_CHILD_POPUPS_PER_BROWSER {
             slots.push(ledger.reserve(owner, i as i32).unwrap());
         }
-        assert_eq!(
-            ledger.reserve(owner, 99),
-            Err(EngineError::Backpressure)
-        );
+        assert_eq!(ledger.reserve(owner, 99), Err(EngineError::Backpressure));
         assert_eq!(ledger.pending(), MAX_CHILD_POPUPS_PER_BROWSER as u64);
 
         // Aborting popup creation does not drop pending until client_released is observed.

@@ -146,8 +146,9 @@ impl CompiledPolicy {
         } else {
             return false;
         };
-        parse_http(&mapped)
-            .is_some_and(|parsed| self.matches_compiled_origin(&parsed.origin().ascii_serialization()))
+        parse_http(&mapped).is_some_and(|parsed| {
+            self.matches_compiled_origin(&parsed.origin().ascii_serialization())
+        })
     }
 
     /// Web-standard `blob:http://...` / `blob:https://...` URLs permitted only
@@ -596,7 +597,8 @@ mod tests {
 
     #[test]
     fn open_web_permits_valid_blobs_and_blank_frames_while_strict_policy_denies_them() {
-        let open = CompiledPolicy::compile(&TrustedContentPolicy::allow_all_http_https(true)).unwrap();
+        let open =
+            CompiledPolicy::compile(&TrustedContentPolicy::allow_all_http_https(true)).unwrap();
         let strict = policy(&["https://allowed.local"], true);
 
         assert!(open.is_open_web());
@@ -628,7 +630,10 @@ mod tests {
         assert!(open.allows_network("ws://localhost:8080/live"));
         assert!(!open.allows_page_navigation("wss://ws.example.com/socket"));
         assert!(!open.allows_network("wss://user:pass@ws.example.com/socket"));
-        let strict_ws = policy(&["https://allowed.local:8443", "http://allowed.local"], false);
+        let strict_ws = policy(
+            &["https://allowed.local:8443", "http://allowed.local"],
+            false,
+        );
         assert!(strict_ws.allows_network("wss://allowed.local:8443/stream"));
         assert!(strict_ws.allows_network("ws://allowed.local/stream"));
         assert!(!strict_ws.allows_network("wss://allowed.local/stream"));

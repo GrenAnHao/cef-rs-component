@@ -208,9 +208,7 @@ mod windows {
                 s.error.get_or_insert("frame-layout");
                 return PublishResult::Rejected;
             };
-            if frame.info.width != 320
-                || frame.info.height != 240
-                || pixels.len() != 320 * 240 * 4
+            if frame.info.width != 320 || frame.info.height != 240 || pixels.len() != 320 * 240 * 4
             {
                 s.error.get_or_insert("frame-layout");
                 return PublishResult::Rejected;

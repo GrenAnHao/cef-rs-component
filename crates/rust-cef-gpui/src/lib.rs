@@ -30,11 +30,15 @@ pub use rust_cef_runtime::runtime::{Runtime, RuntimeServices};
 pub use rust_cef_runtime::{attachment, runtime};
 
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+pub mod async_ops;
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 pub mod composition;
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 pub mod events;
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 pub mod find_view;
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+pub mod js_repository;
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 pub mod menu;
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
@@ -43,6 +47,11 @@ pub mod menu_presenter;
 pub mod print_confirmation;
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 pub mod source_view;
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+pub use async_ops::{
+    AsyncOpError, AsyncOpFuture, AsyncOpLedger, DEFAULT_ASYNC_OP_TIMEOUT, InitialLoadResult,
+    MappedAsyncOpFuture, ScreenshotBgra,
+};
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 pub use composition::{
     CompositionError, DispatchFailure, DispatchFailureKind, DispatchReport, InputRetryReport,
@@ -53,6 +62,13 @@ pub use events::*;
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 pub use find_view::{FindServices, FindUiError, FindUiStatus, FindUiUpdate};
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+pub use js_repository::{
+    BoundObject, BoundProperty, CallbackReplyKind, JsBindingOptions, JsBindingSettings,
+    JsCallContext, JsCallbackHandle, JsDate, JsInvocationOutcome, JsInvocationToken,
+    JsNameConverter, JsObjectRepository, JsValue, JsonParser, JsonVal, OutboundCallbackRequest,
+    PostMessageEvent, parse_json,
+};
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 pub use menu::{
     ContextMenuServices, MenuCleanup, MenuCleanupStatus, MenuDispatchReport, MenuFocusRegistration,
     MenuServiceError, MenuServiceStatus, MenuUiUpdate,
@@ -61,6 +77,11 @@ pub use menu::{
 pub use menu_presenter::{
     DefaultMenuPresenter, MenuBounds, MenuCommandBounds, MenuPresenterFailure, MenuPresenterLayout,
     MenuPresenterReply, MenuPresenterStatus, init_default_menu_ui,
+};
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+pub use rust_cef_runtime::{
+    JsRepositoryMethodStyle, JsRepositoryObjectDescriptor, JsRepositoryPropertyDescriptor,
+    JsRepositorySettings,
 };
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 pub mod accessibility;

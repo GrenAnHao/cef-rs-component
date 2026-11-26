@@ -187,11 +187,28 @@ mod cng_sha256 {
     use std::{ffi::c_void, fs::File, io::Read, sync::OnceLock};
 
     const SHA256_ALG_NAME: &[u16] = &[
-        b'S' as u16, b'H' as u16, b'A' as u16, b'2' as u16, b'5' as u16, b'6' as u16, 0,
+        b'S' as u16,
+        b'H' as u16,
+        b'A' as u16,
+        b'2' as u16,
+        b'5' as u16,
+        b'6' as u16,
+        0,
     ];
     const OBJECT_LENGTH_PROP: &[u16] = &[
-        b'O' as u16, b'b' as u16, b'j' as u16, b'e' as u16, b'c' as u16, b't' as u16,
-        b'L' as u16, b'e' as u16, b'n' as u16, b'g' as u16, b't' as u16, b'h' as u16, 0,
+        b'O' as u16,
+        b'b' as u16,
+        b'j' as u16,
+        b'e' as u16,
+        b'c' as u16,
+        b't' as u16,
+        b'L' as u16,
+        b'e' as u16,
+        b'n' as u16,
+        b'g' as u16,
+        b't' as u16,
+        b'h' as u16,
+        0,
     ];
     const SHA256_DIGEST_LEN: u32 = 32;
 
@@ -604,11 +621,8 @@ pub fn validate_files(
                             break;
                         };
                         let work = &works[work_idx];
-                        let res = check_hash_with_buffer(
-                            &work.path,
-                            &work.expected_sha256,
-                            &mut buffer,
-                        );
+                        let res =
+                            check_hash_with_buffer(&work.path, &work.expected_sha256, &mut buffer);
                         let _ = outcomes[work.index].set(res);
                     }
                 });

@@ -11,7 +11,7 @@ $ErrorActionPreference = "Stop"
 . (Join-Path $PSScriptRoot "common.ps1")
 Push-Location (Split-Path -Parent $PSScriptRoot)
 try {
-    cargo fmt --check
+    cargo fmt -p gpui-cef-poc -p rust-cef-ui -p rust-cef-helper -p rust-cef-runtime -p rust-cef-gpui -- --check
     if ($LASTEXITCODE -ne 0) { throw "Formatting check failed" }
     # Compile the real pure core once for its consumers, without CEF/GPUI builds.
     $checkOut = New-PocDirectory (Resolve-CheckOutputDir)

@@ -20,14 +20,60 @@ fn status(q: &Shared) -> FindStatus {
     q.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 #[derive(Clone)]
-struct Data {
-    id: FindOperationId,
-    scope: Arc<Scope>,
-    sink: Arc<dyn FindResultSink>,
-    status: Shared,
+pub(crate) enum FindScope {
+    Menu(Arc<Scope>),
+    HostMenu(Arc<Scope>),
+    HostDirect {
+        browser: BrowserId,
+        context: Arc<rust_cef_core::menu_context::MenuContext>,
+        registry: Weak<UiRegistry>,
+    },
+}
+impl FindScope {
+    pub(crate) fn browser(&self) -> BrowserId {
+        match self {
+            Self::Menu(s) | Self::HostMenu(s) => s.browser,
+            Self::HostDirect { browser, .. } => *browser,
+        }
+    }
+    pub(crate) fn serial(&self) -> Option<u64> {
+        match self {
+            Self::Menu(s) | Self::HostMenu(s) => Some(s.serial),
+            Self::HostDirect { .. } => None,
+        }
+    }
+    pub(crate) fn context(&self) -> &Arc<rust_cef_core::menu_context::MenuContext> {
+        match self {
+            Self::Menu(s) | Self::HostMenu(s) => &s.context,
+            Self::HostDirect { context, .. } => context,
+        }
+    }
+    pub(crate) fn operation_alive(&self) -> bool {
+        match self {
+            Self::Menu(s) => s.operation_alive(),
+            Self::HostMenu(s) => s
+                .registry
+                .upgrade()
+                .is_some_and(|r| r.host_menu_scope_alive(s)),
+            Self::HostDirect {
+                browser, registry, ..
+            } => registry
+                .upgrade()
+                .is_some_and(|r| r.host_direct_find_alive(*browser)),
+        }
+    }
+}
+#[derive(Clone)]
+pub(crate) struct Data {
+    pub(crate) id: FindOperationId,
+    pub(crate) scope: FindScope,
+    pub(crate) sink: Arc<dyn FindResultSink>,
+    pub(crate) status: Shared,
+    pub(crate) allow_same_session_id: bool,
 }
 struct Cursor {
     highwater: Option<i32>,
+    last_session_active: bool,
     quarantined: bool,
     row: Option<Data>,
 }
@@ -55,7 +101,7 @@ pub struct FindDiagnostics {
 pub(crate) struct Finds {
     state: Mutex<State>,
 }
-struct Work(Arc<Finds>);
+pub(crate) struct Work(Arc<Finds>);
 impl Drop for Work {
     fn drop(&mut self) {
         let mut s = self.0.lock();
@@ -100,7 +146,7 @@ impl Finds {
     pub fn configured(&self) -> bool {
         self.lock().limits.is_some()
     }
-    fn work(self: &Arc<Self>) -> Work {
+    pub(crate) fn work(self: &Arc<Self>) -> Work {
         let mut s = self.lock();
         s.inflight = s.inflight.checked_add(1).unwrap_or_else(|| {
             s.faulted = true;
@@ -154,39 +200,53 @@ impl Finds {
         menu: ContextMenuRequestId,
         sink: &Arc<dyn FindResultSink>,
     ) -> Result<Data, EngineError> {
+        self.begin_host(FindScope::Menu(scope.clone()), menu, sink, false)
+    }
+    pub(crate) fn begin_host(
+        &self,
+        scope: FindScope,
+        menu: ContextMenuRequestId,
+        sink: &Arc<dyn FindResultSink>,
+        allow_same_session_id: bool,
+    ) -> Result<Data, EngineError> {
         let mut s = self.lock();
         let limits = s.limits.ok_or(EngineError::NotReady)?;
-        if s.faulted || menu.browser != scope.browser {
+        let browser = scope.browser();
+        if s.faulted || menu.browser != browser {
             return Err(EngineError::InvalidRequest);
         }
-        if scope.context.selection.len() > limits.max_query_bytes.get() {
+        let query_bytes = scope.context().selection.len();
+        if query_bytes > limits.max_query_bytes.get() {
             return Err(EngineError::Backpressure);
         }
-        if let Some(c) = s.cursors.get(&scope.browser) {
+        let allow_same_session_id = if let Some(c) = s.cursors.get(&browser) {
             if c.row.is_some() || c.quarantined || c.highwater == Some(i32::MAX) {
                 return Err(EngineError::Backpressure);
             }
+            allow_same_session_id
+                && !matches!(scope, FindScope::Menu(_))
+                && c.last_session_active
+                && c.highwater.is_some()
         } else if s.cursors.len() >= limits.capacity.get() {
             return Err(EngineError::Backpressure);
-        }
+        } else {
+            false
+        };
         let sequence = s.next;
         if sequence == 0 {
             return Err(EngineError::InvalidRequest);
         }
         s.next = sequence.checked_add(1).unwrap_or(0);
-        let id = FindOperationId {
-            browser: scope.browser,
-            sequence,
-        };
+        let id = FindOperationId { browser, sequence };
         let data = Data {
             id,
-            scope: scope.clone(),
+            scope,
             sink: sink.clone(),
             status: Arc::new(Mutex::new(FindStatus {
                 operation: id,
                 menu,
                 phase: FindPhase::Admitted,
-                query_bytes: scope.context.selection.len(),
+                query_bytes,
                 issued: false,
                 cancel_requested: false,
                 stop_attempted: false,
@@ -195,11 +255,13 @@ impl Finds {
                 outcome: None,
                 first_failure: None,
             })),
+            allow_same_session_id,
         };
         s.cursors
             .entry(id.browser)
             .or_insert(Cursor {
                 highwater: None,
+                last_session_active: false,
                 quarantined: false,
                 row: None,
             })
@@ -207,7 +269,26 @@ impl Finds {
         s.started += 1;
         Ok(data)
     }
-    fn data(&self, id: FindOperationId) -> Option<Data> {
+    pub(crate) fn rollback_unstarted(&self, id: FindOperationId) {
+        let old = {
+            let mut s = self.lock();
+            let row = if let Some(c) = s.cursors.get_mut(&id.browser)
+                && c.row
+                    .as_ref()
+                    .is_some_and(|d| d.id == id && !status(&d.status).issued)
+            {
+                c.row.take()
+            } else {
+                None
+            };
+            if row.is_some() {
+                s.started = s.started.saturating_sub(1);
+            }
+            row
+        };
+        drop(old);
+    }
+    pub(crate) fn data(&self, id: FindOperationId) -> Option<Data> {
         self.lock()
             .cursors
             .get(&id.browser)?
@@ -216,35 +297,40 @@ impl Finds {
             .filter(|d| d.id == id)
             .cloned()
     }
-    fn active(&self, browser: BrowserId) -> Option<Data> {
+    pub(crate) fn active(&self, browser: BrowserId) -> Option<Data> {
         self.lock().cursors.get(&browser)?.row.clone()
     }
-    fn failure(&self, data: &Data, f: FindFailure) {
+    pub(crate) fn failure(&self, data: &Data, f: FindFailure) {
         let mut s = self.lock();
         let mut q = data.status.lock().unwrap_or_else(|e| e.into_inner());
         q.first_failure.get_or_insert(f.clone());
         s.first_failure.get_or_insert((data.id, f));
     }
-    fn end(&self, data: &Data, outcome: FindOutcome) -> Option<Data> {
+    pub(crate) fn end(&self, data: &Data, outcome: FindOutcome) -> Option<Data> {
         let mut s = self.lock();
         let c = s.cursors.get_mut(&data.id.browser)?;
         if c.row.as_ref().is_none_or(|d| d.id != data.id) {
             return None;
         }
-        {
+        let session_active = {
             let mut q = data.status.lock().unwrap_or_else(|e| e.into_inner());
             q.phase = FindPhase::Finished;
-            q.outcome = Some(if q.first_failure.is_some() {
+            let final_outcome = if q.first_failure.is_some() {
                 FindOutcome::Failed
             } else {
                 outcome
-            });
-        }
+            };
+            q.outcome = Some(final_outcome);
+            final_outcome == FindOutcome::Result
+                && !q.cancel_requested
+                && q.last_result.as_ref().is_some_and(|r| r.matches > 0)
+        };
+        c.last_session_active = session_active;
         let old = c.row.take();
         s.finished += 1;
         old
     }
-    fn finish(&self, data: &Data, outcome: FindOutcome) {
+    pub(crate) fn finish(&self, data: &Data, outcome: FindOutcome) {
         if let Some(old) = self.end(data, outcome) {
             drop(old);
             self.notify_end(data);
@@ -255,7 +341,7 @@ impl Finds {
             self.failure(data, FindFailure::Publish(e));
         }
     }
-    fn issue(&self, data: &Data) -> bool {
+    pub(crate) fn issue(&self, data: &Data) -> bool {
         let s = self.lock();
         if s.cursors
             .get(&data.id.browser)
@@ -277,7 +363,7 @@ impl Finds {
         }
         true
     }
-    fn reserve_cancel(&self, id: FindOperationId) -> Result<Data, EngineError> {
+    pub(crate) fn reserve_cancel(&self, id: FindOperationId) -> Result<Data, EngineError> {
         let s = self.lock();
         let d = s
             .cursors
@@ -295,7 +381,7 @@ impl Finds {
         drop(q);
         Ok(d)
     }
-    fn rollback_cancel(&self, data: &Data, e: EngineError) {
+    pub(crate) fn rollback_cancel(&self, data: &Data, e: EngineError) {
         let s = self.lock();
         if s.cursors
             .get(&data.id.browser)
@@ -315,7 +401,7 @@ impl Finds {
     }
     // No returned callback/row is dropped while the book or outer registry locks
     // are held. Late known native IDs never bind to a newer local operation.
-    fn result(
+    pub(crate) fn result(
         &self,
         browser: BrowserId,
         identifier: i32,
@@ -366,7 +452,12 @@ impl Finds {
             s.late += 1;
             return None;
         }
-        if current.is_none() && c.highwater.is_some_and(|old| identifier <= old) {
+        let stale = if d.allow_same_session_id {
+            c.highwater.is_some_and(|old| identifier < old)
+        } else {
+            c.highwater.is_some_and(|old| identifier <= old)
+        };
+        if current.is_none() && stale {
             drop(q);
             s.late += 1;
             return None;
@@ -387,8 +478,24 @@ impl Finds {
     pub fn fault(&self) {
         self.lock().faulted = true;
     }
-    fn enrolled(&self, browser: BrowserId) -> bool {
+    pub(crate) fn enrolled(&self, browser: BrowserId) -> bool {
         self.lock().cursors.contains_key(&browser)
+    }
+    pub(crate) fn clear_session_active(&self, browser: BrowserId) {
+        if let Some(c) = self.lock().cursors.get_mut(&browser) {
+            c.last_session_active = false;
+        }
+    }
+    pub(crate) fn sequence_watermark_and_clear_session(&self, browser: BrowserId) -> u64 {
+        let mut s = self.lock();
+        if let Some(c) = s.cursors.get_mut(&browser) {
+            c.last_session_active = false;
+        }
+        if s.next == 0 {
+            u64::MAX
+        } else {
+            s.next.saturating_sub(1)
+        }
     }
     pub fn browser_closed(self: &Arc<Self>, browser: BrowserId) {
         let _work = self.work();
@@ -411,7 +518,7 @@ impl Finds {
             }
         }
     }
-    fn selected(&self, browser: Option<BrowserId>, serial: Option<u64>) -> Vec<Data> {
+    pub(crate) fn selected(&self, browser: Option<BrowserId>, serial: Option<u64>) -> Vec<Data> {
         self.lock()
             .cursors
             .iter()
@@ -419,11 +526,18 @@ impl Finds {
             .filter_map(|(_, c)| {
                 c.row
                     .as_ref()
-                    .filter(|d| serial.is_none_or(|n| d.scope.serial == n))
+                    .filter(|d| serial.is_none_or(|n| d.scope.serial() == Some(n)))
                     .cloned()
             })
             .collect()
     }
+}
+pub(crate) fn find_receipt(registry: Weak<UiRegistry>, data: &Data) -> Arc<dyn FindReceipt> {
+    Arc::new(Receipt {
+        id: data.id,
+        registry,
+        shared: data.status.clone(),
+    })
 }
 struct Receipt {
     id: FindOperationId,
@@ -520,6 +634,9 @@ impl UiRegistry {
         }
     }
     pub(crate) fn cancel_find_now(&self, id: FindOperationId) {
+        self.cancel_find_now_with_clear(id, false);
+    }
+    pub(crate) fn cancel_find_now_with_clear(&self, id: FindOperationId, clear_selection: bool) {
         let _work = self.finds.work();
         let Some(data) = self.finds.data(id) else {
             return;
@@ -543,7 +660,8 @@ impl UiRegistry {
                 self.menu_audit().record();
                 if let Some(host) = native.host() {
                     self.menu_audit().record();
-                    host.stop_finding(0);
+                    host.stop_finding(i32::from(clear_selection));
+                    self.finds.clear_session_active(id.browser);
                     data.status
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
@@ -565,10 +683,10 @@ wrap_find_handler! {
    let Some(native)=browser else{registry.finds.fault();return};
    if !registry.find_native_matches(self.state.browser,native){registry.finds.fault();return;}
    if !registry.finds.enrolled(self.state.browser){self.state.find_unmanaged.store(true,Ordering::Release);return;}
-   if let Some(data)=registry.finds.active(self.state.browser){if !data.scope.operation_alive(){registry.cancel_finds(Some(self.state.browser),Some(data.scope.serial));}}
+   if let Some(data)=registry.finds.active(self.state.browser){if !data.scope.operation_alive(){registry.cancel_finds(Some(self.state.browser),data.scope.serial());}}
    let rect=selection_rect.map(|r|FindRect{x:r.x,y:r.y,width:r.width,height:r.height});
    if let Some((data,result,done))=registry.finds.result(self.state.browser,identifier,count,active_match_ordinal,rect,final_update!=0){
-    if !status(&data.status).cancel_requested{if let Err(e)=data.sink.update(result){registry.finds.failure(&data,FindFailure::Publish(e));registry.cancel_finds(Some(data.id.browser),Some(data.scope.serial));}}
+    if !status(&data.status).cancel_requested{if let Err(e)=data.sink.update(result){registry.finds.failure(&data,FindFailure::Publish(e));registry.cancel_finds(Some(data.id.browser),data.scope.serial());}}
     if done{let q=status(&data.status);let outcome=if q.query_bytes==0{FindOutcome::EmptySelection}else if q.cancel_requested{FindOutcome::Cancelled}else{FindOutcome::Result};registry.finds.finish(&data,outcome);}
     if let Err(e)=registry.menu_wake(){registry.finds.failure(&data,FindFailure::Wake(e));}
    }

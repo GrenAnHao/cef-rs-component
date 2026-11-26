@@ -256,7 +256,11 @@ struct KeyedMutexGuard<'a> {
 }
 
 impl<'a> KeyedMutexGuard<'a> {
-    fn acquire(mutex: &'a IDXGIKeyedMutex, key: u64, timeout_ms: u32) -> Result<Self, CaptureFault> {
+    fn acquire(
+        mutex: &'a IDXGIKeyedMutex,
+        key: u64,
+        timeout_ms: u32,
+    ) -> Result<Self, CaptureFault> {
         let hr = unsafe { (Interface::vtable(mutex).AcquireSync)(mutex.as_raw(), key, timeout_ms) };
         if hr.0 != 0 {
             return Err(native_fault(CaptureFailureKind::CopyResource, hr));
@@ -345,91 +349,7 @@ impl D3d11Capture {
         if crate::executor::current_thread_id() != owner_thread {
             return Err(CaptureFault::new(CaptureFailureKind::WrongThread));
         }
-        let levels = [
-            D3D_FEATURE_LEVEL_11_0,
-            D3D_FEATURE_LEVEL_10_1,
-            D3D_FEATURE_LEVEL_10_0,
-        ];
-        let mut device: Option<ID3D11Device> = None;
-        let mut context: Option<ID3D11DeviceContext> = None;
-
-        // Enumerate DXGI hardware adapters first (matching GPUI's primary hardware
-        // adapter LUID). When a non-null IDXGIAdapter is supplied, DriverType MUST
-        // be D3D_DRIVER_TYPE_UNKNOWN.
-        let mut created_via_adapter = false;
-        if let Ok(factory) = unsafe { CreateDXGIFactory1::<IDXGIFactory1>() } {
-            let mut idx = 0u32;
-            while let Ok(adapter1) = unsafe { factory.EnumAdapters1(idx) } {
-                idx = idx.saturating_add(1);
-                let Ok(desc) = (unsafe { adapter1.GetDesc1() }) else {
-                    continue;
-                };
-                if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32) != 0 {
-                    continue;
-                }
-                let Ok(adapter) = adapter1.cast::<IDXGIAdapter>() else {
-                    continue;
-                };
-                let mut dev = None;
-                let mut ctx = None;
-                if unsafe {
-                    D3D11CreateDevice(
-                        Some(&adapter),
-                        D3D_DRIVER_TYPE_UNKNOWN,
-                        HMODULE::default(),
-                        D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-                        Some(levels.as_slice()),
-                        D3D11_SDK_VERSION,
-                        Some(&mut dev),
-                        None,
-                        Some(&mut ctx),
-                    )
-                }
-                .is_ok()
-                    && dev.is_some()
-                    && ctx.is_some()
-                {
-                    device = dev;
-                    context = ctx;
-                    created_via_adapter = true;
-                    break;
-                }
-            }
-        }
-
-        if !created_via_adapter {
-            // Fallback to default hardware driver selection; still never WARP.
-            unsafe {
-                D3D11CreateDevice(
-                    None::<&IDXGIAdapter>,
-                    D3D_DRIVER_TYPE_HARDWARE,
-                    HMODULE::default(),
-                    D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-                    Some(levels.as_slice()),
-                    D3D11_SDK_VERSION,
-                    Some(&mut device),
-                    None,
-                    Some(&mut context),
-                )
-            }
-            .map_err(|error| native_fault(CaptureFailureKind::DeviceCreation, error.code()))?;
-        }
-
-        let device = device.ok_or_else(|| CaptureFault::new(CaptureFailureKind::DeviceCreation))?;
-        let context =
-            context.ok_or_else(|| CaptureFault::new(CaptureFailureKind::DeviceCreation))?;
-        // A device that was removed before first use must not be handed out.
-        // SAFETY: both interfaces are live and were just created.
-        unsafe { device.GetDeviceRemovedReason() }
-            .map_err(|error| native_fault(CaptureFailureKind::DeviceCreation, error.code()))?;
-        // SAFETY: QueryInterface on a live device; ID3D11Device1 is needed for
-        // NT-handle `OpenSharedResource1`.
-        let device1: ID3D11Device1 = device
-            .cast()
-            .map_err(|error| native_fault(CaptureFailureKind::DeviceCreation, error.code()))?;
-        if let Ok(dxgi_device1) = device.cast::<IDXGIDevice1>() {
-            let _ = unsafe { dxgi_device1.SetMaximumFrameLatency(1) };
-        }
+        let (device, device1, context) = create_hardware_d3d11_device()?;
         #[cfg(feature = "test-support")]
         let readback_adapter_luid = readback_adapter_luid(&device);
         Ok(Self {
@@ -460,8 +380,11 @@ impl D3d11Capture {
         };
         let handle = HANDLE(raw_handle);
         match self.open_mode {
-            OpenHandleMode::NtHandle => unsafe { device1.OpenSharedResource1(handle) }
-                .map_err(|error| native_fault(CaptureFailureKind::OpenSharedResource, error.code())),
+            OpenHandleMode::NtHandle => {
+                unsafe { device1.OpenSharedResource1(handle) }.map_err(|error| {
+                    native_fault(CaptureFailureKind::OpenSharedResource, error.code())
+                })
+            }
             OpenHandleMode::LegacyHandle => {
                 let mut opened: Option<ID3D11Texture2D> = None;
                 unsafe { device.OpenSharedResource(handle, &mut opened) }.map_err(|error| {
@@ -621,7 +544,16 @@ impl D3d11Capture {
                     back: 1,
                 };
                 unsafe {
-                    context.CopySubresourceRegion(&slot.texture, 0, 0, 0, 0, imported, 0, Some(&src_box));
+                    context.CopySubresourceRegion(
+                        &slot.texture,
+                        0,
+                        0,
+                        0,
+                        0,
+                        imported,
+                        0,
+                        Some(&src_box),
+                    );
                 }
             }
             // `KeyedMutexGuard::drop` calls `ReleaseSync(0)`, which implicitly flushes the
@@ -687,9 +619,8 @@ impl D3d11Capture {
             MiscFlags: misc_flags,
         };
 
-        let nt_keyed_flags =
-            (D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX.0 | D3D11_RESOURCE_MISC_SHARED_NTHANDLE.0)
-                as u32;
+        let nt_keyed_flags = (D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX.0
+            | D3D11_RESOURCE_MISC_SHARED_NTHANDLE.0) as u32;
         let nt_plain_flags =
             (D3D11_RESOURCE_MISC_SHARED.0 | D3D11_RESOURCE_MISC_SHARED_NTHANDLE.0) as u32;
         let legacy_flags = D3D11_RESOURCE_MISC_SHARED.0 as u32;
@@ -716,9 +647,7 @@ impl D3d11Capture {
                 unsafe {
                     device.CreateTexture2D(&make_desc(legacy_flags), None, Some(&mut created))
                 }
-                .map_err(|error| {
-                    native_fault(CaptureFailureKind::StagingCreation, error.code())
-                })?;
+                .map_err(|error| native_fault(CaptureFailureKind::StagingCreation, error.code()))?;
             }
         }
 
@@ -743,14 +672,16 @@ impl D3d11Capture {
             } else {
                 None
             };
-            (Arc::new(OwnedSharedHandle::new_nt(raw, ring_counter)), keyed)
+            (
+                Arc::new(OwnedSharedHandle::new_nt(raw, ring_counter)),
+                keyed,
+            )
         } else {
             let resource: IDXGIResource = texture
                 .cast()
                 .map_err(|error| native_fault(CaptureFailureKind::StagingCreation, error.code()))?;
-            let raw = unsafe { resource.GetSharedHandle() }.map_err(|error| {
-                native_fault(CaptureFailureKind::StagingCreation, error.code())
-            })?;
+            let raw = unsafe { resource.GetSharedHandle() }
+                .map_err(|error| native_fault(CaptureFailureKind::StagingCreation, error.code()))?;
             (
                 Arc::new(OwnedSharedHandle::new_legacy(raw, ring_counter)),
                 None,
@@ -1758,4 +1689,281 @@ mod tests {
             "all shared handles must close after capture and frames drop"
         );
     }
+
+    #[test]
+    fn readback_shared_texture_frame_copies_real_shared_pool_pixels_and_rejects_stale_keepalive() {
+        let mut stale = GpuSharedTextureFrame {
+            pool_id: 1,
+            shared_handle: 0,
+            is_nt_handle: true,
+            keyed_mutex_key: None,
+            width: 2,
+            height: 2,
+            format: TextureFormat::Bgra8888,
+            frame_seq: 1,
+            slot_index: 0,
+            generation: 1,
+            resource_keepalive: std::sync::Weak::new(),
+            handle_owner: Arc::new(()),
+            lease: Arc::new(SharedTextureSlotTracker::new()).lease(0),
+        };
+        assert_eq!(
+            readback_shared_texture_frame(&stale),
+            Err(CaptureFault::new(CaptureFailureKind::InvalidHandle).engine())
+        );
+        stale.shared_handle = 1;
+        assert_eq!(
+            readback_shared_texture_frame(&stale),
+            Err(CaptureFault::new(CaptureFailureKind::InvalidHandle).engine())
+        );
+
+        let tex = test_texture(FrameFormat::Bgra8);
+        let mut capture = D3d11Capture::new(owner()).expect("hardware D3D11 device");
+        let (frame, _) = capture
+            .copy_to_shared_pool(SurfaceKind::View, &tex.info, || None)
+            .expect("copy into shared texture pool");
+        frame.lease.tracker().mark_presenting(frame.slot_index);
+        let bytes = readback_shared_texture_frame(&frame).expect("read back shared texture");
+        assert_eq!(bytes, tex.expected_bgra());
+        drop(frame);
+        drop(capture);
+    }
+}
+
+fn create_hardware_d3d11_device()
+-> Result<(ID3D11Device, ID3D11Device1, ID3D11DeviceContext), CaptureFault> {
+    let levels = [
+        D3D_FEATURE_LEVEL_11_0,
+        D3D_FEATURE_LEVEL_10_1,
+        D3D_FEATURE_LEVEL_10_0,
+    ];
+    let mut device: Option<ID3D11Device> = None;
+    let mut context: Option<ID3D11DeviceContext> = None;
+
+    // Enumerate DXGI hardware adapters first (matching GPUI's primary hardware
+    // adapter LUID). When a non-null IDXGIAdapter is supplied, DriverType MUST
+    // be D3D_DRIVER_TYPE_UNKNOWN.
+    let mut created_via_adapter = false;
+    if let Ok(factory) = unsafe { CreateDXGIFactory1::<IDXGIFactory1>() } {
+        let mut idx = 0u32;
+        while let Ok(adapter1) = unsafe { factory.EnumAdapters1(idx) } {
+            idx = idx.saturating_add(1);
+            let Ok(desc) = (unsafe { adapter1.GetDesc1() }) else {
+                continue;
+            };
+            if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32) != 0 {
+                continue;
+            }
+            let Ok(adapter) = adapter1.cast::<IDXGIAdapter>() else {
+                continue;
+            };
+            let mut dev = None;
+            let mut ctx = None;
+            if unsafe {
+                D3D11CreateDevice(
+                    Some(&adapter),
+                    D3D_DRIVER_TYPE_UNKNOWN,
+                    HMODULE::default(),
+                    D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                    Some(levels.as_slice()),
+                    D3D11_SDK_VERSION,
+                    Some(&mut dev),
+                    None,
+                    Some(&mut ctx),
+                )
+            }
+            .is_ok()
+                && dev.is_some()
+                && ctx.is_some()
+            {
+                device = dev;
+                context = ctx;
+                created_via_adapter = true;
+                break;
+            }
+        }
+    }
+
+    if !created_via_adapter {
+        // Fallback to default hardware driver selection; still never WARP.
+        unsafe {
+            D3D11CreateDevice(
+                None::<&IDXGIAdapter>,
+                D3D_DRIVER_TYPE_HARDWARE,
+                HMODULE::default(),
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                Some(levels.as_slice()),
+                D3D11_SDK_VERSION,
+                Some(&mut device),
+                None,
+                Some(&mut context),
+            )
+        }
+        .map_err(|error| native_fault(CaptureFailureKind::DeviceCreation, error.code()))?;
+    }
+
+    let device = device.ok_or_else(|| CaptureFault::new(CaptureFailureKind::DeviceCreation))?;
+    let context = context.ok_or_else(|| CaptureFault::new(CaptureFailureKind::DeviceCreation))?;
+    // A device that was removed before first use must not be handed out.
+    // SAFETY: both interfaces are live and were just created.
+    unsafe { device.GetDeviceRemovedReason() }
+        .map_err(|error| native_fault(CaptureFailureKind::DeviceCreation, error.code()))?;
+    // SAFETY: QueryInterface on a live device; ID3D11Device1 is needed for
+    // NT-handle `OpenSharedResource1`.
+    let device1: ID3D11Device1 = device
+        .cast()
+        .map_err(|error| native_fault(CaptureFailureKind::DeviceCreation, error.code()))?;
+    if let Ok(dxgi_device1) = device.cast::<IDXGIDevice1>() {
+        let _ = unsafe { dxgi_device1.SetMaximumFrameLatency(1) };
+    }
+    Ok((device, device1, context))
+}
+
+struct ReadbackMapGuard<'a> {
+    context: &'a ID3D11DeviceContext,
+    staging: &'a ID3D11Texture2D,
+}
+
+impl Drop for ReadbackMapGuard<'_> {
+    fn drop(&mut self) {
+        // SAFETY: pairs with the successful `Map` on subresource 0.
+        unsafe { self.context.Unmap(self.staging, 0) };
+    }
+}
+
+/// On-demand D3D11 readback for a presented [`GpuSharedTextureFrame`].
+///
+/// Opens the shared handle on a fresh hardware device, respects any keyed mutex,
+/// copies into a private STAGING texture, maps read-only with RAII `Unmap`, and
+/// extracts compact premultiplied BGRA8 bytes.
+pub(crate) fn readback_shared_texture_frame(
+    frame: &GpuSharedTextureFrame,
+) -> Result<Vec<u8>, rust_cef_core::ports::EngineError> {
+    if frame.format != TextureFormat::Bgra8888 {
+        return Err(CaptureFault::new(CaptureFailureKind::UnsupportedFormat).engine());
+    }
+    if frame.width == 0 || frame.height == 0 {
+        return Err(invalid_dimensions().engine());
+    }
+    let Some(expected_len) = rust_cef_core::frame_store::frame_len(frame.width, frame.height)
+    else {
+        return Err(invalid_dimensions().engine());
+    };
+    if frame.shared_handle == 0 || frame.resource_keepalive.strong_count() == 0 {
+        return Err(CaptureFault::new(CaptureFailureKind::InvalidHandle).engine());
+    }
+
+    let (device, device1, context) =
+        create_hardware_d3d11_device().map_err(CaptureFault::engine)?;
+    let handle = HANDLE(frame.shared_handle as *mut core::ffi::c_void);
+    let source: ID3D11Texture2D = if frame.is_nt_handle {
+        unsafe { device1.OpenSharedResource1(handle) }.map_err(|error| {
+            native_fault(CaptureFailureKind::OpenSharedResource, error.code()).engine()
+        })?
+    } else {
+        let mut opened: Option<ID3D11Texture2D> = None;
+        unsafe { device.OpenSharedResource(handle, &mut opened) }.map_err(|error| {
+            native_fault(CaptureFailureKind::OpenSharedResource, error.code()).engine()
+        })?;
+        opened.ok_or_else(|| CaptureFault::new(CaptureFailureKind::OpenSharedResource).engine())?
+    };
+
+    let mut desc = D3D11_TEXTURE2D_DESC::default();
+    unsafe { source.GetDesc(&mut desc) };
+    if desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM {
+        return Err(CaptureFault::new(CaptureFailureKind::UnsupportedFormat).engine());
+    }
+    if desc.Width < frame.width || desc.Height < frame.height {
+        return Err(invalid_dimensions().engine());
+    }
+
+    let keyed_mutex = match frame.keyed_mutex_key {
+        Some(key) => {
+            let mutex: IDXGIKeyedMutex = source.cast().map_err(|error| {
+                native_fault(CaptureFailureKind::CopyResource, error.code()).engine()
+            })?;
+            Some((mutex, key))
+        }
+        None => None,
+    };
+    let keyed_guard = match keyed_mutex.as_ref() {
+        Some((mutex, key)) => {
+            Some(KeyedMutexGuard::acquire(mutex, *key, 250).map_err(CaptureFault::engine)?)
+        }
+        None => None,
+    };
+
+    let layout = FrameLayout {
+        coded_width: frame.width,
+        coded_height: frame.height,
+        visible: (0, 0, frame.width as i32, frame.height as i32),
+        format: FrameFormat::Bgra8,
+        dxgi: DXGI_FORMAT_B8G8R8A8_UNORM,
+    };
+    let sdesc = staging_desc(&layout);
+    let mut staging: Option<ID3D11Texture2D> = None;
+    unsafe { device.CreateTexture2D(&sdesc, None, Some(&mut staging)) }.map_err(|error| {
+        native_fault(CaptureFailureKind::StagingCreation, error.code()).engine()
+    })?;
+    let staging =
+        staging.ok_or_else(|| CaptureFault::new(CaptureFailureKind::StagingCreation).engine())?;
+
+    if desc.Width == frame.width && desc.Height == frame.height {
+        unsafe { context.CopyResource(&staging, &source) };
+    } else {
+        let src_box = D3D11_BOX {
+            left: 0,
+            top: 0,
+            front: 0,
+            right: frame.width,
+            bottom: frame.height,
+            back: 1,
+        };
+        unsafe { context.CopySubresourceRegion(&staging, 0, 0, 0, 0, &source, 0, Some(&src_box)) };
+    }
+
+    drop(keyed_guard);
+    if frame.keyed_mutex_key.is_none() {
+        unsafe { context.Flush() };
+    }
+    drop(keyed_mutex);
+    drop(source);
+
+    unsafe { device.GetDeviceRemovedReason() }
+        .map_err(|error| native_fault(CaptureFailureKind::DeviceRemoved, error.code()).engine())?;
+
+    let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+    unsafe { context.Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped)) }
+        .map_err(|error| native_fault(CaptureFailureKind::Map, error.code()).engine())?;
+    let _unmap = ReadbackMapGuard {
+        context: &context,
+        staging: &staging,
+    };
+    if mapped.pData.is_null() {
+        return Err(CaptureFault::new(CaptureFailureKind::Map).engine());
+    }
+    let pitch = mapped.RowPitch;
+    let Some(min_pitch) = frame.width.checked_mul(4) else {
+        return Err(CaptureFault::new(CaptureFailureKind::IncompleteFrame).engine());
+    };
+    let Some(len) = (pitch as usize).checked_mul(frame.height as usize) else {
+        return Err(CaptureFault::new(CaptureFailureKind::IncompleteFrame).engine());
+    };
+    if pitch < min_pitch || len > isize::MAX as usize {
+        return Err(CaptureFault::new(CaptureFailureKind::IncompleteFrame).engine());
+    }
+    let src = unsafe { slice::from_raw_parts(mapped.pData as *const u8, len) };
+    let mut dst = vec![0u8; expected_len];
+    if !copy_bgra_aperture(
+        src,
+        pitch,
+        frame.width,
+        frame.height,
+        layout.visible,
+        layout.format,
+        &mut dst,
+    ) {
+        return Err(CaptureFault::new(CaptureFailureKind::IncompleteFrame).engine());
+    }
+    Ok(dst)
 }

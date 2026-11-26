@@ -5,9 +5,13 @@
 use crate::{policy::CompiledPolicy, registry::UiRegistry};
 use cef::*;
 use rust_cef_core::{
-    contracts::BrowserId, custom_schemes::ResourceInterceptor, host_capabilities::HostCapabilities,
-    ports::PolicyAction,
+    contracts::BrowserId,
+    custom_schemes::ResourceInterceptor,
+    host_capabilities::HostCapabilities,
+    js_bridge::{MAX_JS_JSON_DEPTH, MAX_JS_PAYLOAD_BYTES, validate_bounded_json},
+    ports::{EngineError, PolicyAction},
 };
+use serde::{Deserialize, Serialize};
 use std::{
     path::PathBuf,
     sync::{
@@ -17,6 +21,147 @@ use std::{
 };
 
 pub(crate) const POLICY_ACTIONS: usize = 12;
+pub const MAX_JS_REPOSITORY_GLOBAL_NAME_BYTES: usize = 128;
+pub const MAX_JS_REPOSITORY_OBJECTS: usize = 64;
+pub const MAX_JS_REPOSITORY_METHODS_PER_OBJECT: usize = 256;
+pub const MAX_JS_REPOSITORY_PROPERTIES_PER_OBJECT: usize = 128;
+pub const MAX_JS_REPOSITORY_DEPTH: usize = 4;
+
+/// Naming style for generated JS repository API methods on custom global objects.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum JsRepositoryMethodStyle {
+    /// Follow CefSharp's convention (`JavascriptBindingSettings.cs:71-73`):
+    /// lowercase-initial global names expose camelCase methods; uppercase-initial names expose PascalCase.
+    #[default]
+    AutoByGlobalName,
+    CamelCase,
+    PascalCase,
+}
+
+/// Pre-registered property descriptor for a bound JS repository object.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JsRepositoryPropertyDescriptor {
+    pub name: String,
+    /// Validated bounded JSON literal (or encoded `Date` marker) for initial value.
+    pub value_json: String,
+    pub readonly: bool,
+}
+
+/// Descriptor for an object pre-registered into the renderer V8 repository bootstrap.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JsRepositoryObjectDescriptor {
+    pub name: String,
+    pub is_async: bool,
+    pub methods: Vec<String>,
+    pub properties: Vec<JsRepositoryPropertyDescriptor>,
+    pub sub_objects: Vec<JsRepositoryObjectDescriptor>,
+}
+
+/// Opt-in runtime configuration for renderer-side JS Object Repository bootstrap.
+///
+/// Mirrors CefSharp's `JavascriptBindingSettings`
+/// (`D:\System Dir\Downloads\CefSharp\CefSharp\JavascriptBinding\JavascriptBindingSettings.cs:14-140`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JsRepositorySettings {
+    pub enabled: bool,
+    /// Custom global object name on `window`/`globalThis`.
+    /// When `None`, preserves default aliases (`window['cef-rs-gpui']`, `window.CefRsGpui`, `window.cefRsGpui`).
+    pub global_object_name: Option<String>,
+    pub method_style: JsRepositoryMethodStyle,
+    /// Automatically bind pre-registered objects when a V8 context is created.
+    pub legacy_binding_enabled: bool,
+    pub objects: Vec<JsRepositoryObjectDescriptor>,
+}
+
+impl Default for JsRepositorySettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            global_object_name: None,
+            method_style: JsRepositoryMethodStyle::AutoByGlobalName,
+            legacy_binding_enabled: false,
+            objects: Vec::new(),
+        }
+    }
+}
+
+pub(crate) fn validate_js_repository_name(
+    name: &str,
+    allow_hyphen: bool,
+) -> Result<(), EngineError> {
+    if name.is_empty() || name.len() > MAX_JS_REPOSITORY_GLOBAL_NAME_BYTES {
+        return Err(EngineError::InvalidRequest);
+    }
+    if matches!(name, "__proto__" | "constructor" | "prototype") {
+        return Err(EngineError::InvalidRequest);
+    }
+    let bytes = name.as_bytes();
+    if !(bytes[0].is_ascii_alphabetic() || bytes[0] == b'_') {
+        return Err(EngineError::InvalidRequest);
+    }
+    if !bytes
+        .iter()
+        .all(|&b| b.is_ascii_alphanumeric() || b == b'_' || (allow_hyphen && b == b'-'))
+    {
+        return Err(EngineError::InvalidRequest);
+    }
+    Ok(())
+}
+
+fn validate_object_descriptor(
+    desc: &JsRepositoryObjectDescriptor,
+    depth: usize,
+) -> Result<(), EngineError> {
+    if depth >= MAX_JS_REPOSITORY_DEPTH {
+        return Err(EngineError::InvalidRequest);
+    }
+    validate_js_repository_name(&desc.name, false)?;
+    if desc.methods.len() > MAX_JS_REPOSITORY_METHODS_PER_OBJECT
+        || desc.properties.len() > MAX_JS_REPOSITORY_PROPERTIES_PER_OBJECT
+        || desc.sub_objects.len() > MAX_JS_REPOSITORY_OBJECTS
+    {
+        return Err(EngineError::InvalidRequest);
+    }
+    for method in &desc.methods {
+        validate_js_repository_name(method, false)?;
+    }
+    for prop in &desc.properties {
+        validate_js_repository_name(&prop.name, false)?;
+        validate_bounded_json(&prop.value_json, MAX_JS_PAYLOAD_BYTES, MAX_JS_JSON_DEPTH)
+            .map_err(|_| EngineError::InvalidRequest)?;
+    }
+    for sub in &desc.sub_objects {
+        validate_object_descriptor(sub, depth + 1)?;
+    }
+    Ok(())
+}
+
+impl JsRepositorySettings {
+    pub fn validate(&self) -> Result<(), EngineError> {
+        if let Some(ref name) = self.global_object_name {
+            validate_js_repository_name(name, true)?;
+        }
+        if self.objects.len() > MAX_JS_REPOSITORY_OBJECTS {
+            return Err(EngineError::InvalidRequest);
+        }
+        for obj in &self.objects {
+            validate_object_descriptor(obj, 0)?;
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn uses_camel_case_methods(&self) -> bool {
+        match self.method_style {
+            JsRepositoryMethodStyle::CamelCase => true,
+            JsRepositoryMethodStyle::PascalCase => false,
+            JsRepositoryMethodStyle::AutoByGlobalName => self
+                .global_object_name
+                .as_deref()
+                .is_some_and(|name| name.bytes().next().is_some_and(|b| b.is_ascii_lowercase())),
+        }
+    }
+}
 
 pub(crate) struct NativePolicy {
     pub(crate) rules: Arc<CompiledPolicy>,
@@ -30,6 +175,7 @@ pub(crate) struct NativePolicy {
     allow_chrome_internal_urls: AtomicBool,
     js_bridge_allow_subframes: AtomicBool,
     next_browser_legacy_binding: AtomicBool,
+    js_repository_settings: RwLock<Option<JsRepositorySettings>>,
 }
 
 impl NativePolicy {
@@ -46,7 +192,30 @@ impl NativePolicy {
             allow_chrome_internal_urls: AtomicBool::new(false),
             js_bridge_allow_subframes: AtomicBool::new(false),
             next_browser_legacy_binding: AtomicBool::new(false),
+            js_repository_settings: RwLock::new(None),
         })
+    }
+
+    pub(crate) fn set_js_repository_settings(
+        &self,
+        settings: Option<JsRepositorySettings>,
+    ) -> Result<(), EngineError> {
+        if let Some(ref cfg) = settings {
+            cfg.validate()?;
+        }
+        let mut guard = self
+            .js_repository_settings
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard = settings;
+        Ok(())
+    }
+
+    pub(crate) fn js_repository_settings(&self) -> Option<JsRepositorySettings> {
+        self.js_repository_settings
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     pub(crate) fn set_allow_chrome_internal_urls(&self, enabled: bool) {

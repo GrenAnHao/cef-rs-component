@@ -8,8 +8,6 @@ mod before_unload;
 mod build_stamp;
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 mod capture;
-#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-mod jsb_bridge_js;
 pub mod client;
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 mod client_handlers;
@@ -24,9 +22,15 @@ pub mod executor;
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 mod find;
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+pub mod frame_text;
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+mod jsb_bridge_js;
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 pub use find::FindDiagnostics;
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 pub mod headless_cdp;
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+mod host_find_source;
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 mod host_requests;
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
@@ -35,6 +39,7 @@ pub use headless_cdp::CdpDiagnostics;
 pub mod pdf_export;
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 pub use pdf_export::{PdfExportStatus, PdfExportTicket};
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 mod input;
 #[cfg(feature = "test-support")]
 pub mod input_fixture;
@@ -93,6 +98,7 @@ mod policy_native;
 pub(crate) mod popup_window;
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 mod print_operations;
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 mod print_provider;
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 pub mod profile_cookies;
@@ -128,6 +134,18 @@ pub mod url_request;
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 pub mod win32_menu;
 
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+pub use attachment::RuntimeBrowserBridge;
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+pub use frame_text::{
+    DEFAULT_FRAME_TEXT_MAX_BYTES, FrameTextError, FrameTextKind, MAX_FRAME_TEXT_BYTES,
+};
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+pub use policy_native::{
+    JsRepositoryMethodStyle, JsRepositoryObjectDescriptor, JsRepositoryPropertyDescriptor,
+    JsRepositorySettings,
+};
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 pub use profiles::ProfileSchemeTicket;
 pub use rust_cef_core::{
     accessibility as accessibility_contracts, contracts, custom_schemes, js_bridge,

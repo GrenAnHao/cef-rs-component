@@ -180,7 +180,9 @@ pub(super) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Option<C
             if !(url.starts_with("http://") || url.starts_with("https://"))
                 || url.chars().any(|c| c.is_control())
             {
-                return Err("--url must start with http:// or https:// without control characters".into());
+                return Err(
+                    "--url must start with http:// or https:// without control characters".into(),
+                );
             }
             Some(url)
         }

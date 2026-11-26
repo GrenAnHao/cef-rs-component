@@ -5,13 +5,13 @@
 use std::{cell::RefCell, ops::Range, rc::Rc, time::Duration};
 
 use gpui::{
-    Animation, AnimationExt as _, AnyElement, App, Background, Bounds, ClipboardItem, ContentMask,
-    Context, Corners, CursorStyle, Element, ElementId, ElementInputHandler, Entity,
+    Animation, AnimationExt as _, AnyElement, App, Background, Bounds, BoxShadow, ClipboardItem,
+    ContentMask, Context, Corners, CursorStyle, Element, ElementId, ElementInputHandler, Entity,
     EntityInputHandler, FocusHandle, GlobalElementId, Hsla, InspectorElementId,
     InteractiveElement as _, IntoElement, KeyDownEvent, LayoutId, MouseButton, MouseDownEvent,
     PaintQuad, ParentElement as _, Pixels, Point, ShapedLine, SharedString, Style, Styled as _,
     TextAlign, TextRun, UnderlineStyle, Window, div, ease_out_quint, fill, hsla, point,
-    prelude::FluentBuilder as _, px, relative, rgb, rgba, size, BoxShadow,
+    prelude::FluentBuilder as _, px, relative, rgb, rgba, size,
 };
 
 use super::model::{TextBuffer, now_monotonic_ms};
@@ -51,6 +51,59 @@ pub(crate) fn child_hwnd_owns_win32_focus(window: &Window) -> bool {
     focused != 0 && focused != raw && unsafe { IsChild(raw, focused) } != 0
 }
 
+pub(crate) fn mask_display_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.chars().count() * '•'.len_utf8());
+    for ch in text.chars() {
+        out.push(if ch == '\n' { '\n' } else { '•' });
+    }
+    out
+}
+
+pub(crate) fn plain_to_masked_offset(text: &str, plain_byte: usize) -> usize {
+    let clamped = plain_byte.min(text.len());
+    let mut masked = 0usize;
+    for (idx, ch) in text.char_indices() {
+        if idx >= clamped {
+            break;
+        }
+        masked += if ch == '\n' { 1 } else { '•'.len_utf8() };
+    }
+    masked
+}
+
+pub(crate) fn masked_to_plain_offset(text: &str, masked_byte: usize) -> usize {
+    let mut masked = 0usize;
+    for (idx, ch) in text.char_indices() {
+        if masked >= masked_byte {
+            return idx;
+        }
+        masked += if ch == '\n' { 1 } else { '•'.len_utf8() };
+    }
+    text.len()
+}
+
+fn build_masked_offset_map(text: &str) -> Vec<(usize, usize)> {
+    let mut map = Vec::with_capacity(text.chars().count() + 1);
+    let mut masked = 0usize;
+    for (idx, ch) in text.char_indices() {
+        map.push((idx, masked));
+        masked += if ch == '\n' { 1 } else { '•'.len_utf8() };
+    }
+    map.push((text.len(), masked));
+    map
+}
+
+fn map_plain_to_masked(map: &[(usize, usize)], plain_byte: usize) -> usize {
+    if map.is_empty() {
+        return 0;
+    }
+    let pos = map.partition_point(|&(p, _)| p < plain_byte);
+    map.get(pos)
+        .copied()
+        .unwrap_or_else(|| *map.last().unwrap())
+        .1
+}
+
 pub(crate) struct ShapedRow {
     pub start_byte: usize,
     pub end_byte: usize,
@@ -65,6 +118,10 @@ pub(crate) struct TextFieldLayoutCache {
     pub scroll_x: f32,
     pub scroll_y: f32,
     pub handler_painted: bool,
+    pub masked: bool,
+    /// `(plain_byte, masked_byte)` boundary pairs populated only when `masked == true`.
+    /// Stores byte indices only, never secret characters.
+    pub masked_offset_map: Vec<(usize, usize)>,
 }
 
 impl TextFieldLayoutCache {
@@ -102,7 +159,12 @@ impl TextFieldLayoutCache {
         let row = &self.rows[row_idx];
         let local_x = (f32::from(point.x) - f32::from(bounds.origin.x) + self.scroll_x).max(0.0);
         let rel = row.line.closest_index_for_x(px(local_x));
-        (row.start_byte + rel).min(row.end_byte).min(text.len())
+        let display_offset = (row.start_byte + rel).min(row.end_byte);
+        if self.masked {
+            masked_to_plain_offset(text, display_offset)
+        } else {
+            display_offset.min(text.len())
+        }
     }
 
     pub(crate) fn vertical_move_offset(
@@ -114,7 +176,11 @@ impl TextFieldLayoutCache {
         if self.rows.is_empty() {
             return current_offset.min(text.len());
         }
-        let clamped = current_offset.min(text.len());
+        let clamped = if self.masked {
+            plain_to_masked_offset(text, current_offset)
+        } else {
+            current_offset.min(text.len())
+        };
         let cur_row_idx = self
             .rows
             .iter()
@@ -126,16 +192,21 @@ impl TextFieldLayoutCache {
         if delta_rows > 0 && cur_row_idx + 1 >= self.rows.len() {
             return text.len();
         }
-        let target_idx = cur_row_idx.saturating_add_signed(delta_rows).min(self.rows.len() - 1);
+        let target_idx = cur_row_idx
+            .saturating_add_signed(delta_rows)
+            .min(self.rows.len() - 1);
         let cur_row = &self.rows[cur_row_idx];
         let x = cur_row
             .line
             .x_for_index(clamped.saturating_sub(cur_row.start_byte));
         let target_row = &self.rows[target_idx];
         let rel = target_row.line.closest_index_for_x(x);
-        (target_row.start_byte + rel)
-            .min(target_row.end_byte)
-            .min(text.len())
+        let target_display = (target_row.start_byte + rel).min(target_row.end_byte);
+        if self.masked {
+            masked_to_plain_offset(text, target_display)
+        } else {
+            target_display.min(text.len())
+        }
     }
 
     pub(crate) fn bounds_for_utf8_range(&self, range: Range<usize>) -> Option<Bounds<Pixels>> {
@@ -143,12 +214,23 @@ impl TextFieldLayoutCache {
         let lh = f32::from(self.line_height).max(12.0);
         if self.rows.is_empty() {
             return Some(Bounds::new(
-                point(bounds.left() - px(self.scroll_x), bounds.top() - px(self.scroll_y)),
+                point(
+                    bounds.left() - px(self.scroll_x),
+                    bounds.top() - px(self.scroll_y),
+                ),
                 size(px(2.0), px(lh)),
             ));
         }
-        let start = range.start.min(range.end);
-        let end = range.start.max(range.end);
+        let raw_start = range.start.min(range.end);
+        let raw_end = range.start.max(range.end);
+        let (start, end) = if self.masked {
+            (
+                map_plain_to_masked(&self.masked_offset_map, raw_start),
+                map_plain_to_masked(&self.masked_offset_map, raw_end),
+            )
+        } else {
+            (raw_start, raw_end)
+        };
         let row_idx = self
             .rows
             .iter()
@@ -161,7 +243,10 @@ impl TextFieldLayoutCache {
         let y0 = f32::from(bounds.top()) + (row_idx as f32) * lh - self.scroll_y;
         let left = f32::from(bounds.left()) + x0 - self.scroll_x;
         let width = (x1 - x0).max(2.0);
-        Some(Bounds::new(point(px(left), px(y0)), size(px(width), px(lh))))
+        Some(Bounds::new(
+            point(px(left), px(y0)),
+            size(px(width), px(lh)),
+        ))
     }
 }
 
@@ -321,6 +406,7 @@ pub(crate) struct TextFieldCanvas<V: EntityInputHandler> {
     cursor_offset: usize,
     marked_range: Option<Range<usize>>,
     multiline: bool,
+    masked: bool,
     focused: bool,
     pub(crate) caret_opacity: f32,
     theme: TextFieldTheme,
@@ -334,6 +420,7 @@ pub(crate) struct TextFieldPrepaint {
     caret_quad: Option<PaintQuad>,
     scroll_x: f32,
     scroll_y: f32,
+    masked_offset_map: Vec<(usize, usize)>,
 }
 
 impl<V: EntityInputHandler> IntoElement for TextFieldCanvas<V> {
@@ -387,15 +474,42 @@ impl<V: EntityInputHandler> Element for TextFieldCanvas<V> {
         let line_height = window.line_height();
         let lh = f32::from(line_height).max(12.0);
 
-        let row_spans = split_text_rows(&self.text, self.multiline);
+        let (display_owned, display_cursor, display_sel, display_marked, masked_offset_map) =
+            if self.masked {
+                let masked = mask_display_text(&self.text);
+                let map = build_masked_offset_map(&self.text);
+                let cursor = map_plain_to_masked(&map, self.cursor_offset);
+                let sel_s = map_plain_to_masked(&map, self.selected_range.start);
+                let sel_e = map_plain_to_masked(&map, self.selected_range.end);
+                let marked = self
+                    .marked_range
+                    .as_ref()
+                    .map(|r| map_plain_to_masked(&map, r.start)..map_plain_to_masked(&map, r.end));
+                (masked, cursor, sel_s..sel_e, marked, map)
+            } else {
+                (
+                    String::new(),
+                    self.cursor_offset,
+                    self.selected_range.clone(),
+                    self.marked_range.clone(),
+                    Vec::new(),
+                )
+            };
+        let display_text = if self.masked {
+            display_owned.as_str()
+        } else {
+            self.text.as_str()
+        };
+
+        let row_spans = split_text_rows(display_text, self.multiline);
         let mut rows = Vec::with_capacity(row_spans.len());
         let mut max_line_w = 0.0_f32;
         for (start_byte, end_byte) in row_spans {
-            let slice = &self.text[start_byte..end_byte];
+            let slice = &display_text[start_byte..end_byte];
             let shaped = shape_row_line(
                 slice,
                 start_byte,
-                self.marked_range.as_ref(),
+                display_marked.as_ref(),
                 font_size,
                 &style,
                 self.theme.text_color,
@@ -409,7 +523,7 @@ impl<V: EntityInputHandler> Element for TextFieldCanvas<V> {
             });
         }
 
-        let placeholder_line = if self.text.is_empty() && !self.placeholder.is_empty() {
+        let placeholder_line = if display_text.is_empty() && !self.placeholder.is_empty() {
             let run = TextRun {
                 len: self.placeholder.len(),
                 font: style.font(),
@@ -427,7 +541,7 @@ impl<V: EntityInputHandler> Element for TextFieldCanvas<V> {
             None
         };
 
-        let clamped_caret = self.cursor_offset.min(self.text.len());
+        let clamped_caret = display_cursor.min(display_text.len());
         let caret_row_idx = rows
             .iter()
             .position(|r| clamped_caret >= r.start_byte && clamped_caret <= r.end_byte)
@@ -479,13 +593,20 @@ impl<V: EntityInputHandler> Element for TextFieldCanvas<V> {
         }
 
         let mut selection_quads = Vec::new();
-        let sel_start = self.selected_range.start.min(self.selected_range.end).min(self.text.len());
-        let sel_end = self.selected_range.start.max(self.selected_range.end).min(self.text.len());
+        let sel_start = display_sel
+            .start
+            .min(display_sel.end)
+            .min(display_text.len());
+        let sel_end = display_sel
+            .start
+            .max(display_sel.end)
+            .min(display_text.len());
         if self.focused && sel_end > sel_start {
             for (row_idx, row) in rows.iter().enumerate() {
                 let ov_s = sel_start.max(row.start_byte);
                 let ov_e = sel_end.min(row.end_byte);
-                let extends_newline = self.multiline && sel_end > row.end_byte && sel_start <= row.end_byte;
+                let extends_newline =
+                    self.multiline && sel_end > row.end_byte && sel_start <= row.end_byte;
                 if ov_e > ov_s || extends_newline {
                     let x0 = f32::from(bounds.left())
                         + f32::from(row.line.x_for_index(ov_s - row.start_byte))
@@ -499,7 +620,10 @@ impl<V: EntityInputHandler> Element for TextFieldCanvas<V> {
                     let y0 = f32::from(bounds.top()) + (row_idx as f32) * lh - scroll_y;
                     let w = (x1 - x0).max(2.0);
                     selection_quads.push(rounded_quad(
-                        Bounds::new(point(px(x0), px(y0 + 1.0)), size(px(w), px((lh - 2.0).max(8.0)))),
+                        Bounds::new(
+                            point(px(x0), px(y0 + 1.0)),
+                            size(px(w), px((lh - 2.0).max(8.0))),
+                        ),
                         rgba(self.theme.selection_bg),
                         px(2.0),
                     ));
@@ -530,6 +654,7 @@ impl<V: EntityInputHandler> Element for TextFieldCanvas<V> {
             caret_quad,
             scroll_x,
             scroll_y,
+            masked_offset_map,
         }
     }
 
@@ -600,6 +725,8 @@ impl<V: EntityInputHandler> Element for TextFieldCanvas<V> {
         cache.scroll_x = scroll_x;
         cache.scroll_y = scroll_y;
         cache.handler_painted = self.focused;
+        cache.masked = self.masked;
+        cache.masked_offset_map = std::mem::take(&mut prepaint.masked_offset_map);
     }
 }
 
@@ -621,8 +748,9 @@ pub(crate) struct TextFieldRenderSpec<'a, V: EntityInputHandler> {
     pub theme: TextFieldTheme,
 }
 
-pub(crate) fn render_text_field_box<V: EntityInputHandler>(
+fn render_text_field_box_inner<V: EntityInputHandler>(
     spec: TextFieldRenderSpec<'_, V>,
+    masked: bool,
     on_mouse_down: impl Fn(&mut V, &MouseDownEvent, &mut Window, &mut Context<V>) + 'static,
     cx: &mut Context<V>,
 ) -> AnyElement {
@@ -637,6 +765,7 @@ pub(crate) fn render_text_field_box<V: EntityInputHandler>(
         cursor_offset: spec.buffer.cursor_offset(),
         marked_range: spec.buffer.marked_range.clone(),
         multiline: spec.multiline,
+        masked,
         focused: spec.focused,
         caret_opacity: caret_blink_opacity(spec.buffer.last_interaction_ms),
         theme: spec.theme,
@@ -722,6 +851,22 @@ pub(crate) fn render_text_field_box<V: EntityInputHandler>(
     }
 }
 
+pub(crate) fn render_text_field_box<V: EntityInputHandler>(
+    spec: TextFieldRenderSpec<'_, V>,
+    on_mouse_down: impl Fn(&mut V, &MouseDownEvent, &mut Window, &mut Context<V>) + 'static,
+    cx: &mut Context<V>,
+) -> AnyElement {
+    render_text_field_box_inner(spec, false, on_mouse_down, cx)
+}
+
+pub(crate) fn render_masked_text_field_box<V: EntityInputHandler>(
+    spec: TextFieldRenderSpec<'_, V>,
+    on_mouse_down: impl Fn(&mut V, &MouseDownEvent, &mut Window, &mut Context<V>) + 'static,
+    cx: &mut Context<V>,
+) -> AnyElement {
+    render_text_field_box_inner(spec, true, on_mouse_down, cx)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum KeyEditOutcome {
     NotHandled,
@@ -729,11 +874,53 @@ pub(crate) enum KeyEditOutcome {
     HandledNoChange,
 }
 
+pub(crate) fn apply_clipboard_shortcut(
+    buf: &mut TextBuffer,
+    action: &str,
+    multiline: bool,
+    masked: bool,
+) -> (KeyEditOutcome, Option<String>) {
+    match action {
+        "c" => {
+            if masked || buf.selected_range.is_empty() {
+                (KeyEditOutcome::HandledNoChange, None)
+            } else {
+                (
+                    KeyEditOutcome::HandledNoChange,
+                    Some(buf.selected_text().to_owned()),
+                )
+            }
+        }
+        "x" => {
+            if masked || buf.selected_range.is_empty() {
+                (KeyEditOutcome::HandledNoChange, None)
+            } else {
+                let copied = buf.selected_text().to_owned();
+                buf.insert_str_filtered("", multiline);
+                (KeyEditOutcome::HandledChanged, Some(copied))
+            }
+        }
+        _ => (KeyEditOutcome::NotHandled, None),
+    }
+}
+
+#[allow(dead_code)]
 pub(crate) fn apply_editor_key_down(
     buf: &mut TextBuffer,
     cache: &TextFieldLayoutCache,
     event: &KeyDownEvent,
     multiline: bool,
+    cx: &mut App,
+) -> KeyEditOutcome {
+    apply_editor_key_down_masked(buf, cache, event, multiline, false, cx)
+}
+
+pub(crate) fn apply_editor_key_down_masked(
+    buf: &mut TextBuffer,
+    cache: &TextFieldLayoutCache,
+    event: &KeyDownEvent,
+    multiline: bool,
+    masked: bool,
     cx: &mut App,
 ) -> KeyEditOutcome {
     let mods = &event.keystroke.modifiers;
@@ -746,22 +933,18 @@ pub(crate) fn apply_editor_key_down(
                 return KeyEditOutcome::HandledNoChange;
             }
             "c" => {
-                if !buf.selected_range.is_empty() {
-                    cx.write_to_clipboard(ClipboardItem::new_string(
-                        buf.selected_text().to_owned(),
-                    ));
+                let (outcome, copied) = apply_clipboard_shortcut(buf, "c", multiline, masked);
+                if let Some(text) = copied {
+                    cx.write_to_clipboard(ClipboardItem::new_string(text));
                 }
-                return KeyEditOutcome::HandledNoChange;
+                return outcome;
             }
             "x" => {
-                if !buf.selected_range.is_empty() {
-                    cx.write_to_clipboard(ClipboardItem::new_string(
-                        buf.selected_text().to_owned(),
-                    ));
-                    buf.insert_str_filtered("", multiline);
-                    return KeyEditOutcome::HandledChanged;
+                let (outcome, copied) = apply_clipboard_shortcut(buf, "x", multiline, masked);
+                if let Some(text) = copied {
+                    cx.write_to_clipboard(ClipboardItem::new_string(text));
                 }
-                return KeyEditOutcome::HandledNoChange;
+                return outcome;
             }
             "v" => {
                 if let Some(paste) = cx.read_from_clipboard().and_then(|item| item.text()) {
@@ -919,5 +1102,61 @@ pub(crate) fn apply_editor_key_down(
             }
             KeyEditOutcome::NotHandled
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn masked_display_uses_u2022_bullets_without_exposing_plaintext() {
+        assert_eq!(mask_display_text(""), "");
+        assert_eq!(mask_display_text("abc"), "\u{2022}\u{2022}\u{2022}");
+        let secret = "p@ss🔑wörd";
+        let masked = mask_display_text(secret);
+        assert_eq!(masked.chars().count(), secret.chars().count());
+        assert!(masked.chars().all(|c| c == '\u{2022}'));
+        assert!(!masked.contains("p") && !masked.contains("word") && !masked.contains("ö"));
+    }
+
+    #[test]
+    fn masked_offset_mapping_roundtrips_multibyte_and_builds_lookup_map() {
+        let secret = "aéb🔑z";
+        // byte offsets: 'a'=0..1, 'é'=1..3, 'b'=3..4, '🔑'=4..8, 'z'=8..9
+        let map = build_masked_offset_map(secret);
+        let expected_boundaries = [0usize, 1, 3, 4, 8, 9];
+        for (char_idx, &plain_off) in expected_boundaries.iter().enumerate() {
+            let masked_off = char_idx * '\u{2022}'.len_utf8();
+            assert_eq!(plain_to_masked_offset(secret, plain_off), masked_off);
+            assert_eq!(map_plain_to_masked(&map, plain_off), masked_off);
+            assert_eq!(masked_to_plain_offset(secret, masked_off), plain_off);
+        }
+    }
+
+    #[test]
+    fn masked_clipboard_copy_and_cut_are_suppressed() {
+        let mut buf = TextBuffer::new("secret123");
+        buf.focus_select_all();
+        assert_eq!(
+            apply_clipboard_shortcut(&mut buf, "c", false, true),
+            (KeyEditOutcome::HandledNoChange, None)
+        );
+        assert_eq!(
+            apply_clipboard_shortcut(&mut buf, "x", false, true),
+            (KeyEditOutcome::HandledNoChange, None)
+        );
+        assert_eq!(buf.text, "secret123");
+
+        // Unmasked copy/cut still return plaintext and mutate on cut.
+        assert_eq!(
+            apply_clipboard_shortcut(&mut buf, "c", false, false),
+            (KeyEditOutcome::HandledNoChange, Some("secret123".into()))
+        );
+        assert_eq!(
+            apply_clipboard_shortcut(&mut buf, "x", false, false),
+            (KeyEditOutcome::HandledChanged, Some("secret123".into()))
+        );
+        assert_eq!(buf.text, "");
     }
 }

@@ -438,7 +438,10 @@ mod tests {
         assert_eq!(mgr.complete(finish).map(|(d, _)| d), Ok(finish));
         assert_eq!(mgr.pending_count(), 0);
         assert!(mgr.is_clear());
-        assert_eq!(mgr.complete(finish).map(|(d, _)| d), Err(EngineError::InvalidRequest));
+        assert_eq!(
+            mgr.complete(finish).map(|(d, _)| d),
+            Err(EngineError::InvalidRequest)
+        );
 
         // Close cancels remaining active drag and drops barrier count to zero.
         let s2 = mgr

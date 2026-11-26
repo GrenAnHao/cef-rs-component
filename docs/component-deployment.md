@@ -1,12 +1,12 @@
-# 组件发行与 helper 接入契约
+# `cef-rs-gpui` 组件发行与 helper 接入契约
 
-范围：Windows x64 MSVC，CEF 146.0.9 / cef-rs `02cd5a01abb9db835549b3632cbf93ee73323e56`，可信内容。本文描述已实现的发行预检与独立 helper；不是 Browser、双模式或完整组件验收声明。
+范围：Windows x64 MSVC，CEF `156.0.31` / `cef-rs` `7b6bf84e76e919790bd61df077e29dc4132eb5e2`，可信内容（v0.1.0 由早期 CEF 146.0.9 基线升级而来）。本文描述已实现的发行预检、打包工具与独立 helper 接入契约；SDK 集成与多场景验证详见[SDK 接入指南](sdk-guide.md) 与 [验证记录](validation.md)。
 
-公开视图的固定 Entity 工厂、一次性 `BrowserAttachment`、宿主指定 NonZeroUsize 容量的显式 `UiComposition` 和独立宿主示例见[组件视图接入](component-view.md)。组件不等待 receiver 或创建 pump/重试任务；宿主唯一 wake owner 显式 dispatch/后继 UI 回合 retry_pending。10.1历史嵌入、10.2六阶段分发及10.3双窗九阶段POPUP实机矩阵分别留存，不把本文的发行预检升级为完整SDK/G4验收。10.3使用显式 -InteractiveInputApproved 与普通所属HWND前台请求；不使用GPUI0.3.12会隐式发送ALT的激活API。三个实际bundle的237项资源逐项哈希、当前/staged host/helper均核对，helper仍为独立绝对路径，没有换依赖或回退到宿主。
+公开视图的固定 Entity 工厂、一次性 `BrowserAttachment`、宿主指定 `NonZeroUsize` 容量的显式 `UiComposition` 和独立宿主示例见 [组件视图接入](component-view.md)。组件不等待 receiver 或创建 pump/重试任务；宿主唯一 wake owner 显式 dispatch/后继 UI 回合 `retry_pending`。下文保留 10.1–10.3 及早期 `deployment_distribution`（当时 CEF `146.0.9` 基线）的实证记录以供追溯。
 
 ## 发行布局
 
-一个发行根包含宿主 exe、独立 helper exe、配套 CEF DLL/pak/dat/bin/json、许可文件及 `component-runtime.json`；`locales` 为子目录。宿主和 helper 名称可不同于仓库示例，但必须由调用者提供实际文件路径，不能凭重命名把任意同架构 exe 当 helper。
+一个发行根包含宿主 exe、独立 helper exe、配套 CEF DLL/pak/dat/bin/json、许可文件及 `component-runtime.json`；`locales` 为子目录。CEF `156.0.31` 打包清单位计 **234** 项运行时文件（14 项根文件 + 220 项 `locales/*.pak`，已不再单独分发旧版 `libEGL.dll` / `libGLESv2.dll` / `dxil.dll`）。宿主和 helper 名称可不同于仓库示例，但必须由调用者提供实际文件路径，不能凭重命名把任意同架构 exe 当 helper。
 
 打包入口显式接收五个必填值：
 
@@ -14,14 +14,14 @@
 & scripts/package-component.ps1 `
     -HostExecutable 'D:\build\my host.exe' `
     -HelperExecutable 'D:\build\rust-cef-helper.exe' `
-    -CefPath 'D:\sdk\146.0.9_windows_x86_64' `
+    -CefPath 'D:\sdk\156.0.31_windows_x86_64' `
     -OutputDirectory 'D:\release\my application' `
-    -HostBuildVersion 'host-build-2026-11-11'
+    -HostBuildVersion 'host-build-2026-11-26'
 ```
 
-输入是实际构建产物，不是按 exe 名搜索 PATH。源 SDK 必须是 cef-rs 导出的平铺目录。源/输出物理目录树不得重叠，包括输出为源 `locales`、其目录别名或祖先；工具在写入前拒绝，不删除未知输出文件。部署后修改任一材料会使原清单哈希失效，须重新打包。
+输入是实际构建产物，不是按 exe 名搜索 PATH。源 SDK 必须是 `cef-rs`（`export-cef-dir`）导出的平铺目录。源/输出物理目录树不得重叠，包括输出为源 `locales`、其目录别名或祖先；工具在写入前拒绝，不删除未知输出文件。部署后修改任一材料会使原清单哈希失效，须重新打包。构建与打包默认将中间产物和 bundle 输出至短路径 `E:\cargo-target\gpui-cef-poc\`（可通过 `-TargetDir`、`-StagingRoot` 或 `CARGO_TARGET_DIR` / `POC_TARGET_DIR` / `POC_OUTPUT_ROOT` 覆盖）。
 
-schema 1 的字段和取舍见[部署决定](../.agents/notes/implemented/architecture/2026-11-11-component-runtime-deployment.md)。清单与 helper 印记是配套诊断，不是签名认证；不提供任意篡改防护。
+schema 1 的字段和取舍见 [部署决定](../.agents/notes/implemented/architecture/2026-11-11-component-runtime-deployment.md)。清单与 helper 印记是配套诊断，不是签名认证；不提供任意篡改防护。
 
 ## 宿主预检
 
@@ -117,18 +117,21 @@ DPI变化即使取整尺寸相同也使旧令牌失效，但不伪造贯穿原�
 
 ### 回调期捕获与 D3D11（9.2）
 
-SoftwareRequired 与 D3d11Required 均通过实际 FrameInput/FrameCapture builder 先预留所属 Browser CPU 输出，再提交同一个 FrameSource/mailbox；不接纳未知格式、非法几何或未完整覆盖的内容，捕获失败保留好帧。D3D11 hardware device/context 在 CEF UI 创建、使用与正常退场，每次回调重新 OpenSharedResource1、CopyResource、Map、按 pitch/crop 转换并 Unmap，不缓存导入纹理、不关闭 CEF 借用 HANDLE、不把它排到宿主；Required 失败不自动转软件，Auto 仍不支持。
+SoftwareRequired 与 D3d11Required 均通过受 `FrameSource` 管控的通道交付像素或共享纹理句柄；D3D11 hardware device/context 在 CEF UI 创建、使用与正常退场，`OnAcceleratedPaint` 默认走 4 槽共享纹理零拷贝 SRV 交付 `gpui-pre-windows` `DirectXRenderer` 直绘，仅在调用 `capture_screenshot_*` 或受限测试回读时在 CEF UI 线程执行单次 `OpenSharedResource1`、`CopyResource`、`Map`、`Unmap` 读回（不缓存导入纹理、不关闭 CEF 借用 HANDLE、不把句柄排到宿主线程）。Required 失败不自动转软件，Auto 仍不支持。
 
 `Runtime::frame_capture_diagnostics(browser_id)` 查询纯owned requested/observed backend、owner/retirement线程、open/copy/map/unmap、逻辑GPU staging容量/峰值、live import/资源门和最后失败分类/原始code。只有真实成功捕获才设置observed；GPU逻辑峰值不是VRAM/RSS或CPU额度。`EngineError::Capture {kind,code}`区分metadata/format/设备/open/staging/copy/map等失败，预算不足仍返回Backpressure。正常关闭在UI释放捕获资源后才完成屏障，unfinished Drop只abandon；闭包不带native资源，reentrant Busy通过tracked UI任务延迟退场。
 
 `Runtime::frame_recovery_diagnostics(browser_id)` 返回纯owned恢复状态、目标代际/像素尺寸、许可与实际Invalidate入口计数、CEF UI线程、有界offset和ack/耗尽/post失败。恢复复用core状态机，单queued CEF UI延时任务，最短100ms/每目标最多8请求，第八次留响应窗口；Threaded无需main pump。隐藏/关闭取消，旧ticket/旧帧/POPUP/未提交帧不可确认VIEW恢复。`CaptureFailureKind::ResizeExhausted` 是可观察停滞，不授权fallback、重建或无限刷新。
 
-限定四组Native Smoke已有真实CEF软件和D3D回读/退场证据，各7sidecar checks通过；该Smoke本身未证明9.3完整alpha/指纹/截图/resize；这些Native帧层能力已由专用Frames四组合另验，详见[恢复决定](../.agents/notes/implemented/architecture/2026-11-13-runtime-resize-validation.md)。Frames使用实际OSR帧图而非桌面/GPUI呈现截图；原生POPUP合成、GPUI呈现/IME和G3/G4仍未证明。详见[捕获决定](../.agents/notes/implemented/architecture/2026-11-13-frame-capture-ui-owned.md)与[验证记录](validation.md)。
+限定四组Native Smoke已有真实CEF软件和D3D回读/退场证据，各7sidecar checks通过；该Smoke本身未证明9.3完整alpha/指纹/截图/resize；这些Native帧层能力已由专用Frames四组合另验，详见[恢复决定](../.agents/notes/implemented/architecture/2026-11-13-runtime-resize-validation.md)。Frames使用实际OSR帧图而非桌面/GPUI呈现截图。详见[捕获决定](../.agents/notes/implemented/architecture/2026-11-13-frame-capture-ui-owned.md)与[验证记录](validation.md)。
 
 正常退出须 `request_shutdown(mode, deadline)`，继续非阻塞 `poll_shutdown(&ticket)`，只有Ready后在初始化主线程执行 `finish_shutdown()`。Draining/Blocked新增pending_profiles诊断，与pending_tasks分别计数；期限不授权销毁或shutdown。context/handler在shutdown前释放，最后一个Browser关闭后profile仍留Runtime以便复用，不删除宿主持久目录。实际双模式内存共享/隔离与G1回归见[验证记录](validation.md)。
 
-## 交付支持矩阵与版本清单（2026-11-21 / `r461`）
+## 交付支持矩阵与版本清单（2026-11-26 / `v0.2.0`）
 
-- **固定版本清单**：Windows x64 MSVC、Rust/Cargo 1.99.1、`gpui-pre =0.3.12`、`gpui-pre-platform =0.3.12`、`gpui-component =0.9.1`、`cef-rs` `02cd5a01abb9db835549b3632cbf93ee73323e56`、CEF `146.0.9+g3ca6a87+chromium-146.0.7680.165`；CefSharp 模板 `D:\System Dir\Downloads\CefSharp`（本地 `41919703` 作形态模板，对照固定 `v146.0.100 / 16d34481`；编辑命令按 `.cef/.../cef_types.h:2015-2017` `115/116/117`）。
-- **离仓冷启动验证**：`test-component-distribution.ps1 -Release -ProfileRestart`（16/16，涵盖双模式 × 双后端默认 `Memory` 消失 / 命名 `Persistent` 保留、非默认可执行文件名、缺失 helper 诊断与无开发 `PATH`）及 `test-component-demo.ps1 -Release -ReleasePathGuards`（5/5）均在离仓环境通过；受管 DevTools 默认关闭，显式启用后经 `AuxiliaryResourcePolicy` + `rust-cef-helper/app.manifest` 渲染正常并退场干净（`AuxDevTools` / `MenuDevTools` 8/8）。
-- **已批准边界豁免**：物理 110% DPI（Windows GUI 25% 步进与 `CefSharp.Wpf/ChromiumWebBrowser.cs:2735-2739` 一致）、Print `131` 与真实打印作业提交、UIPI 下 OS 中文候选窗视觉采纳（IMM32 与活跃 CJK 组合期临时 1×1 caret 实窗回读已验证），以及离线 CEF 146.0.9 拼写建议 `200..=206`（已修复 `WritableCefString` 使 `SetPreference` 返回 true，受限于无 OS `en-US` 语言包与离线 `TrustedContentPolicy`）。
+- **固定版本清单（`cef-rs-gpui` SDK & Release）**：Windows x64 MSVC、Rust/Cargo（edition 2024）、`gpui-pre =0.3.12`、`gpui-pre-platform =0.3.12`、`gpui-component =0.9.1`、`cef-rs` `7b6bf84e76e919790bd61df077e29dc4132eb5e2`、CEF `156.0.31`（234 项运行时文件）；CefSharp 行为基线参照 `156.0.15`。
+- **自动化 CI 与 Release 流水线**：
+  - [`.github/workflows/ci.yml`](../.github/workflows/ci.yml)：跨平台执行 `cargo fmt --check`、`cargo test --locked -p rust-cef-core` 与 `cargo check --locked -p rust-cef-ui`，并在 `windows-latest` 上导出缓存 CEF `156.0.31`、运行 `scripts/check.ps1` 及 `--workspace` / `gpui-cef-example` / `gpui-cef-component-demo` 单测；
+  - [`.github/workflows/release.yml`](../.github/workflows/release.yml)：在 tag `v*` 或 `workflow_dispatch` 时以 Release 编译 `gpui-cef-component-demo`、`gpui-cef-example` 与 `rust-cef-helper`，调用 [`scripts/package-component.ps1`](../scripts/package-component.ps1) 生成并逐文件校验 `component-runtime.json`，最终产出 `.zip`、`.sha256` 与 `SHA256SUMS.txt`。
+- **离仓冷启动验证（历史 `r468` / CEF `156.0.31` 基线）**：`test-component-distribution.ps1 -Release -ProfileRestart`（16/16，涵盖双模式 × 双后端默认 `Memory` 消失 / 命名 `Persistent` 保留、非默认可执行文件名、缺失 helper 诊断与无开发 `PATH`）及 `test-component-demo.ps1 -Release -ReleasePathGuards`（5/5）均在离仓环境通过；受管 DevTools 默认关闭，显式启用后经 `AuxiliaryResourcePolicy` + `rust-cef-helper/app.manifest` 渲染正常并退场干净（`AuxDevTools` / `MenuDevTools` 8/8）。
+- **已批准边界豁免**：物理 110% DPI（Windows GUI 25% 步进与 `CefSharp.Wpf/ChromiumWebBrowser.cs:2735-2739` 一致）、Print `131` 与真实打印作业提交、UIPI 下 OS 中文候选窗视觉采纳（IMM32 与活跃 CJK 组合期临时 1×1 caret 实窗回读已验证），以及早期离线 CEF 146.0.9 拼写建议 `200..=206`（已修复 `WritableCefString` 使 `SetPreference` 返回 true，受限于无 OS `en-US` 语言包与离线 `TrustedContentPolicy`）。

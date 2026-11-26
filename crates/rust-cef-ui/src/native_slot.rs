@@ -8,12 +8,14 @@
 //! notifications, and guarantee orderly hide-before-close retirement.
 use std::{error::Error, fmt, num::NonZeroUsize};
 
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+use rust_cef_core::contracts::BrowserSurfaceMode;
 use rust_cef_core::{
-    contracts::{BrowserId, BrowserSurfaceMode, NativeChildHwndConfig, PixelRect},
+    contracts::{BrowserId, NativeChildHwndConfig, PixelRect},
     ports::{BrowserCommand, BrowserHandle, CloseMode, EngineError, WindowBinding},
 };
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-use rust_cef_runtime::attachment::BrowserAttachment;
+use rust_cef_runtime::attachment::{BrowserAttachment, RuntimeBrowserBridge};
 
 use crate::binding::WindowToken;
 
@@ -294,6 +296,13 @@ impl NativeSlotController {
 
     pub fn handle(&self) -> &BrowserHandle {
         &self.handle
+    }
+
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    pub fn runtime_bridge(&self) -> Option<RuntimeBrowserBridge> {
+        self._attachment
+            .as_ref()
+            .and_then(|attachment| attachment.runtime_bridge().cloned())
     }
 
     pub fn parent_hwnd(&self) -> NonZeroUsize {

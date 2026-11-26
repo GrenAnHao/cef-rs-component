@@ -2,20 +2,29 @@
 //! GPUI desktop browser example state and host configuration.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     ffi::OsString,
+    fmt,
     ops::Range,
     path::PathBuf,
-    sync::OnceLock,
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
 use rust_cef_gpui::{
     contracts::{
-        DraggableRegionRect, NavigationSnapshot, RenderPreference, ThreadMode, truncate_utf8_bytes,
-        zoom_level_to_milli,
+        BrowserId, DraggableRegionRect, NavigationSnapshot, RenderPreference, ThreadMode,
+        truncate_utf8_bytes, zoom_level_to_milli,
     },
-    host_capabilities::{DownloadProgress, DownloadState, HostRequestId, JsDialogKind},
+    events::BeforeUnloadRequestId,
+    host_capabilities::{
+        AuthRequest, CertificateErrorRequest, ClientCertificateRequest, DownloadId,
+        DownloadProgress, DownloadRequest, DownloadState, HostRequestId, JsDialogKind,
+        PermissionRequest,
+    },
 };
 
 #[cfg(test)]
@@ -92,7 +101,9 @@ pub struct ExampleConfig {
 
 impl ExampleConfig {
     #[allow(dead_code)]
-    pub fn parse_standalone_args(args: impl IntoIterator<Item = OsString>) -> Result<Option<Self>, String> {
+    pub fn parse_standalone_args(
+        args: impl IntoIterator<Item = OsString>,
+    ) -> Result<Option<Self>, String> {
         let mut values = BTreeMap::new();
         let mut iter = args.into_iter().peekable();
         if iter.peek().is_some_and(|a| a == "--help") {
@@ -106,15 +117,8 @@ impl ExampleConfig {
         while let Some(arg) = iter.next() {
             let name = match arg.to_str() {
                 Some(
-                    n @ ("--bundle"
-                    | "--helper"
-                    | "--cache-root"
-                    | "--mode"
-                    | "--backend"
-                    | "--host-mode"
-                    | "--context-menu"
-                    | "--url"
-                    | "--smoke-ms"
+                    n @ ("--bundle" | "--helper" | "--cache-root" | "--mode" | "--backend"
+                    | "--host-mode" | "--context-menu" | "--url" | "--smoke-ms"
                     | "--verify-tests"),
                 ) => n.to_owned(),
                 _ => return Err(format!("unknown argument {:?}", arg)),
@@ -164,7 +168,11 @@ impl ExampleConfig {
             Some("Software") => RenderPreference::SoftwareRequired,
             Some(_) => return Err("--backend must name Software or D3d11".into()),
         };
-        let host_mode = match values.remove("--host-mode").as_ref().and_then(|v| v.to_str()) {
+        let host_mode = match values
+            .remove("--host-mode")
+            .as_ref()
+            .and_then(|v| v.to_str())
+        {
             None | Some("osr") => ExampleHostMode::Osr,
             Some("native-hwnd") => ExampleHostMode::NativeHwnd,
             Some(_) => return Err("--host-mode must be osr or native-hwnd".into()),
@@ -247,6 +255,9 @@ pub enum ActiveInput {
     ExecuteJs,
     EvaluateJs,
     JsPrompt,
+    FindQuery,
+    AuthUser,
+    AuthPass,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -367,7 +378,8 @@ impl TextBuffer {
 
     pub fn set_from_external(&mut self, next: &str) {
         self.text.clear();
-        self.text.push_str(&truncate_utf8_bytes(next, MAX_TEXT_BUFFER_BYTES));
+        self.text
+            .push_str(&truncate_utf8_bytes(next, MAX_TEXT_BUFFER_BYTES));
         let len = self.text.len();
         self.selected_range = len..len;
         self.selection_reversed = false;
@@ -787,20 +799,123 @@ impl TextBuffer {
             Some(sel) => {
                 let lo = sel.start.min(sel.end).min(inserted_len_utf16);
                 let hi = sel.start.max(sel.end).min(inserted_len_utf16);
-                self.range_from_utf16(
-                    &(insertion_start_utf16 + lo..insertion_start_utf16 + hi),
-                )
+                self.range_from_utf16(&(insertion_start_utf16 + lo..insertion_start_utf16 + hi))
             }
             None => marked_end..marked_end,
         };
         self.selection_reversed = false;
         self.touch();
     }
+
+    pub fn wipe_secret(&mut self) {
+        let mut bytes = std::mem::take(&mut self.text).into_bytes();
+        bytes.fill(0);
+        std::hint::black_box(&bytes);
+        drop(bytes);
+        for (old, _) in self.undo_stack.drain(..) {
+            let mut old_bytes = old.into_bytes();
+            old_bytes.fill(0);
+            std::hint::black_box(&old_bytes);
+        }
+        self.selected_range = 0..0;
+        self.selection_reversed = false;
+        self.marked_range = None;
+        self.scroll_x = 0.0;
+        self.scroll_y = 0.0;
+        self.touch();
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PendingFindFollowUp {
+    StopClearSelection,
+    Search {
+        forward: bool,
+        force_find_next: bool,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub struct TabFindState {
+    pub open: bool,
+    pub open_flag: Arc<AtomicBool>,
+    pub query: TextBuffer,
+    pub match_case: bool,
+    pub active_ordinal: i32,
+    pub matches: i32,
+    pub search_in_progress: bool,
+    pub pending_after_finish: Option<PendingFindFollowUp>,
+    pub latest_operation_seq: u64,
+    pub quarantined: bool,
+    pub last_error: Option<String>,
+    pub last_submitted_query: String,
+    pub last_submitted_match_case: bool,
+}
+
+impl Default for TabFindState {
+    fn default() -> Self {
+        Self {
+            open: false,
+            open_flag: Arc::new(AtomicBool::new(false)),
+            query: TextBuffer::new(""),
+            match_case: false,
+            active_ordinal: 0,
+            matches: 0,
+            search_in_progress: false,
+            pending_after_finish: None,
+            latest_operation_seq: 0,
+            quarantined: false,
+            last_error: None,
+            last_submitted_query: String::new(),
+            last_submitted_match_case: false,
+        }
+    }
+}
+
+impl TabFindState {
+    pub fn set_open(&mut self, open: bool) {
+        self.open = open;
+        self.open_flag.store(open, Ordering::Release);
+        if !open {
+            if self.search_in_progress {
+                self.pending_after_finish = Some(PendingFindFollowUp::StopClearSelection);
+            } else {
+                self.pending_after_finish = None;
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn sync_open_flag(&self) {
+        self.open_flag.store(self.open, Ordering::Release);
+    }
+
+    #[allow(dead_code)]
+    pub fn reset_results(&mut self) {
+        self.active_ordinal = 0;
+        self.matches = 0;
+        self.search_in_progress = false;
+        self.pending_after_finish = None;
+        self.last_error = None;
+    }
+
+    pub fn on_document_navigated(&mut self) {
+        self.last_submitted_query.clear();
+        if !self.search_in_progress {
+            self.active_ordinal = 0;
+            self.matches = 0;
+            if !self.quarantined {
+                self.last_error = None;
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DownloadInfoView {
     pub last_action: String,
+    pub browser_id: Option<BrowserId>,
+    pub download_id: Option<DownloadId>,
     pub id: Option<u64>,
     pub url: String,
     pub original_url: String,
@@ -810,11 +925,15 @@ pub struct DownloadInfoView {
     pub is_in_progress: bool,
     pub is_complete: bool,
     pub is_cancelled: bool,
+    pub cancelled_reason: Option<String>,
     pub current_speed: i64,
     pub percent_complete: Option<i32>,
     pub total_bytes: Option<u64>,
     pub received_bytes: u64,
 }
+
+#[allow(dead_code)]
+pub type DownloadEntry = DownloadInfoView;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct PendingJsDialog {
@@ -823,6 +942,71 @@ pub struct PendingJsDialog {
     pub origin_url: String,
     pub message: String,
     pub prompt_input: TextBuffer,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingPermissionModal {
+    pub tab_id: u64,
+    pub browser_id: BrowserId,
+    pub request: PermissionRequest,
+}
+
+#[derive(Clone)]
+pub struct PendingAuthModal {
+    pub tab_id: u64,
+    pub browser_id: BrowserId,
+    pub request: AuthRequest,
+    pub username_input: TextBuffer,
+    pub password_input: TextBuffer,
+}
+
+impl fmt::Debug for PendingAuthModal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PendingAuthModal")
+            .field("tab_id", &self.tab_id)
+            .field("browser_id", &self.browser_id)
+            .field("request", &self.request)
+            .field("username_input", &"<redacted>")
+            .field("password_input", &"<redacted>")
+            .finish()
+    }
+}
+
+impl PendingAuthModal {
+    pub fn wipe_inputs(&mut self) {
+        self.username_input.wipe_secret();
+        self.password_input.wipe_secret();
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PendingCertKind {
+    ServerError(CertificateErrorRequest),
+    ClientSelect(ClientCertificateRequest),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingCertModal {
+    pub tab_id: u64,
+    pub browser_id: BrowserId,
+    pub kind: PendingCertKind,
+}
+
+impl PendingCertModal {
+    pub fn request_id(&self) -> HostRequestId {
+        match &self.kind {
+            PendingCertKind::ServerError(r) => r.id,
+            PendingCertKind::ClientSelect(r) => r.id,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingBeforeUnloadModal {
+    pub tab_id: u64,
+    pub browser_id: BrowserId,
+    pub request: BeforeUnloadRequestId,
+    pub is_reload: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -859,6 +1043,8 @@ pub struct ExampleTabModel {
     pub v8_context_count: usize,
     pub focused_node_tag: String,
     pub download: DownloadInfoView,
+    pub find: TabFindState,
+    pub closing_pending: bool,
 }
 
 impl ExampleTabModel {
@@ -893,6 +1079,8 @@ impl ExampleTabModel {
                 last_action: "None".into(),
                 ..DownloadInfoView::default()
             },
+            find: TabFindState::default(),
+            closing_pending: false,
         }
     }
 
@@ -925,8 +1113,29 @@ impl ExampleTabModel {
         }
     }
 
+    pub fn apply_download_request(&mut self, browser_id: BrowserId, req: &DownloadRequest) {
+        self.download.last_action = "OnBeforeDownload".into();
+        self.download.browser_id = Some(browser_id);
+        self.download.download_id = Some(req.id);
+        self.download.id = Some(req.id.sequence);
+        self.download.url = req.url.clone();
+        self.download.original_url = req.original_url.clone();
+        self.download.suggested_file_name = req.suggested_name.clone();
+        self.download.mime_type = req.mime_type.clone();
+        self.download.total_bytes = req.total_bytes;
+        self.download.received_bytes = 0;
+        self.download.current_speed = 0;
+        self.download.percent_complete = None;
+        self.download.is_in_progress = true;
+        self.download.is_complete = false;
+        self.download.is_cancelled = false;
+        self.download.cancelled_reason = None;
+    }
+
     pub fn apply_download_progress(&mut self, p: &DownloadProgress) {
         self.download.last_action = "OnDownloadUpdated".into();
+        self.download.browser_id = Some(p.id.browser);
+        self.download.download_id = Some(p.id);
         self.download.id = Some(p.id.sequence);
         self.download.received_bytes = p.received_bytes;
         self.download.total_bytes = p.total_bytes;
@@ -934,10 +1143,27 @@ impl ExampleTabModel {
         self.download.percent_complete = (p.percent_complete >= 0).then_some(p.percent_complete);
         self.download.is_in_progress = p.state == DownloadState::InProgress;
         self.download.is_complete = p.state == DownloadState::Complete;
-        self.download.is_cancelled = matches!(p.state, DownloadState::Canceled | DownloadState::Interrupted);
+        self.download.is_cancelled = matches!(
+            p.state,
+            DownloadState::Canceled | DownloadState::Interrupted
+        );
+        if self.download.is_cancelled {
+            self.download
+                .cancelled_reason
+                .get_or_insert_with(|| format!("{:?}", p.state));
+        } else if self.download.is_in_progress || self.download.is_complete {
+            self.download.cancelled_reason = None;
+        }
         if let Some(full) = &p.full_path {
             self.download.full_path = full.to_string_lossy().into_owned();
         }
+    }
+
+    pub fn mark_download_cancelled(&mut self, reason: impl Into<String>) {
+        self.download.is_in_progress = false;
+        self.download.is_cancelled = true;
+        self.download.cancelled_reason = Some(reason.into());
+        self.download.last_action = "Cancelled".into();
     }
 }
 
@@ -947,9 +1173,18 @@ pub struct ExampleAppModel {
     pub active_tab: Option<u64>,
     pub active_input: ActiveInput,
     pub open_menu: Option<MenuCategory>,
+    pub ask_save_as: bool,
+    pub active_native_file_dialog: Option<HostRequestId>,
+    pub active_save_as_download: Option<DownloadId>,
     pub pending_js_dialog: Option<PendingJsDialog>,
+    pub pending_permission: VecDeque<PendingPermissionModal>,
+    pub pending_auth: VecDeque<PendingAuthModal>,
+    pub pending_cert: VecDeque<PendingCertModal>,
+    pub pending_before_unload: VecDeque<PendingBeforeUnloadModal>,
     pub notice_dialog: Option<NoticeDialog>,
+    pub window_close_pending: bool,
     pub quit_requested: bool,
+    pub active_find_open: Arc<AtomicBool>,
 }
 
 impl ExampleAppModel {
@@ -959,6 +1194,7 @@ impl ExampleAppModel {
         }
         self.tabs.push(ExampleTabModel::new(id, url, show_sidebar));
         self.active_tab = Some(id);
+        self.sync_active_find_flag();
         true
     }
 
@@ -967,6 +1203,7 @@ impl ExampleAppModel {
             self.active_tab = Some(id);
             self.active_input = ActiveInput::None;
             self.open_menu = None;
+            self.sync_active_find_flag();
             true
         } else {
             false
@@ -977,10 +1214,14 @@ impl ExampleAppModel {
         let Some(idx) = self.tabs.iter().position(|t| t.id == id) else {
             return false;
         };
+        let browser_id = self.tabs[idx].download.browser_id;
         self.tabs.remove(idx);
+        self.clear_modals_for_tab(id, browser_id);
         if self.tabs.is_empty() {
             self.active_tab = None;
+            self.window_close_pending = false;
             self.quit_requested = true;
+            self.sync_active_find_flag();
             return true;
         }
         if self.active_tab == Some(id) {
@@ -988,11 +1229,190 @@ impl ExampleAppModel {
             self.active_tab = Some(self.tabs[next_idx].id);
             self.active_input = ActiveInput::None;
         }
+        self.sync_active_find_flag();
         true
+    }
+
+    pub fn sync_active_find_flag(&self) {
+        let open = self.active_tab().is_some_and(|t| t.find.open);
+        self.active_find_open.store(open, Ordering::Release);
+    }
+
+    pub fn has_blocking_modal(&self) -> bool {
+        self.pending_js_dialog.is_some()
+            || self.notice_dialog.is_some()
+            || self.active_native_file_dialog.is_some()
+            || self.active_save_as_download.is_some()
+            || !self.pending_permission.is_empty()
+            || !self.pending_auth.is_empty()
+            || !self.pending_cert.is_empty()
+            || !self.pending_before_unload.is_empty()
+            || self.open_menu.is_some()
+    }
+
+    pub fn enqueue_permission(&mut self, modal: PendingPermissionModal) {
+        if !self
+            .pending_permission
+            .iter()
+            .any(|m| m.request.id == modal.request.id)
+        {
+            self.pending_permission.push_back(modal);
+        }
+    }
+
+    pub fn cancel_permission(&mut self, id: HostRequestId) -> bool {
+        let before = self.pending_permission.len();
+        self.pending_permission.retain(|m| m.request.id != id);
+        self.pending_permission.len() != before
+    }
+
+    pub fn pop_front_permission(&mut self) -> Option<PendingPermissionModal> {
+        self.pending_permission.pop_front()
+    }
+
+    pub fn enqueue_auth(&mut self, modal: PendingAuthModal) {
+        if !self
+            .pending_auth
+            .iter()
+            .any(|m| m.request.id == modal.request.id)
+        {
+            self.pending_auth.push_back(modal);
+        }
+    }
+
+    pub fn cancel_auth(&mut self, id: HostRequestId) -> bool {
+        let mut removed = false;
+        let mut kept = VecDeque::with_capacity(self.pending_auth.len());
+        while let Some(mut modal) = self.pending_auth.pop_front() {
+            if modal.request.id == id {
+                modal.wipe_inputs();
+                removed = true;
+            } else {
+                kept.push_back(modal);
+            }
+        }
+        self.pending_auth = kept;
+        if removed
+            && matches!(
+                self.active_input,
+                ActiveInput::AuthUser | ActiveInput::AuthPass
+            )
+        {
+            self.active_input = ActiveInput::None;
+        }
+        removed
+    }
+
+    pub fn pop_front_auth(&mut self) -> Option<PendingAuthModal> {
+        let popped = self.pending_auth.pop_front();
+        if popped.is_some()
+            && matches!(
+                self.active_input,
+                ActiveInput::AuthUser | ActiveInput::AuthPass
+            )
+        {
+            self.active_input = ActiveInput::None;
+        }
+        popped
+    }
+
+    pub fn enqueue_cert(&mut self, modal: PendingCertModal) {
+        let id = modal.request_id();
+        if !self.pending_cert.iter().any(|m| m.request_id() == id) {
+            self.pending_cert.push_back(modal);
+        }
+    }
+
+    pub fn cancel_cert(&mut self, id: HostRequestId) -> bool {
+        let before = self.pending_cert.len();
+        self.pending_cert.retain(|m| m.request_id() != id);
+        self.pending_cert.len() != before
+    }
+
+    pub fn pop_front_cert(&mut self) -> Option<PendingCertModal> {
+        self.pending_cert.pop_front()
+    }
+
+    pub fn enqueue_before_unload(&mut self, modal: PendingBeforeUnloadModal) {
+        if !self
+            .pending_before_unload
+            .iter()
+            .any(|m| m.browser_id == modal.browser_id && m.request == modal.request)
+        {
+            self.pending_before_unload.push_back(modal);
+        }
+    }
+
+    pub fn pop_front_before_unload(&mut self) -> Option<PendingBeforeUnloadModal> {
+        self.pending_before_unload.pop_front()
+    }
+
+    pub fn clear_active_file_dialog_if(&mut self, id: HostRequestId) -> bool {
+        if self.active_native_file_dialog == Some(id) {
+            self.active_native_file_dialog = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn clear_modals_for_tab(&mut self, tab_id: u64, browser_id: Option<BrowserId>) {
+        let matches_target =
+            |tid: u64, bid: BrowserId| tid == tab_id || browser_id.is_some_and(|b| b == bid);
+        self.pending_permission
+            .retain(|m| !matches_target(m.tab_id, m.browser_id));
+        let mut kept_auth = VecDeque::with_capacity(self.pending_auth.len());
+        let mut wiped_active_auth = false;
+        while let Some(mut m) = self.pending_auth.pop_front() {
+            if matches_target(m.tab_id, m.browser_id) {
+                m.wipe_inputs();
+                wiped_active_auth = true;
+            } else {
+                kept_auth.push_back(m);
+            }
+        }
+        self.pending_auth = kept_auth;
+        if wiped_active_auth
+            && matches!(
+                self.active_input,
+                ActiveInput::AuthUser | ActiveInput::AuthPass
+            )
+        {
+            self.active_input = ActiveInput::None;
+        }
+        self.pending_cert
+            .retain(|m| !matches_target(m.tab_id, m.browser_id));
+        self.pending_before_unload
+            .retain(|m| !matches_target(m.tab_id, m.browser_id));
+        if let Some(bid) = browser_id {
+            if self
+                .active_native_file_dialog
+                .is_some_and(|id| id.browser == bid)
+            {
+                self.active_native_file_dialog = None;
+            }
+            if self
+                .active_save_as_download
+                .is_some_and(|id| id.browser == bid)
+            {
+                self.active_save_as_download = None;
+            }
+            if self
+                .pending_js_dialog
+                .as_ref()
+                .is_some_and(|d| d.id.browser == bid)
+            {
+                self.pending_js_dialog = None;
+            }
+        }
     }
 
     pub fn active_tab(&self) -> Option<&ExampleTabModel> {
         let id = self.active_tab?;
+        self.tabs.iter().find(|t| t.id == id)
+    }
+
+    pub fn tab(&self, id: u64) -> Option<&ExampleTabModel> {
         self.tabs.iter().find(|t| t.id == id)
     }
 
@@ -1007,7 +1427,8 @@ impl ExampleAppModel {
 }
 
 pub fn normalize_user_url(input: &str) -> Option<String> {
-    if input.bytes().any(|b| b == 0 || b.is_ascii_control()) || input.len() > MAX_TEXT_BUFFER_BYTES {
+    if input.bytes().any(|b| b == 0 || b.is_ascii_control()) || input.len() > MAX_TEXT_BUFFER_BYTES
+    {
         return None;
     }
     let trimmed = input.trim();
@@ -1204,5 +1625,106 @@ mod tests {
         assert!(!is_point_draggable(&regions, 80, 90));
         assert!(is_point_draggable(&regions, 300, 180));
         assert!(!is_point_draggable(&regions, 5, 5));
+    }
+
+    #[test]
+    fn app_model_modal_queues_preserve_fifo_order_and_prune_stale_ids() {
+        use rust_cef_gpui::contracts::RuntimeGeneration;
+        use rust_cef_gpui::host_capabilities::PermissionKind;
+
+        let rt = RuntimeGeneration::new(1);
+        let b1 = BrowserId::new(rt, 1);
+        let b2 = BrowserId::new(rt, 2);
+        let mut model = ExampleAppModel::default();
+        assert!(model.add_tab(10, DEFAULT_HOME_URL.into(), false));
+        assert!(model.add_tab(20, DEFAULT_HOME_URL.into(), false));
+
+        // Tab find open_flag synchronizes with active tab.
+        assert!(!model.active_find_open.load(Ordering::Acquire));
+        model.tab_mut(20).unwrap().find.set_open(true);
+        model.sync_active_find_flag();
+        assert!(model.active_find_open.load(Ordering::Acquire));
+        model.switch_tab(10);
+        assert!(!model.active_find_open.load(Ordering::Acquire));
+
+        let p1 = HostRequestId {
+            browser: b1,
+            sequence: 1,
+        };
+        let p2 = HostRequestId {
+            browser: b2,
+            sequence: 2,
+        };
+        model.enqueue_permission(PendingPermissionModal {
+            tab_id: 10,
+            browser_id: b1,
+            request: PermissionRequest {
+                id: p1,
+                kind: PermissionKind::MediaAccess,
+                requesting_origin: "https://a.test".into(),
+                requested_permissions: 1,
+            },
+        });
+        model.enqueue_permission(PendingPermissionModal {
+            tab_id: 20,
+            browser_id: b2,
+            request: PermissionRequest {
+                id: p2,
+                kind: PermissionKind::PermissionPrompt,
+                requesting_origin: "https://b.test".into(),
+                requested_permissions: 2,
+            },
+        });
+        // Duplicate request id is ignored.
+        model.enqueue_permission(PendingPermissionModal {
+            tab_id: 10,
+            browser_id: b1,
+            request: PermissionRequest {
+                id: p1,
+                kind: PermissionKind::MediaAccess,
+                requesting_origin: "https://a.test".into(),
+                requested_permissions: 1,
+            },
+        });
+        assert_eq!(model.pending_permission.len(), 2);
+        assert!(model.cancel_permission(p1));
+        assert!(!model.cancel_permission(p1));
+        assert_eq!(model.pop_front_permission().unwrap().request.id, p2);
+
+        // Auth modal redacts Debug output and wipes buffers on cancel/tab close.
+        let a1 = HostRequestId {
+            browser: b1,
+            sequence: 3,
+        };
+        let auth_modal = PendingAuthModal {
+            tab_id: 10,
+            browser_id: b1,
+            request: AuthRequest {
+                id: a1,
+                origin_url: "https://auth.test".into(),
+                is_proxy: false,
+                host: "auth.test".into(),
+                port: 443,
+                realm: "TestRealm".into(),
+                scheme: "basic".into(),
+            },
+            username_input: TextBuffer::new("alice"),
+            password_input: TextBuffer::new("s3cr3t!"),
+        };
+        let dbg = format!("{auth_modal:?}");
+        assert!(!dbg.contains("alice") && !dbg.contains("s3cr3t!"));
+        assert!(dbg.contains("<redacted>"));
+
+        model.enqueue_auth(auth_modal);
+        model.active_input = ActiveInput::AuthPass;
+        model.clear_modals_for_tab(10, Some(b1));
+        assert!(model.pending_auth.is_empty());
+        assert_eq!(model.active_input, ActiveInput::None);
+
+        let mut buf = TextBuffer::new("sensitive");
+        buf.insert_str("-more");
+        buf.wipe_secret();
+        assert!(buf.text.is_empty());
+        assert!(!buf.undo());
     }
 }

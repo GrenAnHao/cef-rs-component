@@ -1,0 +1,164 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      release_version:
+        description: "Release archive and HostBuildVersion tag"
+        required: false
+        default: "0.2.0"
+
+permissions:
+  contents: write
+
+env:
+  CEF_VERSION: 156.0.31
+  CEF_RS_REV: 7b6bf84e76e919790bd61df077e29dc4132eb5e2
+  TARGET_TRIPLE: x86_64-pc-windows-msvc
+
+jobs:
+  package-windows-x64:
+    name: Build & Package Windows x64 Release
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      CARGO_TARGET_DIR: C:\t
+      CARGO_INCREMENTAL: 0
+      CL: /utf-8
+      CEF_PATH: C:\cef\156.0.31_windows_x86_64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-directories: |
+            C:\t
+
+      - name: Cache exported CEF SDK
+        id: cache-cef
+        uses: actions/cache@v4
+        with:
+          path: C:\cef\156.0.31_windows_x86_64
+          key: cef-${{ env.CEF_VERSION }}-${{ env.CEF_RS_REV }}-win64
+
+      - name: Export CEF SDK if cache missed
+        if: steps.cache-cef.outputs.cache-hit != 'true'
+        run: |
+          [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+          cargo install --locked --git https://github.com/tauri-apps/cef-rs --rev $env:CEF_RS_REV export-cef-dir
+          New-Item -ItemType Directory -Force -Path C:\cef | Out-Null
+          export-cef-dir --force C:\cef\156.0.31_windows_x86_64
+
+      - name: Build Release host and helper binaries
+        run: |
+          $ErrorActionPreference = 'Stop'
+          [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+          . .\scripts\common.ps1
+          $ninja = Resolve-Ninja
+          $env:PATH = (Split-Path -Parent $ninja) + ';' + $env:PATH
+          Import-MsvcEnvironment
+          Set-Utf8CompilerFlag
+          cargo build --locked --release --target $env:TARGET_TRIPLE -p gpui-cef-poc --features component-demo --bin gpui-cef-component-demo --bin gpui-cef-example
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo build --locked --release --target $env:TARGET_TRIPLE -p rust-cef-helper --bin rust-cef-helper
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Package bundles, verify component-runtime.json, and generate SHA-256 archives
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ver = if ('${{ github.ref }}' -like 'refs/tags/v*') {
+            '${{ github.ref_name }}'.TrimStart('v')
+          } elseif ('${{ inputs.release_version }}') {
+            '${{ inputs.release_version }}'
+          } else {
+            '0.2.0'
+          }
+          $binDir = Join-Path $env:CARGO_TARGET_DIR "$($env:TARGET_TRIPLE)\release"
+          $helperExe = Join-Path $binDir 'rust-cef-helper.exe'
+          $stageRoot = '.\release-staging'
+          $outDist = '.\release-assets'
+          New-Item -ItemType Directory -Force -Path $stageRoot, $outDist | Out-Null
+
+          $targets = @(
+            @{ Bin = 'gpui-cef-component-demo.exe'; Name = "cef-rs-gpui-component-demo-win-x64-$ver" },
+            @{ Bin = 'gpui-cef-example.exe'; Name = "cef-rs-gpui-example-win-x64-$ver" }
+          )
+
+          $manifestLines = @()
+          foreach ($t in $targets) {
+            $hostExe = Join-Path $binDir $t.Bin
+            $bundleDir = Join-Path $stageRoot $t.Name
+            & .\scripts\package-component.ps1 `
+              -HostExecutable $hostExe `
+              -HelperExecutable $helperExe `
+              -CefPath $env:CEF_PATH `
+              -OutputDirectory $bundleDir `
+              -HostBuildVersion $ver | Out-Null
+
+            $manifestPath = Join-Path $bundleDir 'component-runtime.json'
+            if (-not (Test-Path $manifestPath)) { throw "Missing component-runtime.json in $bundleDir" }
+            $manifest = Get-Content $manifestPath -Raw | ConvertFrom-Json
+            if ($manifest.cef_version -ne $env:CEF_VERSION) {
+              throw "Unexpected cef_version '$($manifest.cef_version)' in $manifestPath"
+            }
+            if ($manifest.target -ne $env:TARGET_TRIPLE) {
+              throw "Unexpected target '$($manifest.target)' in $manifestPath"
+            }
+            if (-not $manifest.host -or -not $manifest.helper) {
+              throw "Missing host/helper metadata in $manifestPath"
+            }
+            foreach ($binEntry in @($manifest.host, $manifest.helper)) {
+              $binPath = Join-Path $bundleDir $binEntry.file_name
+              if (-not (Test-Path $binPath)) { throw "Missing packaged binary: $binPath" }
+              $binSha = (Get-FileHash -Path $binPath -Algorithm SHA256).Hash.ToLowerInvariant()
+              if ($binSha -ne $binEntry.sha256) {
+                throw "SHA-256 mismatch for $($binEntry.file_name): expected $($binEntry.sha256), got $binSha"
+              }
+            }
+            if ($manifest.runtime.Count -lt 1) {
+              throw "Empty runtime file list in $manifestPath"
+            }
+            foreach ($entry in $manifest.runtime) {
+              $fp = Join-Path $bundleDir $entry.path
+              if (-not (Test-Path $fp)) { throw "Missing packaged file: $fp" }
+              $actual = (Get-FileHash -Path $fp -Algorithm SHA256).Hash.ToLowerInvariant()
+              if ($actual -ne $entry.sha256) {
+                throw "SHA-256 mismatch for $($entry.path): expected $($entry.sha256), got $actual"
+              }
+            }
+
+            $zipPath = Join-Path $outDist "$($t.Name).zip"
+            Compress-Archive -Path "$bundleDir\*" -DestinationPath $zipPath -Force
+            $zipSha = (Get-FileHash -Path $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+            $line = "$zipSha  $($t.Name).zip"
+            Set-Content -Path "$zipPath.sha256" -Value $line -NoNewline
+            $manifestLines += $line
+          }
+          Set-Content -Path (Join-Path $outDist 'SHA256SUMS.txt') -Value ($manifestLines -join "`n")
+
+      - name: Upload workflow release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: cef-rs-gpui-windows-x64
+          path: |
+            release-assets/*.zip
+            release-assets/*.sha256
+            release-assets/SHA256SUMS.txt
+            release-staging/**/component-runtime.json
+
+      - name: Publish GitHub Release assets
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release-assets/*.zip
+            release-assets/*.sha256
+            release-assets/SHA256SUMS.txt

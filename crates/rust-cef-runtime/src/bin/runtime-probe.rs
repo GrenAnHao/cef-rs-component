@@ -410,9 +410,7 @@ mod windows {
             } else {
                 width == 320
                     && height == 240
-                    && frame
-                        .cpu_pixels()
-                        .and_then(|px| px.get(center..center + 4))
+                    && frame.cpu_pixels().and_then(|px| px.get(center..center + 4))
                         == Some(&[126, 76, 26, 255])
             };
             if valid {

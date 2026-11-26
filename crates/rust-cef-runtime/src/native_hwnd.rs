@@ -577,6 +577,9 @@ mod tests {
         let (x0, y0) = client_to_screen(hwnd, 0, 0).expect("client_to_screen(0, 0)");
         let (x1, y1) = client_to_screen(hwnd, 165, 141).expect("client_to_screen(165, 141)");
         assert_eq!((x1 - x0, y1 - y0), (165, 141));
-        assert_eq!(client_to_screen(NonZeroUsize::new(0xDEAD).unwrap(), 10, 10), None);
+        assert_eq!(
+            client_to_screen(NonZeroUsize::new(0xDEAD).unwrap(), 10, 10),
+            None
+        );
     }
 }

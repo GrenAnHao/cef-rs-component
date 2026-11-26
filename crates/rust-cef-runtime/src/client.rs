@@ -196,11 +196,8 @@ impl ViewportState {
                 && client_x_f <= i32::MAX as f32
                 && client_y_f >= i32::MIN as f32
                 && client_y_f <= i32::MAX as f32
-                && let Some(screen_pt) = crate::native_hwnd::client_to_screen(
-                    hwnd,
-                    client_x_f as i32,
-                    client_y_f as i32,
-                )
+                && let Some(screen_pt) =
+                    crate::native_hwnd::client_to_screen(hwnd, client_x_f as i32, client_y_f as i32)
             {
                 return Some(screen_pt);
             }
@@ -680,8 +677,8 @@ impl BrowserClientState {
         post_data: &[u8],
         content_type: Option<&str>,
     ) -> Result<Request, rust_cef_core::ports::EngineError> {
-        let req =
-            cef::request_create().ok_or(rust_cef_core::ports::EngineError::Backend { code: None })?;
+        let req = cef::request_create()
+            .ok_or(rust_cef_core::ports::EngineError::Backend { code: None })?;
         req.set_url(Some(&CefString::from(url)));
         req.set_method(Some(&CefString::from("POST")));
         req.set_flags(cef::sys::cef_urlrequest_flags_t::UR_FLAG_ALLOW_STORED_CREDENTIALS.0);
@@ -770,7 +767,9 @@ impl BrowserClientState {
             *guard = None;
             return None;
         }
-        let matches_bootstrap = guard.as_ref().is_some_and(|p| p.bootstrap_url == loaded_url);
+        let matches_bootstrap = guard
+            .as_ref()
+            .is_some_and(|p| p.bootstrap_url == loaded_url);
         if !matches_bootstrap {
             return None;
         }
@@ -3761,7 +3760,17 @@ mod tests {
             height: 600,
             scale: 1.0,
         });
-        assert_eq!(vp.snapshot(), (Viewport { width: 800, height: 600, scale: 1.0 }, None));
+        assert_eq!(
+            vp.snapshot(),
+            (
+                Viewport {
+                    width: 800,
+                    height: 600,
+                    scale: 1.0
+                },
+                None
+            )
+        );
         let _ = vp.set_screen_origin(100, 200);
         vp.set(Viewport {
             width: 1200,
@@ -3789,8 +3798,22 @@ mod tests {
         let dummy_px = [1u8, 2, 3, 255];
 
         // CPU on_paint: 0-dimension and > 16384 frames are dropped without fault.
-        handler.on_paint(None, PaintElementType::VIEW, None, dummy_px.as_ptr(), 0, 100);
-        handler.on_paint(None, PaintElementType::VIEW, None, dummy_px.as_ptr(), 100, 0);
+        handler.on_paint(
+            None,
+            PaintElementType::VIEW,
+            None,
+            dummy_px.as_ptr(),
+            0,
+            100,
+        );
+        handler.on_paint(
+            None,
+            PaintElementType::VIEW,
+            None,
+            dummy_px.as_ptr(),
+            100,
+            0,
+        );
         handler.on_paint(
             None,
             PaintElementType::VIEW,
@@ -3810,8 +3833,16 @@ mod tests {
 
         // GPU on_accelerated_paint: 0-dimension and > 16384 frames are dropped without fault.
         let mut zero_info = cef::AcceleratedPaintInfo::default();
-        zero_info.extra.coded_size = cef::Size { width: 0, height: 100 };
-        zero_info.extra.visible_rect = cef::Rect { x: 0, y: 0, width: 0, height: 100 };
+        zero_info.extra.coded_size = cef::Size {
+            width: 0,
+            height: 100,
+        };
+        zero_info.extra.visible_rect = cef::Rect {
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 100,
+        };
         handler.on_accelerated_paint(None, PaintElementType::VIEW, None, Some(&zero_info));
 
         let mut oversized_info = cef::AcceleratedPaintInfo::default();
@@ -3976,7 +4007,9 @@ mod tests {
         );
 
         // 3. Explicit NavigateCurrentTab policy -> NavigateCurrentTab.
-        state.routing.set_popup_policy(PopupPolicy::NavigateCurrentTab);
+        state
+            .routing
+            .set_popup_policy(PopupPolicy::NavigateCurrentTab);
         assert_eq!(
             state.resolve_popup_decision(make_req("https://allowed.local/a")),
             (PopupDecision::NavigateCurrentTab, false)
@@ -4017,7 +4050,9 @@ mod tests {
         // 6. on_open_urlfrom_tab follows resolved decision (NavigateCurrentTab -> 0, disallowed -> 1).
         state.routing.set_popup_filter(None);
         state.routing.set_popup_ui_listener_active(false);
-        state.routing.set_popup_policy(PopupPolicy::NavigateCurrentTab);
+        state
+            .routing
+            .set_popup_policy(PopupPolicy::NavigateCurrentTab);
         let req_handler = RuntimeRequestHandler::new(state.clone());
         let ok_url = CefString::from("https://allowed.local/midclick");
         let bad_url = CefString::from("https://blocked.invalid/midclick");
@@ -4144,16 +4179,14 @@ mod tests {
             0
         );
         assert_eq!(is_shortcut, 0);
-        state
-            .routing
-            .set_pre_key_filter(Some(Arc::new(|_, ev| {
-                assert_eq!(ev.kind, BrowserKeyEventKind::KeyDown);
-                if ev.windows_key_code == 0x41 {
-                    PreKeyDecision::PassAsShortcut
-                } else {
-                    PreKeyDecision::Handled
-                }
-            })));
+        state.routing.set_pre_key_filter(Some(Arc::new(|_, ev| {
+            assert_eq!(ev.kind, BrowserKeyEventKind::KeyDown);
+            if ev.windows_key_code == 0x41 {
+                PreKeyDecision::PassAsShortcut
+            } else {
+                PreKeyDecision::Handled
+            }
+        })));
         assert_eq!(
             kbd.on_pre_key_event(None, Some(&key), None, Some(&mut is_shortcut)),
             0
@@ -4180,14 +4213,17 @@ mod tests {
 
         // 3. DragHandler: default allow, filter can cancel, draggable regions gate on EXT_EVENT.
         let drag = crate::client_handlers::RuntimeDragHandler::new(state.clone());
-        let drag_copy =
-            crate::outbound_drag::core_mask_to_cef(rust_cef_core::outbound_drag::DragOperationMask::COPY);
+        let drag_copy = crate::outbound_drag::core_mask_to_cef(
+            rust_cef_core::outbound_drag::DragOperationMask::COPY,
+        );
         assert_eq!(drag.on_drag_enter(None, None, drag_copy), 0);
         let expected_browser = state.browser;
-        state.routing.set_drag_enter_filter(Some(Arc::new(move |info| {
-            assert_eq!(info.browser, expected_browser);
-            DragEnterDecision::Cancel
-        })));
+        state
+            .routing
+            .set_drag_enter_filter(Some(Arc::new(move |info| {
+                assert_eq!(info.browser, expected_browser);
+                DragEnterDecision::Cancel
+            })));
         assert_eq!(drag.on_drag_enter(None, None, drag_copy), 1);
         assert!(!state.wants_extended_event(EXT_EVENT_DRAGGABLE_REGIONS));
         let region = DraggableRegion {

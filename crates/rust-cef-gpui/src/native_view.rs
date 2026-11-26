@@ -15,7 +15,7 @@ use std::{
     ffi::c_void,
     num::NonZeroUsize,
     rc::Rc,
-    sync::OnceLock,
+    sync::{Arc, OnceLock},
 };
 
 use gpui::{
@@ -25,9 +25,7 @@ use gpui::{
 };
 use raw_window_handle::RawWindowHandle;
 use rust_cef_core::{
-    contracts::{
-        BrowserCursor, BrowserId, BrowserSurfaceMode, PixelRect, ShortcutId,
-    },
+    contracts::{BrowserCursor, BrowserId, BrowserSurfaceMode, PixelRect, ShortcutId},
     cursor::{NativeCursorData, StandardCursor},
     host_capabilities::PopupRequest,
     js_bridge::{EvalOutcome, EvalRequestId, JsFrameScope},
@@ -415,8 +413,16 @@ fn drag_op_cursor(op: DragOperationMask) -> OwnedWinCursor {
     const LR_DEFAULTSIZE: u32 = 0x0040;
     const LR_SHARED: u32 = 0x8000;
     const OLE32_UTF16: &[u16] = &[
-        b'o' as u16, b'l' as u16, b'e' as u16, b'3' as u16, b'2' as u16, b'.' as u16,
-        b'd' as u16, b'l' as u16, b'l' as u16, 0,
+        b'o' as u16,
+        b'l' as u16,
+        b'e' as u16,
+        b'3' as u16,
+        b'2' as u16,
+        b'.' as u16,
+        b'd' as u16,
+        b'l' as u16,
+        b'l' as u16,
+        0,
     ];
     let preferred = op.preferred_single_op();
     let res_id: usize = if preferred == DragOperationMask::COPY {
@@ -430,7 +436,8 @@ fn drag_op_cursor(op: DragOperationMask) -> OwnedWinCursor {
     };
     let hmod = unsafe { GetModuleHandleW(OLE32_UTF16.as_ptr()) };
     if hmod != 0 {
-        let hcursor = unsafe { LoadImageW(hmod, res_id, IMAGE_CURSOR, 0, 0, LR_DEFAULTSIZE | LR_SHARED) };
+        let hcursor =
+            unsafe { LoadImageW(hmod, res_id, IMAGE_CURSOR, 0, 0, LR_DEFAULTSIZE | LR_SHARED) };
         if hcursor != 0 {
             return OwnedWinCursor::Standard(hcursor);
         }
@@ -982,9 +989,9 @@ pub(crate) fn clear_surface_cursor(hwnd_raw: Option<isize>, browser_key: u64) {
         (removed, drag)
     });
     if old_drag.is_some()
-        || removed
-            .as_ref()
-            .is_some_and(|e| matches!(e.cursor, OwnedWinCursor::Custom(h) if h.get() == unsafe { GetCursor() }))
+        || removed.as_ref().is_some_and(
+            |e| matches!(e.cursor, OwnedWinCursor::Custom(h) if h.get() == unsafe { GetCursor() }),
+        )
     {
         let _ = unsafe { SetCursor(standard_hcursor(StandardCursor::Arrow)) };
     }
@@ -1168,8 +1175,9 @@ pub type NativeEvalCompletedCallback = Box<
         &mut Context<NativeCefBrowser>,
     ),
 >;
-pub type NativePopupCallback =
-    Box<dyn FnMut(PopupRequest, &mut NativeCefBrowser, &mut Window, &mut Context<NativeCefBrowser>)>;
+pub type NativePopupCallback = Box<
+    dyn FnMut(PopupRequest, &mut NativeCefBrowser, &mut Window, &mut Context<NativeCefBrowser>),
+>;
 pub type NativeNavigationCallback =
     Box<dyn FnMut(String, &mut NativeCefBrowser, &mut Window, &mut Context<NativeCefBrowser>)>;
 
@@ -1212,6 +1220,8 @@ pub struct NativeCefBrowser {
     on_address_changed: Option<NativeNavigationCallback>,
     on_address_epoch: u64,
     callbacks: BrowserViewCallbacks<Self>,
+    runtime_bridge: Option<rust_cef_runtime::RuntimeBrowserBridge>,
+    async_ops: Arc<crate::async_ops::AsyncOpLedger>,
 }
 
 impl NativeCefBrowser {
@@ -1244,6 +1254,9 @@ impl NativeCefBrowser {
         let window_handle = window.window_handle();
         let window_id = window_handle.window_id().as_u64();
         let handle = attachment.handle().clone();
+        let runtime_bridge = attachment.runtime_bridge().cloned();
+        let async_ops = crate::async_ops::AsyncOpLedger::new();
+        let close_async_ops = Arc::clone(&async_ops);
         let slot_controller =
             NativeSlotController::from_attachment(attachment, cfg.parent_hwnd, window_id)
                 .map_err(map_slot_error)?;
@@ -1278,6 +1291,8 @@ impl NativeCefBrowser {
             on_address_changed: None,
             on_address_epoch: 0,
             callbacks: BrowserViewCallbacks::default(),
+            runtime_bridge,
+            async_ops,
         });
 
         let release_subscription = cx.observe_release(&view, |view, _app| {
@@ -1288,6 +1303,7 @@ impl NativeCefBrowser {
             if closed_window.as_u64() != window_id {
                 return;
             }
+            close_async_ops.retire_and_cancel_all();
             if close_view.update(app, |view, _| view.retire()).is_err() {
                 close_token.retire();
                 let _ = close_handle.submit(BrowserCommand::SetVisible(false));
@@ -1511,6 +1527,7 @@ impl NativeCefBrowser {
                     }
                 }
                 BrowserEvent::EvalCompleted { id, outcome } => {
+                    let _ = self.async_ops.on_eval_completed(id, &outcome);
                     if let Some(mut cb) = self.on_eval_completed.take() {
                         cb(id, outcome, self, window, cx);
                         if self.on_eval_completed.is_none() {
@@ -1530,6 +1547,7 @@ impl NativeCefBrowser {
     fn sync_view_events(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let events = self.handle.take_view_events();
         for event in events {
+            self.async_ops.on_browser_event(&event);
             if let BrowserEvent::DraggableRegionsChanged(ref regions) = event {
                 self.ux.draggable_regions.clone_from(regions);
             }
@@ -1550,6 +1568,7 @@ impl NativeCefBrowser {
 
     pub fn retire(&mut self) {
         self.clear_callbacks_and_filters();
+        self.async_ops.retire_and_cancel_all();
         self.slot.borrow_mut().retire();
     }
 
@@ -1658,6 +1677,127 @@ impl NativeCefBrowser {
             .map_err(ViewError::Input)
     }
 
+    pub fn evaluate_script_async(
+        &self,
+        script: impl Into<String>,
+        frame_scope: JsFrameScope,
+        timeout: Option<std::time::Duration>,
+    ) -> crate::async_ops::AsyncOpFuture<Option<String>> {
+        if self.check_live().is_err() {
+            return crate::async_ops::AsyncOpFuture::ready(Err(
+                crate::async_ops::AsyncOpError::Closed,
+            ));
+        }
+        let dur = timeout.unwrap_or(crate::async_ops::DEFAULT_ASYNC_OP_TIMEOUT);
+        let timeout_ms = dur.as_millis().clamp(1, i64::MAX as u128) as u64;
+        let id = match self
+            .handle
+            .evaluate_script(script.into(), frame_scope, timeout_ms)
+        {
+            Ok(id) => id,
+            Err(err) => {
+                return crate::async_ops::AsyncOpFuture::ready(Err(
+                    crate::async_ops::AsyncOpError::Runtime(err),
+                ));
+            }
+        };
+        match self.async_ops.begin_eval(id, Some(dur)) {
+            Ok(fut) => fut,
+            Err(err) => crate::async_ops::AsyncOpFuture::ready(Err(err)),
+        }
+    }
+
+    pub fn get_source_async(
+        &self,
+        frame_scope: JsFrameScope,
+        timeout: Option<std::time::Duration>,
+    ) -> crate::async_ops::AsyncOpFuture<String> {
+        if self.check_live().is_err() {
+            return crate::async_ops::AsyncOpFuture::ready(Err(
+                crate::async_ops::AsyncOpError::Closed,
+            ));
+        }
+        crate::async_ops::request_frame_text_async(
+            &self.async_ops,
+            self.runtime_bridge.as_ref(),
+            rust_cef_runtime::FrameTextKind::Source,
+            frame_scope,
+            timeout,
+        )
+    }
+
+    pub fn get_text_async(
+        &self,
+        frame_scope: JsFrameScope,
+        timeout: Option<std::time::Duration>,
+    ) -> crate::async_ops::AsyncOpFuture<String> {
+        if self.check_live().is_err() {
+            return crate::async_ops::AsyncOpFuture::ready(Err(
+                crate::async_ops::AsyncOpError::Closed,
+            ));
+        }
+        crate::async_ops::request_frame_text_async(
+            &self.async_ops,
+            self.runtime_bridge.as_ref(),
+            rust_cef_runtime::FrameTextKind::Text,
+            frame_scope,
+            timeout,
+        )
+    }
+
+    pub fn wait_for_initial_load_async(
+        &self,
+        timeout: Option<std::time::Duration>,
+    ) -> crate::async_ops::AsyncOpFuture<crate::async_ops::InitialLoadResult> {
+        if self.check_live().is_err() {
+            return crate::async_ops::AsyncOpFuture::ready(Err(
+                crate::async_ops::AsyncOpError::Closed,
+            ));
+        }
+        let nav = self.handle.snapshot().navigation;
+        let hint = (!nav.is_loading && !nav.address.is_empty()).then_some(
+            crate::async_ops::InitialLoadResult {
+                http_status_code: 200,
+            },
+        );
+        self.async_ops.wait_for_initial_load(
+            hint,
+            Some(timeout.unwrap_or(crate::async_ops::DEFAULT_ASYNC_OP_TIMEOUT)),
+        )
+    }
+
+    pub fn capture_screenshot_bgra(
+        &self,
+        timeout: Option<std::time::Duration>,
+    ) -> crate::async_ops::AsyncOpFuture<crate::async_ops::ScreenshotBgra> {
+        if self.check_live().is_err() {
+            return crate::async_ops::AsyncOpFuture::ready(Err(
+                crate::async_ops::AsyncOpError::Closed,
+            ));
+        }
+        crate::async_ops::capture_native_cdp_bgra(
+            &self.async_ops,
+            self.runtime_bridge.as_ref(),
+            timeout,
+        )
+    }
+
+    pub fn capture_screenshot_png(
+        &self,
+        timeout: Option<std::time::Duration>,
+    ) -> crate::async_ops::AsyncOpFuture<Vec<u8>> {
+        if self.check_live().is_err() {
+            return crate::async_ops::AsyncOpFuture::ready(Err(
+                crate::async_ops::AsyncOpError::Closed,
+            ));
+        }
+        crate::async_ops::capture_native_cdp_png(
+            &self.async_ops,
+            self.runtime_bridge.as_ref(),
+            timeout,
+        )
+    }
+
     pub fn post_js_message(&self, payload_json: impl Into<String>) -> Result<CommandId, ViewError> {
         self.check_live()?;
         self.handle
@@ -1693,6 +1833,7 @@ impl NativeCefBrowser {
 impl Drop for NativeCefBrowser {
     fn drop(&mut self) {
         self.clear_callbacks_and_filters();
+        self.async_ops.retire_and_cancel_all();
         self.slot.borrow_mut().retire();
     }
 }

@@ -456,8 +456,9 @@ impl NativeKeyboardServices {
                 // by observing propagation=false.
                 if let Some(view) = route.view.upgrade() {
                     app.stop_propagation();
-                    let admission = view
-                        .update(app, |view, cx| view.native_key_down(envelope.key, window, cx));
+                    let admission = view.update(app, |view, cx| {
+                        view.native_key_down(envelope.key, window, cx)
+                    });
                     let (claim, text_allowed, host_consumed, epoch) = match admission {
                         NativeDownAdmission::Admitted(epoch) => (true, true, false, Some(epoch)),
                         NativeDownAdmission::Deferred(epoch) => (true, false, false, Some(epoch)),
@@ -1072,7 +1073,8 @@ impl Route {
             return;
         }
         let result = state.current.get();
-        let host_consumed = result.is_some_and(|envelope| envelope.claimed && envelope.host_consumed);
+        let host_consumed =
+            result.is_some_and(|envelope| envelope.claimed && envelope.host_consumed);
         let claimed = result.is_some_and(|envelope| envelope.claimed && !envelope.host_consumed);
         if host_consumed && !key.up {
             let mut exceptions = self.host_exceptions.get();

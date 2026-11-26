@@ -1,0 +1,100 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CEF_VERSION: 156.0.31
+  CEF_RS_REV: 7b6bf84e76e919790bd61df077e29dc4132eb5e2
+
+jobs:
+  fmt:
+    name: Format Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt -p gpui-cef-poc -p rust-cef-ui -p rust-cef-helper -p rust-cef-runtime -p rust-cef-gpui -- --check
+
+  core-and-ui:
+    name: Core & UI (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run core tests
+        run: cargo test --locked -p rust-cef-core
+      - name: Check rust-cef-ui
+        run: cargo check --locked -p rust-cef-ui
+
+  windows-msvc:
+    name: Windows x64 MSVC Checks & Unit Tests
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      CARGO_TARGET_DIR: C:\t
+      CARGO_INCREMENTAL: 0
+      CL: /utf-8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-directories: |
+            C:\t
+
+      - name: Run script-level checks (core + fmt + UI)
+        run: |
+          pwsh -NoProfile -File scripts/check.ps1
+
+      - name: Cache exported CEF SDK
+        id: cache-cef
+        uses: actions/cache@v4
+        with:
+          path: C:\cef\156.0.31_windows_x86_64
+          key: cef-${{ env.CEF_VERSION }}-${{ env.CEF_RS_REV }}-win64
+
+      - name: Export CEF SDK if cache missed
+        if: steps.cache-cef.outputs.cache-hit != 'true'
+        run: |
+          [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+          cargo install --locked --git https://github.com/tauri-apps/cef-rs --rev $env:CEF_RS_REV export-cef-dir
+          New-Item -ItemType Directory -Force -Path C:\cef | Out-Null
+          export-cef-dir --force C:\cef\156.0.31_windows_x86_64
+
+      - name: Check workspace and host binaries
+        env:
+          CEF_PATH: C:\cef\156.0.31_windows_x86_64
+        run: |
+          $ErrorActionPreference = 'Stop'
+          [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+          . .\scripts\common.ps1
+          Import-MsvcEnvironment
+          Set-Utf8CompilerFlag
+          cargo check --locked --workspace
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo check --locked --target x86_64-pc-windows-msvc --bin gpui-cef-example --bin gpui-cef-component-demo --features component-demo
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked --target x86_64-pc-windows-msvc -p rust-cef-runtime --lib
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked --target x86_64-pc-windows-msvc -p rust-cef-gpui --lib
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked --target x86_64-pc-windows-msvc --bin gpui-cef-example --bin gpui-cef-component-demo --features component-demo
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

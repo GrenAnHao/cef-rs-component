@@ -10,6 +10,7 @@ mod tests;
 pub(crate) mod timing;
 
 use cpu::{BgraInput, CpuCapture};
+pub(crate) use d3d11::readback_shared_texture_frame;
 use d3d11::{D3d11Capture, D3dMetrics};
 use rust_cef_core::{
     contracts::RenderPreference,
@@ -322,23 +323,25 @@ impl CaptureEndpoint {
         }
         let gpu = match backend {
             RenderPreference::SoftwareRequired => None,
-            RenderPreference::D3d11Required | RenderPreference::Auto => match create_device(owner) {
-                Ok(gpu) => Some(gpu),
-                Err(fault) => {
-                    if allow_auto_fallback || backend == RenderPreference::Auto {
+            RenderPreference::D3d11Required | RenderPreference::Auto => {
+                match create_device(owner) {
+                    Ok(gpu) => Some(gpu),
+                    Err(fault) => {
+                        if allow_auto_fallback || backend == RenderPreference::Auto {
+                            self.record_failure(&fault.engine());
+                            let mut state = self.lock();
+                            state.backend = Some(RenderPreference::SoftwareRequired);
+                            state.shared_texture_output = false;
+                            state.allow_software_fallback = true;
+                            drop(state);
+                            self.commit_gpu(None)?;
+                            return Ok(false);
+                        }
                         self.record_failure(&fault.engine());
-                        let mut state = self.lock();
-                        state.backend = Some(RenderPreference::SoftwareRequired);
-                        state.shared_texture_output = false;
-                        state.allow_software_fallback = true;
-                        drop(state);
-                        self.commit_gpu(None)?;
-                        return Ok(false);
+                        return Err(fault.engine());
                     }
-                    self.record_failure(&fault.engine());
-                    return Err(fault.engine());
                 }
-            },
+            }
         };
         let shared = gpu.is_some();
         self.lock().shared_texture_output = shared;

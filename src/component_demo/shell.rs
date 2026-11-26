@@ -24,8 +24,8 @@ use gpui::{
     AnyElement, App, AppContext as _, AsyncApp, Bounds, Context, Entity, EntityInputHandler,
     FocusHandle, Focusable as _, InteractiveElement as _, IntoElement, KeyDownEvent, MouseButton,
     MouseDownEvent, MouseMoveEvent, ParentElement as _, Pixels, Point, Render,
-    StatefulInteractiveElement as _, Styled as _, Subscription, UTF16Selection, Window, WindowBounds, WindowHandle, WindowOptions, div, px, rgb,
-    size,
+    StatefulInteractiveElement as _, Styled as _, Subscription, UTF16Selection, Window,
+    WindowBounds, WindowHandle, WindowOptions, div, px, rgb, size,
 };
 use rust_cef_gpui::{
     CefBrowser, ContextMenuConfig, ContextMenuRegistration, ContextMenuServices,
@@ -56,7 +56,6 @@ use rust_cef_gpui::{
     runtime::{ShutdownStatus, StartError},
 };
 
-use crate::cli::{Config, HostMode};
 use crate::cef_example::{
     model::TextBuffer,
     text_input::{
@@ -65,6 +64,7 @@ use crate::cef_example::{
         render_text_field_box,
     },
 };
+use crate::cli::{Config, HostMode};
 
 pub(super) const MAX_SHELL_TABS: usize = 8;
 const MAX_DOWNLOAD_HISTORY: usize = 8;
@@ -517,7 +517,9 @@ impl ShellRoot {
         }
     }
 
-    fn active_input_mut(&mut self) -> Option<(bool, &mut TextBuffer, Rc<RefCell<TextFieldLayoutCache>>)> {
+    fn active_input_mut(
+        &mut self,
+    ) -> Option<(bool, &mut TextBuffer, Rc<RefCell<TextFieldLayoutCache>>)> {
         if self.model.address_focused {
             Some((true, &mut self.address_buf, self.address_cache.clone()))
         } else if self.model.find_focused && self.model.find_open {
@@ -578,7 +580,8 @@ impl ShellRoot {
                 || (!editing_address && self.model.find_focused));
         if editing_address {
             if !self.model.address_focused && self.address_buf.text != self.model.address_draft {
-                self.address_buf.set_from_external(&self.model.address_draft);
+                self.address_buf
+                    .set_from_external(&self.model.address_draft);
             }
             if self.model.find_focused {
                 self.find_buf.unmark();
@@ -637,7 +640,8 @@ impl ShellRoot {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some((editing_address, down_pos, pending_select_all)) = self.dragging_shell_input else {
+        let Some((editing_address, down_pos, pending_select_all)) = self.dragging_shell_input
+        else {
             return;
         };
         let (buf, cache) = if editing_address {
@@ -908,8 +912,13 @@ impl EntityInputHandler for ShellRoot {
         cx.notify();
     }
 
-    fn text_length_utf16(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> Option<usize> {
-        self.active_input_mut().map(|(_, buf, _)| buf.text_len_utf16())
+    fn text_length_utf16(
+        &mut self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        self.active_input_mut()
+            .map(|(_, buf, _)| buf.text_len_utf16())
     }
 }
 
@@ -925,7 +934,8 @@ impl Render for ShellRoot {
             self.address_cache.borrow_mut().reset_scroll();
         }
         if !self.model.address_focused && self.address_buf.text != self.model.address_draft {
-            self.address_buf.set_from_external(&self.model.address_draft);
+            self.address_buf
+                .set_from_external(&self.model.address_draft);
         }
         if !self.model.find_focused && self.find_buf.text != self.model.find_query {
             self.find_buf.set_from_external(&self.model.find_query);
@@ -1305,31 +1315,29 @@ impl Render for ShellRoot {
                 .text_color(rgb(0xe2e8f0))
                 .text_size(px(12.0))
                 .child("Find:")
-                .child(
-                    div().w(px(180.0)).child(render_text_field_box(
-                        TextFieldRenderSpec {
-                            id: "shell-find-input",
-                            host: cx.entity(),
-                            focus_handle: self.input_focus.clone(),
-                            buffer: &self.find_buf,
-                            cache: self.find_cache.clone(),
-                            placeholder: "<click & type query>",
-                            focused: find_focused,
-                            multiline: false,
-                            font_size_px: 12.0,
-                            pad_x_px: 8.0,
-                            pad_y_px: 2.0,
-                            height_px: Some(22.0),
-                            rounded_px: 3.0,
-                            flex_1: false,
-                            theme: TextFieldTheme::shell_dark(),
-                        },
-                        |this, event, window, cx| {
-                            this.focus_shell_input_on_mouse_down(false, event, window, cx);
-                        },
-                        cx,
-                    )),
-                )
+                .child(div().w(px(180.0)).child(render_text_field_box(
+                    TextFieldRenderSpec {
+                        id: "shell-find-input",
+                        host: cx.entity(),
+                        focus_handle: self.input_focus.clone(),
+                        buffer: &self.find_buf,
+                        cache: self.find_cache.clone(),
+                        placeholder: "<click & type query>",
+                        focused: find_focused,
+                        multiline: false,
+                        font_size_px: 12.0,
+                        pad_x_px: 8.0,
+                        pad_y_px: 2.0,
+                        height_px: Some(22.0),
+                        rounded_px: 3.0,
+                        flex_1: false,
+                        theme: TextFieldTheme::shell_dark(),
+                    },
+                    |this, event, window, cx| {
+                        this.focus_shell_input_on_mouse_down(false, event, window, cx);
+                    },
+                    cx,
+                )))
                 .child(Self::pill(
                     "shell-find-next",
                     "Next",
@@ -1786,8 +1794,12 @@ fn plan_shell_shortcut(
     audio_muted: bool,
 ) -> Option<ShellShortcutOp> {
     match id.0 {
-        1 => Some(ShellShortcutOp::Zoom(step_canonical_zoom_level(zoom_level, 1))),
-        2 => Some(ShellShortcutOp::Zoom(step_canonical_zoom_level(zoom_level, -1))),
+        1 => Some(ShellShortcutOp::Zoom(step_canonical_zoom_level(
+            zoom_level, 1,
+        ))),
+        2 => Some(ShellShortcutOp::Zoom(step_canonical_zoom_level(
+            zoom_level, -1,
+        ))),
         3 => Some(ShellShortcutOp::Zoom(0.0)),
         4 => Some(ShellShortcutOp::Mute(!audio_muted)),
         _ => None,
@@ -3269,9 +3281,9 @@ pub(super) fn run(config: Config) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rust_cef_gpui::ports::{CaptureFailureKind, EngineError};
     use rust_cef_core::contracts::RuntimeGeneration;
     use rust_cef_core::host_capabilities::PopupDisposition;
+    use rust_cef_gpui::ports::{CaptureFailureKind, EngineError};
 
     #[test]
     fn url_normalization_enforces_confined_origins_and_rejects_untrusted() {
